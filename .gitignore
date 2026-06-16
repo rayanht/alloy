@@ -1,0 +1,78 @@
+# Python build / runtime artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.so
+*.dylib
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local Claude/AI assistant scratch
+.claude/
+
+# Local secrets — release signing private key backup, never commit
+.secrets/
+*alloy_release_key*
+
+*.md
+!README.md
+!CHANGELOG.md
+!CONTRIBUTING.md
+!CODE_OF_CONDUCT.md
+!SECURITY.md
+!apps/**/README.md
+!packages/**/README.md
+
+# Metal compiled shaders
+*.metallib
+*.air
+
+# Visualization HTML output from al.visualize() / profilers
+*.html
+
+# Generated images / debug captures
+*.png
+
+# Local debug capture directories
+diagnostics/
+/tmp/alloy_*
+
+# Benchmark output
+benchmarks/results/
+benchmarks/viz/
+
+# Mac App build artifacts (xcodegen regenerates from project.yml)
+apps/mac/Alloy.xcodeproj/
+app/
+
+*.log
+*.txt
+# but never ignore build recipes — *.txt above would otherwise drop CMakeLists.txt
+!CMakeLists.txt
+
+bench_logs/
+scripts/
+*.gputrace

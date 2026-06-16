@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "alloy-cli"
+version = "0.1.2"
+description = "Command-line interface for the Alloy local LLM server: model management, foreground serving, and chat REPL."
+license = "Apache-2.0"
+authors = [{ name = "Rayan Hatout", email = "rayan.hatout@gmail.com" }]
+requires-python = ">=3.10"
+keywords = ["alloy", "cli", "llm", "apple-silicon", "ollama-compatible"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "httpx>=0.27",
+    "questionary>=2.0",
+    "alloy-server",
+    "alloy-torch",
+    "alloy-metal",
+]
+
+[project.urls]
+Homepage = "https://github.com/rayanht/alloy"
+Repository = "https://github.com/rayanht/alloy"
+Issues = "https://github.com/rayanht/alloy/issues"
+
+[project.scripts]
+alloy = "alloy_cli.entry:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/alloy_cli"]

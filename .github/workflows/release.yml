@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'version tag (e.g. v0.1.0)'
+        required: true
+
+jobs:
+  build-cli:
+    name: Build + sign single-binary CLI tarball
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      ALLOY_SSH_SIGN_KEY: ${{ secrets.ALLOY_SSH_SIGN_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        run: curl -fsSL https://astral.sh/uv/install.sh | sh
+
+      - name: Build tarball
+        run: bash installer/build-tarball.sh
+
+      - name: Sign tarball (ed25519)
+        if: env.ALLOY_SSH_SIGN_KEY != ''
+        run: |
+          set -eu
+          KEY="$RUNNER_TEMP/alloy_sign_key"
+          printf '%s\n' "$ALLOY_SSH_SIGN_KEY" > "$KEY"
+          chmod 600 "$KEY"
+          ssh-keygen -Y sign -f "$KEY" -n file dist/alloy-arm64-darwin.tar.gz
+          rm -f "$KEY"
+          PUB="$(grep -o 'ssh-ed25519 [A-Za-z0-9+/=]*' installer/install.sh | head -1)"
+          [ -n "$PUB" ] || { echo "::error::no pinned pubkey in install.sh"; exit 1; }
+          printf 'alloy-release %s\n' "$PUB" > "$RUNNER_TEMP/signers"
+          ssh-keygen -Y verify -f "$RUNNER_TEMP/signers" -I alloy-release -n file \
+            -s dist/alloy-arm64-darwin.tar.gz.sig < dist/alloy-arm64-darwin.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alloy-arm64-darwin
+          path: |
+            dist/alloy-arm64-darwin.tar.gz
+            dist/alloy-arm64-darwin.tar.gz.sig
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/alloy-arm64-darwin.tar.gz
+            dist/alloy-arm64-darwin.tar.gz.sig
+          draft: true
+          generate_release_notes: true

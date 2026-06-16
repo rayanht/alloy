@@ -1,0 +1,78 @@
+# Single published distribution `alloy`, assembled from the workspace packages
+# by packaging/CMakeLists.txt. The repo keeps its packages/* layout; this is the
+# packaging view only. Lean base (kernels, no torch) + `[serve]` / `[all]` extras.
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+# `alloy` and `alloy-ml` were taken on PyPI; the distribution is `alloy-kit`.
+# The import packages (`alloy`, `alloy_torch`, `alloy_cli`) and the `alloy`
+# console script are unaffected — only the `pip install` name differs.
+name = "alloy-kit"
+version = "0.1.2"
+description = "Local LLM inference and GPU kernels for Apple Silicon"
+license = "Apache-2.0"
+authors = [{ name = "Rayan Hatout", email = "rayan.hatout@gmail.com" }]
+requires-python = ">=3.10"
+keywords = ["metal", "apple-silicon", "gpu", "llm", "inference", "torch.compile", "ollama-compatible"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Compilers",
+]
+# Lean base: the Metal kernel compiler/runtime only — no torch.
+dependencies = [
+    "numpy",
+    "structlog>=24.0",
+]
+
+[project.optional-dependencies]
+# Explicit alias for the lean base, so `alloy-kit[core]` reads symmetrically.
+core = []
+# The local-LLM stack: torch.compile backend + OpenAI/Ollama/Anthropic server
+# + CLI. The union of alloy-server's and alloy-cli's runtime dependencies — the
+# wheel bundles both import packages, so the extra must carry both deps.
+serve = [
+    "torch",
+    "transformers",
+    "accelerate>=1.0",
+    "gguf>=0.19.0",
+    "huggingface-hub>=0.24",
+    "pillow>=12.1.1",
+    "python-multipart>=0.0.9",
+    "starlette>=0.37",
+    "uvicorn>=0.30",
+    "xgrammar>=0.2.1",
+    "httpx>=0.27",
+    "typer>=0.12",
+    "rich>=13.7",
+    "questionary>=2.0",
+]
+# Everything, including training / vision / audio research extras.
+all = [
+    "alloy-kit[serve]",
+    "peft>=0.18.1",
+    "diffusers>=0.37.1",
+    "librosa>=0.11.0",
+]
+
+[project.scripts]
+alloy = "alloy_cli._entry:main"
+
+[project.urls]
+Homepage = "https://github.com/rayanht/alloy"
+Repository = "https://github.com/rayanht/alloy"
+Issues = "https://github.com/rayanht/alloy/issues"
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+# Everything is placed by CMake install(); no source-dir auto-detection.
+wheel.packages = []

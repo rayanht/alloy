@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Sync (dev only — skips C++ build)
+        run: |
+          uv sync --no-install-package alloy-metal --no-install-package alloy-torch \
+                  --no-install-package alloy-mlx --no-install-package alloy-cli
+      - name: ruff check
+        run: uv run ruff check .
+
+  test:
+    name: Unit tests (macos-15 arm64)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Sync (build alloy-metal C++ ext)
+        run: uv sync
+      - name: pytest — kernels + compiler + architecture
+        run: |
+          uv run python -m pytest \
+            tests/kernels \
+            tests/compiler \
+            tests/architecture \
+            -m "not slow" \
+            -v --timeout=120

@@ -1,0 +1,97 @@
+[project]
+# Workspace root only — never published. The published distribution is
+# `alloy-kit`, assembled from the workspace packages by packaging/. This holds
+# the dev/research environment + tooling.
+name = "alloy-workspace"
+version = "0.1.2"
+description = "GPU kernels and torch.compile inference on Apple Silicon"
+license = "Apache-2.0"
+authors = [{ name = "Rayan Hatout", email = "rayan.hatout@gmail.com" }]
+requires-python = ">=3.10"
+keywords = ["metal", "apple-silicon", "gpu", "compiler", "torch.compile", "inference", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Compilers",
+]
+dependencies = [
+    "alloy-metal",
+    "diffusers>=0.37.1",
+    "gguf>=0.19.0",
+    "librosa>=0.11.0",
+    "ml-dtypes[dev]>=0.5.4",
+    "peft>=0.18.1",
+    "pillow>=12.1.1",
+    "protobuf>=7.34.1",
+    "pyobjc-core>=12.1",
+    "pyobjc-framework-metal>=12.1",
+    "pyrefly>=0.58.0",
+    "transformers>=5.3.0",
+    "xgrammar>=0.2.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/rayanht/alloy"
+Repository = "https://github.com/rayanht/alloy"
+Issues = "https://github.com/rayanht/alloy/issues"
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+alloy-metal = { workspace = true }
+alloy-torch = { workspace = true }
+alloy-server = { workspace = true }
+alloy-mlx = { workspace = true }
+alloy-cli = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "alloy-metal",
+    "alloy-torch",
+    "alloy-server",
+    "alloy-mlx",
+    "alloy-cli",
+    "pytest>=8.0",
+    "pytest-timeout>=2.3",
+    "ruff>=0.4",
+    "pre-commit>=3.5",
+]
+
+[tool.pytest.ini_options]
+addopts = ["--ignore=bench_logs", "--ignore=scripts"]
+markers = [
+    "slow: many-dispatch Monte-Carlo GPU tests; excluded from CI (too slow on the paravirtual runner GPU, fast on real Apple Silicon)",
+]
+filterwarnings = [
+    # Apple Accelerate BLAS triggers spurious FP exceptions in float32 SGEMM
+    # for matrices >= 16x16. Results are correct; the warnings are harmless.
+    "ignore:(overflow|divide by zero|invalid value) encountered in matmul:RuntimeWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# `PLC0415` (import-outside-toplevel) is enforced by a stricter
+# edit-time hook that requires a `# scoped: <reason>` justification —
+# duplicating the check in ruff is noisy because ruff can't read the
+# justification comment.
+ignore = ["E741"]
+
+[tool.pyrefly]
+project-includes = [
+    "**/*.py*",
+    "**/*.ipynb",
+]

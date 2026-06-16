@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "alloy-mlx"
+version = "0.1.2"
+description = "Alloy interop for MLX arrays"
+license = "Apache-2.0"
+authors = [{ name = "Rayan Hatout", email = "rayan.hatout@gmail.com" }]
+requires-python = ">=3.10"
+keywords = ["alloy", "mlx", "apple-silicon"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "alloy-metal",
+    "mlx",
+]
+
+[project.urls]
+Homepage = "https://github.com/rayanht/alloy"
+Repository = "https://github.com/rayanht/alloy"
+Issues = "https://github.com/rayanht/alloy/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/alloy_mlx"]

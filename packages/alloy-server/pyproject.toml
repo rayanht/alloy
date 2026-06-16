@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "alloy-server"
+version = "0.1.2"
+description = "Alloy LLM inference + serving stack: GGUF loading, the batch-1 generation engine, speculative decoding, and the OpenAI/Ollama/Anthropic-compatible server for Apple Silicon"
+license = "Apache-2.0"
+authors = [{ name = "Rayan Hatout", email = "rayan.hatout@gmail.com" }]
+requires-python = ">=3.10"
+keywords = ["llm", "inference", "serving", "apple-silicon", "openai-compat", "ollama-compatible", "gguf"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "alloy-torch",
+    "alloy-metal",
+    "torch",
+    "transformers",
+    "accelerate>=1.0",
+    "gguf>=0.19.0",
+    "huggingface-hub>=0.24",
+    "pillow>=12.1.1",
+    "python-multipart>=0.0.9",
+    "soundfile>=0.12",
+    "starlette>=0.37",
+    "uvicorn>=0.30",
+    "xgrammar>=0.2.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/rayanht/alloy"
+Repository = "https://github.com/rayanht/alloy"
+Issues = "https://github.com/rayanht/alloy/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/alloy_server"]

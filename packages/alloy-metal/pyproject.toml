@@ -1,0 +1,42 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "alloy-metal"
+version = "0.1.2"
+description = "Alloy compiler and runtime for Metal GPU kernels"
+license = "Apache-2.0"
+authors = [{ name = "Rayan Hatout", email = "rayan.hatout@gmail.com" }]
+requires-python = ">=3.10"
+keywords = ["metal", "apple-silicon", "gpu", "compiler", "kernels"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Compilers",
+]
+dependencies = [
+    "numpy",
+    "structlog>=24.0",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+# Model-level tuning (`al.tune(torch_module, inputs)`) and the
+# `al.visualize` debug helper compile a torch model via the alloy
+# backend, so they need torch + alloy-torch. Plain kernel work
+# (`@al.kernel`, `al.dot`, `al.softmax`, the std kernels, and
+# `al.tune(kernel, M=..., K=..., N=...)`) does not.
+torch = ["torch>=2.10.0", "alloy-torch"]
+
+[project.urls]
+Homepage = "https://github.com/rayanht/alloy"
+Repository = "https://github.com/rayanht/alloy"
+Issues = "https://github.com/rayanht/alloy/issues"
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.packages = ["src/alloy"]

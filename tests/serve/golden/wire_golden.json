@@ -1,0 +1,1131 @@
+{
+ "anthropic.messages.reasoning": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "content": [
+     {
+      "thinking": "let me consider this",
+      "type": "thinking"
+     },
+     {
+      "text": "echo: hello",
+      "type": "text"
+     }
+    ],
+    "id": "<volatile>",
+    "model": "alloy-test:tiny",
+    "role": "assistant",
+    "stop_reason": "end_turn",
+    "stop_sequence": null,
+    "type": "message",
+    "usage": {
+     "input_tokens": 5,
+     "output_tokens": 11
+    }
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "anthropic.messages.stream": {
+  "body": {
+   "events": [
+    {
+     "data": {
+      "message": {
+       "content": [],
+       "id": "<volatile>",
+       "model": "alloy-test:tiny",
+       "role": "assistant",
+       "stop_reason": null,
+       "stop_sequence": null,
+       "type": "message",
+       "usage": {
+        "input_tokens": 5,
+        "output_tokens": 1
+       }
+      },
+      "type": "message_start"
+     },
+     "event": "message_start"
+    },
+    {
+     "data": {
+      "content_block": {
+       "text": "",
+       "type": "text"
+      },
+      "index": 0,
+      "type": "content_block_start"
+     },
+     "event": "content_block_start"
+    },
+    {
+     "data": {
+      "delta": {
+       "text": "echo:",
+       "type": "text_delta"
+      },
+      "index": 0,
+      "type": "content_block_delta"
+     },
+     "event": "content_block_delta"
+    },
+    {
+     "data": {
+      "delta": {
+       "text": " hell",
+       "type": "text_delta"
+      },
+      "index": 0,
+      "type": "content_block_delta"
+     },
+     "event": "content_block_delta"
+    },
+    {
+     "data": {
+      "delta": {
+       "text": "o",
+       "type": "text_delta"
+      },
+      "index": 0,
+      "type": "content_block_delta"
+     },
+     "event": "content_block_delta"
+    },
+    {
+     "data": {
+      "index": 0,
+      "type": "content_block_stop"
+     },
+     "event": "content_block_stop"
+    },
+    {
+     "data": {
+      "delta": {
+       "stop_reason": "end_turn",
+       "stop_sequence": null
+      },
+      "type": "message_delta",
+      "usage": {
+       "output_tokens": 11
+      }
+     },
+     "event": "message_delta"
+    },
+    {
+     "data": {
+      "type": "message_stop"
+     },
+     "event": "message_stop"
+    }
+   ],
+   "kind": "sse"
+  },
+  "headers": {
+   "content-type": "text/event-stream"
+  },
+  "status": 200
+ },
+ "anthropic.messages.system": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "content": [
+     {
+      "text": "echo: hello",
+      "type": "text"
+     }
+    ],
+    "id": "<volatile>",
+    "model": "alloy-test:tiny",
+    "role": "assistant",
+    "stop_reason": "end_turn",
+    "stop_sequence": null,
+    "type": "message",
+    "usage": {
+     "input_tokens": 15,
+     "output_tokens": 11
+    }
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "anthropic.messages.text": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "content": [
+     {
+      "text": "echo: hello",
+      "type": "text"
+     }
+    ],
+    "id": "<volatile>",
+    "model": "alloy-test:tiny",
+    "role": "assistant",
+    "stop_reason": "end_turn",
+    "stop_sequence": null,
+    "type": "message",
+    "usage": {
+     "input_tokens": 5,
+     "output_tokens": 11
+    }
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "anthropic.messages.tools": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "content": [
+     {
+      "id": "<volatile>",
+      "input": {
+       "location": "Paris"
+      },
+      "name": "get_weather",
+      "type": "tool_use"
+     }
+    ],
+    "id": "<volatile>",
+    "model": "alloy-test:tiny",
+    "role": "assistant",
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "type": "message",
+    "usage": {
+     "input_tokens": 19,
+     "output_tokens": 0
+    }
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "cors.get_with_origin": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "data": [
+     {
+      "id": "<volatile>",
+      "object": "model",
+      "owned_by": "alloy"
+     }
+    ],
+    "object": "list"
+   }
+  },
+  "headers": {
+   "access-control-allow-origin": "http://localhost:3000",
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "cors.preflight": {
+  "body": {
+   "kind": "empty"
+  },
+  "headers": {
+   "access-control-allow-headers": "*",
+   "access-control-allow-methods": "GET, POST, OPTIONS",
+   "access-control-allow-origin": "http://localhost:3000",
+   "access-control-max-age": "86400"
+  },
+  "status": 204
+ },
+ "healthz": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "kind": "chat",
+    "model": "alloy-test:tiny",
+    "spec": null,
+    "status": "ok",
+    "version": "0.5.4-alloy"
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "ollama.chat.stop": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "created_at": "<volatile>",
+    "done": true,
+    "done_reason": "stop",
+    "eval_count": 12,
+    "eval_duration": "<volatile>",
+    "load_duration": "<volatile>",
+    "message": {
+     "content": "echo: alpha ",
+     "role": "assistant"
+    },
+    "model": "alloy-test:tiny",
+    "prompt_eval_count": 16,
+    "prompt_eval_duration": "<volatile>",
+    "total_duration": "<volatile>"
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "ollama.chat.stream": {
+  "body": {
+   "kind": "ndjson",
+   "lines": [
+    {
+     "created_at": "<volatile>",
+     "done": false,
+     "message": {
+      "content": "echo:",
+      "role": "assistant"
+     },
+     "model": "alloy-test:tiny"
+    },
+    {
+     "created_at": "<volatile>",
+     "done": false,
+     "message": {
+      "content": " stre",
+      "role": "assistant"
+     },
+     "model": "alloy-test:tiny"
+    },
+    {
+     "created_at": "<volatile>",
+     "done": false,
+     "message": {
+      "content": "aming",
+      "role": "assistant"
+     },
+     "model": "alloy-test:tiny"
+    },
+    {
+     "created_at": "<volatile>",
+     "done": true,
+     "done_reason": "stop",
+     "eval_count": 15,
+     "eval_duration": "<volatile>",
+     "load_duration": "<volatile>",
+     "message": {
+      "content": "",
+      "role": "assistant"
+     },
+     "model": "alloy-test:tiny",
+     "prompt_eval_count": 9,
+     "prompt_eval_duration": "<volatile>",
+     "total_duration": "<volatile>"
+    }
+   ]
+  },
+  "headers": {
+   "content-type": "application/x-ndjson"
+  },
+  "status": 200
+ },
+ "ollama.chat.text": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "created_at": "<volatile>",
+    "done": true,
+    "done_reason": "stop",
+    "eval_count": 11,
+    "eval_duration": "<volatile>",
+    "load_duration": "<volatile>",
+    "message": {
+     "content": "echo: hello",
+     "role": "assistant"
+    },
+    "model": "alloy-test:tiny",
+    "prompt_eval_count": 5,
+    "prompt_eval_duration": "<volatile>",
+    "total_duration": "<volatile>"
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "ollama.chat.tools": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "created_at": "<volatile>",
+    "done": true,
+    "done_reason": "stop",
+    "eval_count": 0,
+    "eval_duration": "<volatile>",
+    "load_duration": "<volatile>",
+    "message": {
+     "content": "",
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "function": {
+        "arguments": {
+         "location": "Paris"
+        },
+        "name": "get_weather"
+       }
+      }
+     ]
+    },
+    "model": "alloy-test:tiny",
+    "prompt_eval_count": 19,
+    "prompt_eval_duration": "<volatile>",
+    "total_duration": "<volatile>"
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "ollama.embed": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "embeddings": [
+     [
+      215.0,
+      101.0,
+      108.0,
+      108.0
+     ],
+     [
+      219.0,
+      111.0,
+      114.0,
+      108.0
+     ]
+    ],
+    "load_duration": "<volatile>",
+    "model": "alloy-test:embed",
+    "prompt_eval_count": 10,
+    "total_duration": "<volatile>"
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "ollama.embeddings.legacy": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "embedding": [
+     215.0,
+     101.0,
+     108.0,
+     108.0
+    ]
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "ollama.generate.stream": {
+  "body": {
+   "kind": "ndjson",
+   "lines": [
+    {
+     "created_at": "<volatile>",
+     "done": false,
+     "model": "alloy-test:tiny",
+     "response": "echo:"
+    },
+    {
+     "created_at": "<volatile>",
+     "done": false,
+     "model": "alloy-test:tiny",
+     "response": " hell"
+    },
+    {
+     "created_at": "<volatile>",
+     "done": false,
+     "model": "alloy-test:tiny",
+     "response": "o"
+    },
+    {
+     "context": [],
+     "created_at": "<volatile>",
+     "done": true,
+     "done_reason": "stop",
+     "eval_count": 11,
+     "eval_duration": "<volatile>",
+     "load_duration": "<volatile>",
+     "model": "alloy-test:tiny",
+     "prompt_eval_count": 5,
+     "prompt_eval_duration": "<volatile>",
+     "response": "",
+     "total_duration": "<volatile>"
+    }
+   ]
+  },
+  "headers": {
+   "content-type": "application/x-ndjson"
+  },
+  "status": 200
+ },
+ "ollama.generate.text": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "context": [],
+    "created_at": "<volatile>",
+    "done": true,
+    "done_reason": "stop",
+    "eval_count": 11,
+    "eval_duration": "<volatile>",
+    "load_duration": "<volatile>",
+    "model": "alloy-test:tiny",
+    "prompt_eval_count": 5,
+    "prompt_eval_duration": "<volatile>",
+    "response": "echo: hello",
+    "total_duration": "<volatile>"
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "ollama.show": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "capabilities": [
+     "completion"
+    ],
+    "details": {
+     "families": [],
+     "family": "",
+     "format": "safetensors",
+     "parameter_size": "",
+     "parent_model": "",
+     "quantization_level": ""
+    },
+    "model_info": {},
+    "modelfile": "",
+    "parameters": "",
+    "template": ""
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "ollama.show.unknown": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "error": "this server serves 'alloy-test:tiny'; to use 'nope', restart with `alloy serve -m nope`"
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 404
+ },
+ "ollama.tags": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "models": [
+     {
+      "details": {
+       "families": [],
+       "family": "",
+       "format": "safetensors",
+       "parameter_size": "",
+       "parent_model": "",
+       "quantization_level": ""
+      },
+      "digest": "",
+      "model": "alloy-test:tiny",
+      "modified_at": "<volatile>",
+      "name": "alloy-test:tiny",
+      "size": 0
+     }
+    ]
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "ollama.version": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "version": "0.5.4-alloy"
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "openai.chat.reasoning": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+       "content": "echo: hello",
+       "reasoning_content": "let me consider this",
+       "role": "assistant"
+      }
+     }
+    ],
+    "id": "<volatile>",
+    "model": "alloy-test:tiny",
+    "object": "chat.completion",
+    "usage": {
+     "completion_tokens": 11,
+     "prompt_tokens": 5,
+     "timings": {},
+     "total_tokens": 16
+    }
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "openai.chat.reasoning.stream": {
+  "body": {
+   "events": [
+    {
+     "data": {
+      "choices": [
+       {
+        "delta": {
+         "reasoning_content": "let",
+         "role": "assistant"
+        },
+        "finish_reason": null,
+        "index": 0
+       }
+      ],
+      "id": "<volatile>",
+      "model": "alloy-test:tiny",
+      "object": "chat.completion.chunk"
+     },
+     "event": null
+    },
+    {
+     "data": {
+      "choices": [
+       {
+        "delta": {
+         "reasoning_content": " me c"
+        },
+        "finish_reason": null,
+        "index": 0
+       }
+      ],
+      "id": "<volatile>",
+      "model": "alloy-test:tiny",
+      "object": "chat.completion.chunk"
+     },
+     "event": null
+    },
+    {
+     "data": {
+      "choices": [
+       {
+        "delta": {
+         "reasoning_content": "onsid"
+        },
+        "finish_reason": null,
+        "index": 0
+       }
+      ],
+      "id": "<volatile>",
+      "model": "alloy-test:tiny",
+      "object": "chat.completion.chunk"
+     },
+     "event": null
+    },
+    {
+     "data": {
+      "choices": [
+       {
+        "delta": {
+         "reasoning_content": "er th"
+        },
+        "finish_reason": null,
+        "index": 0
+       }
+      ],
+      "id": "<volatile>",
+      "model": "alloy-test:tiny",
+      "object": "chat.completion.chunk"
+     },
+     "event": null
+    },
+    {
+     "data": {
+      "choices": [
+       {
+        "delta": {
+         "reasoning_content": "is"
+        },
+        "finish_reason": null,
+        "index": 0
+       }
+      ],
+      "id": "<volatile>",
+      "model": "alloy-test:tiny",
+      "object": "chat.completion.chunk"
+     },
+     "event": null
+    },
+    {
+     "data": {
+      "choices": [
+       {
+        "delta": {
+         "content": "echo:"
+        },
+        "finish_reason": null,
+        "index": 0
+       }
+      ],
+      "id": "<volatile>",
+      "model": "alloy-test:tiny",
+      "object": "chat.completion.chunk"
+     },
+     "event": null
+    },
+    {
+     "data": {
+      "choices": [
+       {
+        "delta": {
+         "content": " hell"
+        },
+        "finish_reason": null,
+        "index": 0
+       }
+      ],
+      "id": "<volatile>",
+      "model": "alloy-test:tiny",
+      "object": "chat.completion.chunk"
+     },
+     "event": null
+    },
+    {
+     "data": {
+      "choices": [
+       {
+        "delta": {
+         "content": "o"
+        },
+        "finish_reason": null,
+        "index": 0
+       }
+      ],
+      "id": "<volatile>",
+      "model": "alloy-test:tiny",
+      "object": "chat.completion.chunk"
+     },
+     "event": null
+    },
+    {
+     "data": {
+      "choices": [
+       {
+        "delta": {},
+        "finish_reason": "stop",
+        "index": 0
+       }
+      ],
+      "id": "<volatile>",
+      "model": "alloy-test:tiny",
+      "object": "chat.completion.chunk"
+     },
+     "event": null
+    },
+    {
+     "data": "[DONE]",
+     "event": null
+    }
+   ],
+   "kind": "sse"
+  },
+  "headers": {
+   "content-type": "text/event-stream"
+  },
+  "status": 200
+ },
+ "openai.chat.stop": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+       "content": "echo: alpha ",
+       "role": "assistant"
+      }
+     }
+    ],
+    "id": "<volatile>",
+    "model": "alloy-test:tiny",
+    "object": "chat.completion",
+    "usage": {
+     "completion_tokens": 12,
+     "prompt_tokens": 16,
+     "timings": {},
+     "total_tokens": 28
+    }
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "openai.chat.stream": {
+  "body": {
+   "events": [
+    {
+     "data": {
+      "choices": [
+       {
+        "delta": {
+         "content": "echo:",
+         "role": "assistant"
+        },
+        "finish_reason": null,
+        "index": 0
+       }
+      ],
+      "id": "<volatile>",
+      "model": "alloy-test:tiny",
+      "object": "chat.completion.chunk"
+     },
+     "event": null
+    },
+    {
+     "data": {
+      "choices": [
+       {
+        "delta": {
+         "content": " hell"
+        },
+        "finish_reason": null,
+        "index": 0
+       }
+      ],
+      "id": "<volatile>",
+      "model": "alloy-test:tiny",
+      "object": "chat.completion.chunk"
+     },
+     "event": null
+    },
+    {
+     "data": {
+      "choices": [
+       {
+        "delta": {
+         "content": "o"
+        },
+        "finish_reason": null,
+        "index": 0
+       }
+      ],
+      "id": "<volatile>",
+      "model": "alloy-test:tiny",
+      "object": "chat.completion.chunk"
+     },
+     "event": null
+    },
+    {
+     "data": {
+      "choices": [
+       {
+        "delta": {},
+        "finish_reason": "stop",
+        "index": 0
+       }
+      ],
+      "id": "<volatile>",
+      "model": "alloy-test:tiny",
+      "object": "chat.completion.chunk"
+     },
+     "event": null
+    },
+    {
+     "data": "[DONE]",
+     "event": null
+    }
+   ],
+   "kind": "sse"
+  },
+  "headers": {
+   "content-type": "text/event-stream"
+  },
+  "status": 200
+ },
+ "openai.chat.text": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "choices": [
+     {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+       "content": "echo: hello",
+       "role": "assistant"
+      }
+     }
+    ],
+    "id": "<volatile>",
+    "model": "alloy-test:tiny",
+    "object": "chat.completion",
+    "usage": {
+     "completion_tokens": 11,
+     "prompt_tokens": 5,
+     "timings": {},
+     "total_tokens": 16
+    }
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "openai.chat.tools": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "choices": [
+     {
+      "finish_reason": "tool_calls",
+      "index": 0,
+      "message": {
+       "content": null,
+       "role": "assistant",
+       "tool_calls": [
+        {
+         "function": {
+          "arguments": "{\"location\": \"Paris\"}",
+          "name": "get_weather"
+         },
+         "id": "<volatile>",
+         "type": "function"
+        }
+       ]
+      }
+     }
+    ],
+    "id": "<volatile>",
+    "model": "alloy-test:tiny",
+    "object": "chat.completion",
+    "usage": {
+     "completion_tokens": 0,
+     "prompt_tokens": 19,
+     "timings": {},
+     "total_tokens": 19
+    }
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "openai.chat.tools.stream": {
+  "body": {
+   "events": [
+    {
+     "data": {
+      "choices": [
+       {
+        "delta": {
+         "role": "assistant",
+         "tool_calls": [
+          {
+           "function": {
+            "arguments": "",
+            "name": "get_weather"
+           },
+           "id": "<volatile>",
+           "index": 0,
+           "type": "function"
+          }
+         ]
+        },
+        "finish_reason": null,
+        "index": 0
+       }
+      ],
+      "id": "<volatile>",
+      "model": "alloy-test:tiny",
+      "object": "chat.completion.chunk"
+     },
+     "event": null
+    },
+    {
+     "data": {
+      "choices": [
+       {
+        "delta": {
+         "tool_calls": [
+          {
+           "function": {
+            "arguments": "{\"location\": \"Paris\"}"
+           },
+           "index": 0
+          }
+         ]
+        },
+        "finish_reason": null,
+        "index": 0
+       }
+      ],
+      "id": "<volatile>",
+      "model": "alloy-test:tiny",
+      "object": "chat.completion.chunk"
+     },
+     "event": null
+    },
+    {
+     "data": {
+      "choices": [
+       {
+        "delta": {},
+        "finish_reason": "tool_calls",
+        "index": 0
+       }
+      ],
+      "id": "<volatile>",
+      "model": "alloy-test:tiny",
+      "object": "chat.completion.chunk"
+     },
+     "event": null
+    },
+    {
+     "data": "[DONE]",
+     "event": null
+    }
+   ],
+   "kind": "sse"
+  },
+  "headers": {
+   "content-type": "text/event-stream"
+  },
+  "status": 200
+ },
+ "openai.chat.unknown_model": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "error": {
+     "code": "model_not_served",
+     "message": "this server serves 'alloy-test:tiny'; to use 'nope', restart with `alloy serve -m nope`",
+     "type": "model_not_served"
+    }
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 404
+ },
+ "openai.embeddings": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "data": [
+     {
+      "embedding": [
+       215.0,
+       101.0,
+       108.0,
+       108.0
+      ],
+      "index": 0,
+      "object": "embedding"
+     },
+     {
+      "embedding": [
+       219.0,
+       111.0,
+       114.0,
+       108.0
+      ],
+      "index": 1,
+      "object": "embedding"
+     }
+    ],
+    "model": "alloy-test:embed",
+    "object": "list",
+    "usage": {
+     "prompt_tokens": 10,
+     "total_tokens": 10
+    }
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ },
+ "openai.models": {
+  "body": {
+   "kind": "json",
+   "value": {
+    "data": [
+     {
+      "id": "<volatile>",
+      "object": "model",
+      "owned_by": "alloy"
+     }
+    ],
+    "object": "list"
+   }
+  },
+  "headers": {
+   "content-type": "application/json"
+  },
+  "status": 200
+ }
+}

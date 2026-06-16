@@ -1,0 +1,17 @@
+# --- metal-lsp:begin ---
+If:
+  PathMatch: .*\.metal
+
+CompileFlags:
+  Add:
+    - -xc++
+    - -std=c++17
+    - -Wno-unknown-attributes
+    - -Wno-reserved-user-defined-literal
+    - -include
+    - /Users/rayan/.cursor/extensions/rayanhtt.metal-lsp-1.4.0/headers/metal_compat.h
+    - -isystem
+    - /Users/rayan/.cursor/extensions/rayanhtt.metal-lsp-1.4.0/stubs
+    - -I
+    - /Users/rayan/alloy
+# --- metal-lsp:end ---
