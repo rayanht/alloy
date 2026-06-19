@@ -251,7 +251,6 @@ class TestActivations:
 
 
 class TestSDPA:
-    @pytest.mark.xfail
     def test_sdpa_unmasked(self):
         check_grads(
             fn_factory(lambda q, k, v: F.scaled_dot_product_attention(q, k, v)),
@@ -259,7 +258,6 @@ class TestSDPA:
             atol=1e-4,
         )
 
-    @pytest.mark.xfail
     def test_sdpa_causal(self):
         check_grads(
             fn_factory(lambda q, k, v: F.scaled_dot_product_attention(q, k, v, is_causal=True)),

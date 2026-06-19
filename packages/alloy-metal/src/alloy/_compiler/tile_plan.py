@@ -1143,7 +1143,13 @@ def _pass_shmem_and_column_tiling(func: TileFunction, plan: TileKernelPlan):
     # `dq += ds @ K`, which blows past the HP=1 grad tolerance. The
     # MMA-pair-dtype constraint that this would normally enforce is
     # bypassed here ONLY because mixed-dtype MMA is legal on Apple Silicon.
-    if plan.shmem_plan and plan.shmem_dtype == "float":
+    #
+    # Gated to bf16 models: the cast reproduces the bf16×float MMA the model
+    # already runs everywhere, so the Dot input loses no precision the model
+    # had. On an f32 model (f32 SDPA backward) there is no such bf16 path —
+    # casting `ds` to bf16 would inject ~bf16 error into an otherwise-exact
+    # gradient (the dq/dkdv backward, where `ds` feeds dQ/dK directly).
+    if plan.shmem_plan and plan.shmem_dtype == "float" and plan.dtype == "bfloat":
         op_by_result: dict[str, TileOp] = {}
         for op in walk_ops(func.ops):
             if op.result is not None:
