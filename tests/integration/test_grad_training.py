@@ -77,6 +77,32 @@ def _regression_data() -> tuple[torch.Tensor, torch.Tensor]:
     return x, x @ w + 0.1 * torch.randn(16, 1)
 
 
+def _lm() -> nn.Module:
+    torch.manual_seed(0)
+    return nn.Sequential(nn.Embedding(50, 32), nn.Linear(32, 50))
+
+
+def _lm_data() -> tuple[torch.Tensor, torch.Tensor]:
+    torch.manual_seed(1)
+    return torch.randint(0, 50, (4, 16)), torch.randint(0, 50, (4, 16))
+
+
+def _train_ce(make_model, make_data, *, backend, steps, lr) -> list[float]:
+    torch._dynamo.reset()
+    model = make_model()
+    x, y = make_data()
+    fn = torch.compile(model, backend="alloy", dynamic=False) if backend == "alloy" else model
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    losses = []
+    for _ in range(steps):
+        opt.zero_grad()
+        loss = F.cross_entropy(fn(x).reshape(-1, 50), y.reshape(-1))
+        loss.backward()
+        opt.step()
+        losses.append(float(loss.detach().to("cpu")))
+    return losses
+
+
 class TestTrainingLoop:
     def test_mlp_sgd_trajectory(self):
         _check_training(_mlp, _regression_data, steps=10, lr=0.02)
@@ -90,6 +116,17 @@ class TestTrainingLoop:
         got = _train(_mlp, _regression_data, backend="alloy", steps=6, lr=0.05, optim="sgd")
         for i in range(1, len(got)):
             assert got[i] != got[i - 1], f"loss frozen at step {i}: {got}"
+
+    def test_embedding_lm_trajectory(self):
+        # Embedding + linear head + cross-entropy: the embedding backward
+        # scatter-adds via an atomic store (sum order non-deterministic at
+        # f32-ULP), so the loss tracks eager within a loose band rather than
+        # bit-exactly.
+        ref = _train_ce(_lm, _lm_data, backend="cpu", steps=10, lr=0.1)
+        got = _train_ce(_lm, _lm_data, backend="alloy", steps=10, lr=0.1)
+        assert all(v == v for v in got), f"alloy LM training produced NaN: {got}"
+        for i, (a, r) in enumerate(zip(got, ref)):
+            assert abs(a - r) <= 0.02, f"step {i}: alloy {a:.4f} vs eager {r:.4f}"
 
     def test_plain_mm_covers_full_output(self):
         # Non-transposed mm (aten.mm with a contiguous rhs) launches plain `dot`,

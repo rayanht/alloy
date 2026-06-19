@@ -1583,18 +1583,27 @@ class MemoryEmitterMixin:
             ptr_dtype = self._buffer_dtypes.get(op.ptr.name, self._dtype) if op.ptr else self._dtype
             cast = f"{ptr_dtype}({val})" if ptr_dtype != self._acc_dtype else val
 
+            # reduce="add" scatters overlap (e.g. the embedding backward, where a
+            # repeated token maps several rows to the same destination), so the
+            # write is an atomic_fetch_add into the (atomic<float>*-declared)
+            # destination rather than a plain store.
+            def _store_stmt(addr: str, value: str) -> str:
+                if op.reduce == "add":
+                    return f"atomic_fetch_add_explicit(&{ptr}[{addr}], float({value}), memory_order_relaxed);"
+                return f"{ptr}[{addr}] = {value};"
+
             # Guard logic for 1D stores
             # 1. Post-reduction scalar store: only tid 0 writes
             if self._has_1d_reduce and not op.mask and not self._mask_expr:
-                self._emit(f"if (tid == 0) {ptr}[{store_addr}] = {cast};")
+                self._emit(f"if (tid == 0) {_store_stmt(store_addr, cast)}")
                 return
             # 2. Mask guard from Compare
             if op.mask:
                 mask = self._get(op.mask)
-                self._emit(f"if ({mask}) {ptr}[{store_addr}] = {cast};")
+                self._emit(f"if ({mask}) {_store_stmt(store_addr, cast)}")
                 return
             if self._mask_expr:
-                self._emit(f"if ({self._mask_expr}) {ptr}[{store_addr}] = {cast};")
+                self._emit(f"if ({self._mask_expr}) {_store_stmt(store_addr, cast)}")
                 return
 
             # In dot composable, more threads than rows — guard 1D stores
@@ -1603,9 +1612,9 @@ class MemoryEmitterMixin:
             if needs_guard:
                 self._emit(f"if (_row < {block_m}u)")
             self._emit(
-                f"    {ptr}[{store_addr}] = {self._dtype}({val});"
+                f"    {_store_stmt(store_addr, f'{self._dtype}({val})')}"
                 if needs_guard
-                else f"{ptr}[{store_addr}] = {cast};"
+                else _store_stmt(store_addr, cast)
             )
 
     def _emit_scalar_load(self, op: Load):

@@ -11,7 +11,7 @@ import torch
 from alloy._compiler.dtypes import int32
 from alloy._dispatch.buf_utils import _alloc_aligned
 from alloy._runtime.alloy_buffer import AlloyBuffer
-from alloy_torch.ops.casting import _to_copy
+from alloy_torch.ops.casting import _to_copy, k_copy
 from alloy_torch.ops.common import (
     _broadcast_shapes,
     _dtype_of,
@@ -85,6 +85,29 @@ def k_scatter_add_last_2d(
         s = alloy.load(src + row * IDX_COLS + k, mask=mask)
         val = alloy.where(col == target, val + s, val)
     alloy.store(out + offs, val, mask=mask)
+
+
+@alloy.kernel
+def k_index_put_add_rows(
+    index,
+    src,
+    out: output,
+    NUM_IDX: constexpr,
+    COLS: constexpr,
+    BLOCK_SIZE: constexpr = 1024,
+):
+    """Scatter-add `src[i]` into `out[index[i]]` (one program per src element).
+    Collisions (repeated index, e.g. a token appearing twice) accumulate via an
+    atomic-add store, so the per-row sum order is non-deterministic at f32-ULP.
+    `out` carries the running value and must be pre-initialised to the target."""
+    pid = alloy.program_id(0)
+    offs = pid * BLOCK_SIZE + alloy.arange(0, BLOCK_SIZE)
+    mask = offs < NUM_IDX * COLS
+    i = offs // COLS
+    c = offs % COLS
+    row = alloy.load(index + i, mask=mask)
+    v = alloy.load(src + offs, mask=mask)
+    alloy.store(out + row * COLS + c, v, mask=mask, reduce="add")
 
 
 @alloy.kernel
@@ -527,11 +550,52 @@ def _cache_write_dim2_4d(
     )
 
 
+def _single_indexed_dim(indices: IndexSequence) -> tuple[int, AlloyBuffer]:
+    if not isinstance(indices, (tuple, list)):
+        raise NotImplementedError("Alloy index_put expects a tuple/list of indices")
+    indexed = [(i, item) for i, item in enumerate(indices) if not _is_full_slice_index(item)]
+    if len(indexed) != 1:
+        raise NotImplementedError("Alloy index_put currently supports exactly one indexed dimension")
+    dim, index = indexed[0]
+    if not isinstance(index, AlloyBuffer):
+        raise NotImplementedError("Alloy index_put expects AlloyBuffer indices")
+    return dim, index
+
+
+def _index_put_accumulate(
+    target: AlloyBuffer, dim: int, index: AlloyBuffer, values: AlloyBuffer, *, inplace: bool
+) -> AlloyBuffer:
+    """index_put(accumulate=True): scatter-add `values` rows into `target` at
+    `index` along the leading dim — the embedding backward (grad_weight[token] +=
+    grad_out). Repeated tokens accumulate through an atomic-add store, so the
+    per-row sum order is non-deterministic at f32-ULP."""
+    if dim != 0:
+        raise NotImplementedError(
+            "Alloy index_put(accumulate=True) supports indexing the leading dim only"
+        )
+    rows = target.shape[0]
+    cols = math.prod(target.shape[1:]) if target.ndim > 1 else 1
+    num_idx = index.size
+    index_i32 = _to_copy(index.reshape((num_idx,)), dtype=torch.int32)
+    values_2d = values.reshape((num_idx, cols)).contiguous()
+    if inplace:
+        out = target.reshape((rows, cols))
+    else:
+        out = _alloc_aligned((rows, cols), target.dtype)
+        src = target.reshape((rows, cols)).contiguous()
+        k_copy[((rows * cols + 1023) // 1024,)](src, out, N=rows * cols)
+    k_index_put_add_rows[((num_idx * cols + 1023) // 1024,)](
+        index_i32, values_2d, out, NUM_IDX=num_idx, COLS=cols
+    )
+    return out.reshape(target.shape)
+
+
 def _index_put(
     target: AlloyBuffer, indices: IndexSequence, values: AlloyBuffer, accumulate: bool = False
 ) -> AlloyBuffer:
     if accumulate:
-        raise NotImplementedError("Alloy index_put does not support accumulate=True")
+        dim, index = _single_indexed_dim(indices)
+        return _index_put_accumulate(target, dim, index, values, inplace=False)
     if not isinstance(indices, (tuple, list)):
         raise NotImplementedError("Alloy index_put expects a tuple/list of indices")
 
@@ -554,7 +618,8 @@ def _index_put_inplace(
     target: AlloyBuffer, indices: IndexSequence, values: AlloyBuffer, accumulate: bool = False
 ) -> AlloyBuffer:
     if accumulate:
-        raise NotImplementedError("Alloy index_put does not support accumulate=True")
+        dim, index = _single_indexed_dim(indices)
+        return _index_put_accumulate(target, dim, index, values, inplace=True)
     if not isinstance(indices, (tuple, list)):
         raise NotImplementedError("Alloy index_put expects a tuple/list of indices")
     indexed_dims = [(idx, item) for idx, item in enumerate(indices) if not _is_full_slice_index(item)]

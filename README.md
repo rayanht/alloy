@@ -149,9 +149,10 @@ Runnable model examples live in [`examples/torch/`](examples/torch/):
 
 A full `torch.compile` training step (forward, backward, and the optimizer
 update) runs end to end through Alloy and matches PyTorch eager within
-floating-point tolerance for dense transformer-style models: linear layers,
-normalization, residual blocks, attention, cross-entropy, and the common
-optimizers (SGD, Adam, AdamW, RMSprop). Enable it before `torch.compile`:
+floating-point tolerance for dense transformer-style models: embeddings, linear
+layers, normalization, residual blocks, attention, cross-entropy, and the common
+optimizers (SGD, Adam, AdamW, RMSprop). A small language model trains end to end.
+Enable it before `torch.compile`:
 
 ```python
 import torch
@@ -178,10 +179,11 @@ Runnable training examples live in [`examples/torch/`](examples/torch/):
 
 - [`train_mlp.py`](examples/torch/train_mlp.py) — MLP regression (Linear / LayerNorm / GELU, AdamW)
 - [`train_transformer.py`](examples/torch/train_transformer.py) — transformer block + cross-entropy (SGD)
+- [`train_lm.py`](examples/torch/train_lm.py) — tiny language model (Embedding + attention + cross-entropy)
 
-It is still a preview. The backward pass does not yet cover embeddings,
-convolutions, or pooling, so end-to-end language-model and CNN training are not
-supported. Inference is the primary, fully validated path.
+It is still a preview. The backward pass does not yet cover convolutions or
+pooling, so CNN training is not supported. Inference is the primary, fully
+validated path.
 
 ## Benchmarks
 

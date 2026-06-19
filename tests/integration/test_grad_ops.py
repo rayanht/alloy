@@ -271,6 +271,22 @@ class TestSDPA:
 # ---------------------------------------------------------------------------
 
 
+class TestEmbedding:
+    def test_embedding_backward(self):
+        # embedding backward decomposes to index_put(accumulate=True): the
+        # weight grad scatter-adds grad_output rows at the token indices.
+        def make_inputs():
+            torch.manual_seed(0)
+            return (torch.randint(0, 50, (4, 8)),)
+
+        check_grads(
+            module_factory(lambda: nn.Embedding(50, 16)),
+            make_inputs,
+            check_input_grads=False,
+            atol=1e-4,
+        )
+
+
 class TestIndexing:
     def test_gather_dim_last(self):
         def make_fn():
