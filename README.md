@@ -1,6 +1,6 @@
 # Alloy
 
-GPU kernels, `torch.compile` inference and LLM serving for Apple Silicon.
+Kernel authoring DSL, `torch.compile` backend and LLM serving for Apple Silicon.
 
 Alloy is a compiler and runtime for GPU compute kernels on Apple Silicon. You write
 kernels in Python. Alloy compiles them to Metal through a tile IR pipeline; 
@@ -23,7 +23,7 @@ import alloy as al
 ```
 
 The PyPI distribution is **`alloy-kit`**. The brackets are optional
-dependency groups: the lean base is `@al.kernel` / tiled GEMM / the tile IR,
+dependency groups: the lean base provides `@al.kernel` with the tile IR, MSL emitter and Metal dispatch machinery,
 and `[serve]` adds everything needed to run the server and the `alloy` CLI.
 
 **Standalone (no Python required):**
@@ -89,33 +89,6 @@ The default port is `11434`. Pass `--port 11435` to `alloy serve` (or set `ALLOY
 | Paged KV cache | Opt-in (`ALLOY_KV=paged`) |
 | KV cache quantization (int8 + fp16 scales) | Opt-in (`--kv-quant q8_0`) |
 
-## torch.compile backend
-
-Alloy includes a `torch.compile` backend that compiles covered PyTorch FX graphs to
-fused Metal compute kernels.
-
-```python
-import torch
-import transformers
-import alloy_torch  # registers the "alloy" backend
-
-model = transformers.AutoModelForCausalLM.from_pretrained("gpt2").eval()
-compiled = torch.compile(model, backend="alloy")
-
-input_ids = torch.randint(0, model.config.vocab_size, (1, 16))
-output = compiled(input_ids=input_ids)
-```
-
-The backend handles: FX graph decomposition, operator fusion (RMSNorm, RoPE, GELU,
-batched QKV, GEMM+LayerNorm, scalar broadcast), GQA-native attention, compiled
-dispatch plans, and autotuning.
-
-Runnable model examples live in [`examples/torch/`](examples/torch/):
-
-- [`mlp.py`](examples/torch/mlp.py) — multi-layer perceptron (Linear / LayerNorm / GELU)
-- [`resnet.py`](examples/torch/resnet.py) — GroupNorm ResNet (Conv2d + residual blocks)
-- [`transformer.py`](examples/torch/transformer.py) — pre-norm encoder block (SDPA + GELU MLP)
-
 <details>
 <summary>Supported quantizations</summary>
 
@@ -144,11 +117,77 @@ Runnable model examples live in [`examples/torch/`](examples/torch/):
 
 </details>
 
+
+## torch.compile backend
+
+Alloy includes a `torch.compile` backend that compiles covered PyTorch FX graphs to
+fused Metal compute kernels.
+
+```python
+import torch
+import transformers
+import alloy_torch  # registers the "alloy" backend
+
+model = transformers.AutoModelForCausalLM.from_pretrained("gpt2").eval()
+compiled = torch.compile(model, backend="alloy")
+
+input_ids = torch.randint(0, model.config.vocab_size, (1, 16))
+output = compiled(input_ids=input_ids)
+```
+
+The backend handles: FX graph decomposition, operator fusion (RMSNorm, RoPE, GELU,
+batched QKV, GEMM+LayerNorm, scalar broadcast), GQA-native attention, compiled
+dispatch plans, and autotuning.
+
+Runnable model examples live in [`examples/torch/`](examples/torch/):
+
+- [`mlp.py`](examples/torch/mlp.py) — multi-layer perceptron (Linear / LayerNorm / GELU)
+- [`resnet.py`](examples/torch/resnet.py) — GroupNorm ResNet (Conv2d + residual blocks)
+- [`transformer.py`](examples/torch/transformer.py) — pre-norm encoder block (SDPA + GELU MLP)
+
+### Training preview
+
+A full `torch.compile` training step (forward, backward, and the optimizer
+update) runs end to end through Alloy and matches PyTorch eager within
+floating-point tolerance for dense transformer-style models: linear layers,
+normalization, residual blocks, attention, cross-entropy, and the common
+optimizers (SGD, Adam, AdamW, RMSprop). Enable it before `torch.compile`:
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import alloy_torch  # registers the "alloy" backend
+from alloy_torch.training import set_training_mode
+
+set_training_mode(True)  # before torch.compile
+
+model = nn.Sequential(nn.Linear(64, 128), nn.GELU(), nn.Linear(128, 1))
+step = torch.compile(model, backend="alloy")
+opt = torch.optim.AdamW(model.parameters(), lr=0.05)
+
+x, y = torch.randn(32, 64), torch.randn(32, 1)
+for _ in range(20):
+    opt.zero_grad()
+    loss = F.mse_loss(step(x), y)
+    loss.backward()
+    opt.step()
+```
+
+Runnable training examples live in [`examples/torch/`](examples/torch/):
+
+- [`train_mlp.py`](examples/torch/train_mlp.py) — MLP regression (Linear / LayerNorm / GELU, AdamW)
+- [`train_transformer.py`](examples/torch/train_transformer.py) — transformer block + cross-entropy (SGD)
+
+It is still a preview. The backward pass does not yet cover embeddings,
+convolutions, or pooling, so end-to-end language-model and CNN training are not
+supported. Inference is the primary, fully validated path.
+
 ## Benchmarks
 
 Reproduce with `alloy bench <HF_OR_OLLAMA_TAG>`
 
-### Causal LM
+### Causal LM Inference
 
 #### HF Models
 
@@ -186,14 +225,14 @@ Reproduce with `alloy bench <HF_OR_OLLAMA_TAG>`
 | mlx-community/Qwen3-4B-4bit | 4-bit g64 | 1673 | 174 |
 | mlx-community/Qwen3-8B-4bit | 4-bit g64 | 866 | 102 |
 
-### Multimodal
+### Multimodal Inference
 
 | model | vision ms | alloy TTFT | alloy dec | alloy wall |
 |---|---:|---:|---:|---:|
 | gemma4:e2b | 229 | 455 | 172 | 1193 |
 | gemma4:e4b | 257 | 665 | 99.0 | 1949 |
 
-### Embeddings
+### Embeddings Inference
 
 Per-regime encoder tok/s from `alloy bench nomic-embed-text --dataset embeddings`.
 
@@ -373,16 +412,6 @@ result = my_kernel[grid](x, M=32, N=128)  # x bound directly; result returned as
 
 Alloy's compiled plans may convert PyTorch input storage to Alloy-owned shared
 memory on first execution so subsequent dispatches can resolve Metal buffers by handle. That keeps subsequent dispatches free of per-call input copies for stable storage.
-
-## Training preview
-
-Training support exists for targeted experiments, but it is not widely validated. Enable it explicitly before `torch.compile`:
-
-```python
-from alloy_torch.training import set_training_mode
-
-set_training_mode(True)
-```
 
 ## Inspect generated code
 

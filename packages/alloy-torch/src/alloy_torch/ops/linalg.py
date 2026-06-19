@@ -926,9 +926,22 @@ def _mm(lhs: AlloyBuffer, rhs: AlloyBuffer) -> AlloyBuffer:
     else:
         rhs = _ensure_zero_offset(rhs)
         lhs, orig_rows = _pad_m_to_tile(lhs, 0)
-        out = _alloc_scratch((lhs.shape[0], rhs.shape[1]), lhs.dtype)
-        result = _dot(lhs, rhs, out)
-        if lhs.shape[0] != orig_rows:
+        rows, red = lhs.shape
+        cols = rhs.shape[1]
+        out = _alloc_scratch((rows, cols), lhs.dtype)
+        # `dot` has no dispatch_spec, so an auto-grid launch collapses to one
+        # threadgroup and leaves every tile past the first uninitialised. Launch
+        # an explicit grid over the resolved config's tiling.
+        cfg = resolve_config("dot", {
+            "_A_dim0": rows, "_A_dim1": red, "_B_dim0": red,
+            "_B_dim1": cols, "_C_dim0": rows, "_C_dim1": cols,
+        }).constexprs
+        bm = cfg.get("BLOCK_M", 64)
+        bn = cfg.get("BLOCK_N", 64)
+        bk = cfg.get("BLOCK_K", 16)
+        grid = ((rows + bm - 1) // bm, (cols + bn - 1) // bn)
+        result = _dot[grid](lhs, rhs, out, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+        if rows != orig_rows:
             result = result.slice(0, 0, orig_rows)
 
     if squeeze_result:

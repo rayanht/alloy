@@ -130,7 +130,6 @@ class TinyLlamaBlock(nn.Module):
 
 
 class TestTinyGPT:
-    @pytest.mark.xfail
     def test_tiny_gpt_grads(self):
         check_grads(
             module_factory(lambda: TinyGPT()),

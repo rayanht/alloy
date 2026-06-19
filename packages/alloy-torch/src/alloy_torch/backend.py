@@ -2195,7 +2195,11 @@ def _execute_plan(plan: CompiledPlan, args: tuple[torch.Tensor, ...],
     # consumed by the next compiled plan's GPU dispatches, so Metal's
     # queue-order handoff is sufficient and a host round-trip is pure
     # overhead.
-    if plan.host_reachable_output and not _skip_gpu:
+    # Training: gradients/input-mutations are flagged not host-reachable (a
+    # following compiled plan would consume them GPU-side), but the eager
+    # optimizer reads param.grad on the HOST, so the async dispatch must be
+    # synced or opt.step() races it and reads the zero-initialised grad buffer.
+    if (plan.host_reachable_output or is_training_mode_enabled()) and not _skip_gpu:
         DispatchEngine.gpu_sync()
 
     if not results or all(r is None for r in results):

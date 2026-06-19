@@ -56,7 +56,6 @@ class TestLinearStacks:
             inputs_factory((4, 32)),
         )
 
-    @pytest.mark.xfail
     def test_two_linears_with_relu(self):
         class M(nn.Module):
             def __init__(self):
@@ -69,7 +68,6 @@ class TestLinearStacks:
 
         check_grads(module_factory(lambda: M()), inputs_factory((4, 32)))
 
-    @pytest.mark.xfail
     def test_linear_gelu_linear(self):
         """GPT-2 / BERT MLP block."""
 
@@ -137,7 +135,6 @@ class TestResidual:
 
 
 class TestAttention:
-    @pytest.mark.xfail
     def test_mha_self_attn(self):
         """Single-block self-attention with QKV projections and out projection."""
 
@@ -169,7 +166,6 @@ class TestAttention:
 
 
 class TestTransformerBlock:
-    @pytest.mark.xfail
     def test_gpt2_style_block(self):
         class Block(nn.Module):
             def __init__(self, d=32, nh=4, ff=64):
@@ -207,7 +203,6 @@ class TestTransformerBlock:
 
 
 class TestLMHead:
-    @pytest.mark.xfail
     def test_lm_head_ce(self):
         """Tied LM head (linear) + cross-entropy, no label shift."""
 
@@ -233,7 +228,6 @@ class TestLMHead:
 
         check_grads(module_factory(lambda: Head()), make_inputs, atol=1e-4)
 
-    @pytest.mark.xfail
     def test_lm_head_ce_shifted(self):
         """HF ForCausalLMLoss tail: shift labels, then CE with ignore_index."""
 
