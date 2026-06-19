@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -53,6 +54,10 @@ def bump(new: str) -> None:
             sys.exit(f"error: {rel}: expected exactly 1 version match, found {n}")
         path.write_text(updated)
         print(f"  {rel}")
+    # uv.lock pins the workspace package versions; resync it so the lock never
+    # lags the bumped pyproject.tomls.
+    subprocess.run(["uv", "lock"], cwd=ROOT, check=True)
+    print("  uv.lock")
 
 
 def main() -> None:
