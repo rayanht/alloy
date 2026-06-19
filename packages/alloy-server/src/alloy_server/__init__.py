@@ -547,10 +547,11 @@ def create_native_served_model(
     native_context: int | None = None
     max_fill: int | None = None
     if isinstance(generator, AlloyGenerator):
-        native_context = generator.max_cache_len
-        max_fill = generator.max_fill  # derived from the machine's memory budget
+        # Sizes the DeltaNet slot bank; must precede max_fill, which builds the cache.
         if config.spec:
             attach_spec_drafter(generator, resolved, config.spec)
+        native_context = generator.max_cache_len
+        max_fill = generator.max_fill
         # Pre-compile cold + warm prefill + decode + verify + the vision tower
         # (if any) at the native cache. No real request pays torch.compile cost.
         generator.eager_compile_all()
