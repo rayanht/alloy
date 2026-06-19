@@ -135,7 +135,10 @@ class Generation:
         no marker and are only detected at content start. Runs on the
         post-reasoning text, so a reasoning model's tool call is still detected."""
         req = self.request
-        tagged = self.split_reasoning_stream(self.raw_stream(), req.model.reasoning)
+        # thinking off: no `<think>` opens, so the splitter (which assumes it
+        # starts mid-think) would tag the whole answer as reasoning.
+        proto = None if req.enable_thinking is False else req.model.reasoning
+        tagged = self.split_reasoning_stream(self.raw_stream(), proto)
         if not req.tools:
             yield from tagged
             return
