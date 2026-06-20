@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "alloy-metal"
-version = "0.1.3"
+version = "0.1.4"
 description = "Alloy compiler and runtime for Metal GPU kernels"
 license = "Apache-2.0"
 authors = [{ name = "Rayan Hatout", email = "rayan.hatout@gmail.com" }]
