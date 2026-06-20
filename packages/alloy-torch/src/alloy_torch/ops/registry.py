@@ -120,6 +120,7 @@ from alloy_torch.ops.rope import (
     _fused_rope_apply_backward,
     _rope_table,
 )
+from alloy_torch.ops.dropout import _native_dropout, _native_dropout_backward
 from alloy_torch.ops.sampling import _sample_categorical_handler
 from alloy_torch.ops.views import (
     _alias,
@@ -238,6 +239,8 @@ ATEN_TO_ALLOY = {
     torch.ops.aten.mm.default: lambda a, b: _mm(a, b),
     torch.ops.aten.native_group_norm.default: _native_group_norm,
     torch.ops.aten.native_layer_norm.default: _native_layer_norm,
+    torch.ops.aten.native_dropout.default: _native_dropout,
+    torch.ops.aten.native_dropout_backward.default: _native_dropout_backward,
     torch.ops.aten.ones_like.default: _ones_like,
     torch.ops.aten.permute.default: lambda x, dims: x.permute(dims),
     torch.ops.aten.pow.Tensor_Scalar: _pow_tensor_scalar,

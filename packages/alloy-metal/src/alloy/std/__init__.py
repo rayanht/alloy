@@ -99,6 +99,7 @@ from alloy.std.rope import (
 )
 from alloy.std.sampling import (
     apply_token_bitmask,
+    dropout_mask_apply,
     sample_categorical,
     sample_categorical_combine,
     sample_categorical_split,
@@ -136,6 +137,7 @@ __all__ = (
     "sample_categorical_combine",
     "sample_categorical_split",
     "apply_token_bitmask",
+    "dropout_mask_apply",
     "cross_entropy",
     "cross_entropy_fused_bwd",
     "cross_entropy_fused_fwd",

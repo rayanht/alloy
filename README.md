@@ -151,8 +151,9 @@ A full `torch.compile` training step (forward, backward, and the optimizer
 update) runs end to end through Alloy and matches PyTorch eager within
 floating-point tolerance for dense transformer-style models: embeddings, linear
 layers, normalization, residual blocks, attention, cross-entropy, and the common
-optimizers (SGD, Adam, AdamW, RMSprop). A small language model trains end to end.
-Enable it before `torch.compile`:
+optimizers (SGD, Adam, AdamW, RMSprop). A small language model trains end to end,
+and LoRA fine-tuning of a pretrained transformer works in `model.train()`. Enable
+it before `torch.compile`:
 
 ```python
 import torch

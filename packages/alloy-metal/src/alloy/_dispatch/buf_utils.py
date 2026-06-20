@@ -51,6 +51,7 @@ _NON_FUSABLE_ELEM_KERNELS = frozenset(
         "k_concat_2",  # reads from two source buffers by position
         "im2col_1d",  # complex loop nest with conditional loads
         "im2col_2d",  # complex loop nest with conditional loads
+        "dropout_mask_apply",  # RNG + second (mask) output — fusion drops the mask
     }
 )
 

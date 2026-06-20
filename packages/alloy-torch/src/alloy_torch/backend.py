@@ -36,6 +36,7 @@ from alloy_torch.decomps import get_alloy_decompositions
 from alloy_torch.mode import is_training_mode_enabled
 from alloy_torch.compile_window import compile_window
 from alloy_torch.ops.linalg import _mm_batched_cache
+from alloy_torch.ops.dropout import refresh_dropout_seed
 from alloy_torch.extern_kv import drain_extern_kv_writes
 from alloy_torch.ops.registry import FX_CALL_HANDLERS
 from alloy_torch.tensor_bridge import IR_TO_TORCH, make_tensor_from_ptr
@@ -703,10 +704,20 @@ def _compile_fx(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]):
     _run_count: int = 0
     # Graph compiler state: [None] → not built, [CompiledPlan] → ready
     _compiled_plan: CompiledPlan | None = None
+    _uses_dropout = any(
+        n.op == "call_function" and n.target is torch.ops.aten.native_dropout.default
+        for n in gm.graph.nodes
+    )
 
     def compiled(*args):
         nonlocal _run_count
         nonlocal _compiled_plan
+
+        # Dropout's keep mask is a per-forward draw from the torch generator;
+        # refresh the shared seed each call (handler or replay path) so masks
+        # vary per step and stay under torch.manual_seed.
+        if _uses_dropout and is_training_mode_enabled():
+            refresh_dropout_seed()
 
         # Record (plan, args) into the active capture slot, if any. Args are
         # captured on EVERY call (lazy or fast path) — AOT specialisations that

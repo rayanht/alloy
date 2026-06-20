@@ -73,6 +73,35 @@ def _rng_uniform(seed_u, pos_u, idx_u):
 
 
 @al.kernel
+def dropout_mask_apply(
+    X,
+    seed,
+    out: al.output,
+    mask_out: al.output,
+    P: al.constexpr,
+    SCALE: al.constexpr,
+    OFFSET: al.constexpr,
+    N: al.constexpr,
+    BLOCK_SIZE: al.constexpr = 1024,
+):
+    """Inverted dropout: keep each element with prob (1-P), scale survivors by
+    SCALE = 1/(1-P). The keep decision is the counter-RNG hash of (seed, OFFSET,
+    element index): `seed` is a 1-element runtime buffer redrawn from the torch
+    generator each forward (so `torch.manual_seed` controls it), OFFSET
+    decorrelates stacked dropout layers. `mask_out` stores keep (1/0) for the
+    backward."""
+    pid = al.program_id(0)
+    offs = pid * BLOCK_SIZE + al.arange(0, BLOCK_SIZE)
+    m = offs < N
+    seed_u = al.cast(al.load(seed + 0), al.uint32)
+    u = _rng_uniform(seed_u, al.cast(OFFSET, al.uint32), al.cast(offs, al.uint32))
+    keep = u >= P
+    x = al.load(X + offs, mask=m)
+    al.store(out + offs, al.where(keep, x * SCALE, 0.0), mask=m)
+    al.store(mask_out + offs, al.where(keep, 1.0, 0.0), mask=m)
+
+
+@al.kernel
 def apply_token_bitmask(logits, bitmask, out: al.output, BLOCK_SIZE: al.constexpr = 512):
     """Constrained-decoding mask. `bitmask` is the xgrammar token bitmask —
     (M, ceil(N/32)) int32, row-major, bit (token % 32) of word (token // 32) set
