@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "alloy-server"
-version = "0.1.2"
+version = "0.1.3"
 description = "Alloy LLM inference + serving stack: GGUF loading, the batch-1 generation engine, speculative decoding, and the OpenAI/Ollama/Anthropic-compatible server for Apple Silicon"
 license = "Apache-2.0"
 authors = [{ name = "Rayan Hatout", email = "rayan.hatout@gmail.com" }]

@@ -3,7 +3,7 @@
 # `alloy-kit`, assembled from the workspace packages by packaging/. This holds
 # the dev/research environment + tooling.
 name = "alloy-workspace"
-version = "0.1.2"
+version = "0.1.3"
 description = "GPU kernels and torch.compile inference on Apple Silicon"
 license = "Apache-2.0"
 authors = [{ name = "Rayan Hatout", email = "rayan.hatout@gmail.com" }]

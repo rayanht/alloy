@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "alloy-torch"
-version = "0.1.2"
+version = "0.1.3"
 description = "Alloy torch.compile backend for Apple Silicon: lowers FX graphs to Metal kernel dispatches"
 license = "Apache-2.0"
 authors = [{ name = "Rayan Hatout", email = "rayan.hatout@gmail.com" }]

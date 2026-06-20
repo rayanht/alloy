@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Bump the Alloy version everywhere in one shot.
 
-The version is declared in several places (the published `alloy` recipe, the
-workspace packages, `version.py`, the Homebrew formula). This is the single
-entry point that keeps them in lockstep — never edit them by hand.
+The version is declared in several places (`version.py`, the workspace packages,
+the packaging pyproject). This is the single entry point that keeps them in
+lockstep — never edit them by hand.
 
     python scripts/bump_version.py 0.2.0     # set everywhere
     python scripts/bump_version.py --show     # print the current version
@@ -33,7 +33,6 @@ TARGETS: list[tuple[str, str]] = [
     ("packages/alloy-mlx/pyproject.toml", r'(?m)^(version = ")[^"]+(")'),
     ("packaging/pyproject.toml", r'(?m)^(version = ")[^"]+(")'),
     ("pyproject.toml", r'(?m)^(version = ")[^"]+(")'),
-    ("installer/alloy.rb", r'(  version ")[^"]+(")'),
 ]
 
 

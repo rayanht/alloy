@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "alloy-cli"
-version = "0.1.2"
+version = "0.1.3"
 description = "Command-line interface for the Alloy local LLM server: model management, foreground serving, and chat REPL."
 license = "Apache-2.0"
 authors = [{ name = "Rayan Hatout", email = "rayan.hatout@gmail.com" }]
