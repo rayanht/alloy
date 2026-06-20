@@ -176,11 +176,33 @@ for _ in range(20):
     opt.step()
 ```
 
+Fine-tuning a pretrained transformer with [PEFT](https://github.com/huggingface/peft) LoRA is the same shape:
+
+```python
+import peft
+import transformers
+
+model = peft.get_peft_model(
+    transformers.AutoModelForCausalLM.from_pretrained("gpt2"),
+    peft.LoraConfig(target_modules=["c_attn"], task_type="CAUSAL_LM"),
+)
+step = torch.compile(model, backend="alloy")
+opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=5e-3)
+
+model.train()
+for input_ids in batches:
+    opt.zero_grad()
+    loss = step(input_ids=input_ids, labels=input_ids).loss
+    loss.backward()
+    opt.step()
+```
+
 Runnable training examples live in [`examples/torch/`](examples/torch/):
 
 - [`train_mlp.py`](examples/torch/train_mlp.py) — MLP regression (Linear / LayerNorm / GELU, AdamW)
 - [`train_transformer.py`](examples/torch/train_transformer.py) — transformer block + cross-entropy (SGD)
 - [`train_lm.py`](examples/torch/train_lm.py) — tiny language model (Embedding + attention + cross-entropy)
+- [`finetune_lora.py`](examples/torch/finetune_lora.py) — LoRA fine-tuning of gpt2 (PEFT + transformers)
 
 It is still a preview. The backward pass does not yet cover convolutions or
 pooling, so CNN training is not supported. Inference is the primary, fully
