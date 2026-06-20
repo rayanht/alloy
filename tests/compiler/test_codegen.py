@@ -51,8 +51,6 @@ class TestFormatScalarOp:
 
 
 class TestPrimitiveCodegen:
-    """Test that primitive DSL ops produce the expected MSL patterns."""
-
     def test_program_id_emits_gid(self):
         @al.kernel
         def k(out: al.output, N: al.constexpr):

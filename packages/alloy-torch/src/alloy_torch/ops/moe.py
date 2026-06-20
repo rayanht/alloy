@@ -6,12 +6,12 @@ from M=1 decode, so this is a trace-time constant -> two static plans):
 
 - **decode (T == 1)**: gathered quantized GEMV (`moe_gate_up_silu` -> `moe_down_combine`).
   One token, no grouping to exploit, so the gathered GEMV handles it directly.
-- **prefill (T > 1)**: grouped GEMM with NO (T*TOP_K, H)-sized global intermediates
-  (each was 17GB at a native-context plan). Sort the chunk's T*TOP_K routings into per-expert
+- **prefill (T > 1)**: grouped GEMM with no (T*TOP_K, H)-sized global intermediates
+  (each is 17GB at a native-context plan). Sort the chunk's T*TOP_K routings into per-expert
   PAD_M-padded segments (`moe_sort_*` — fill-free, atomic-free), sanitize the per-row
   gather/scatter indices + routing weight analytically (`moe_row_tokens`), then two tiled
   simdgroup-MMA GEMMs that dequantize each expert weight once and reuse it across the
-  tile: `moe_gate_up_grouped` GATHERS its A rows in-kernel via TOK_LD (the emitter's
+  tile: `moe_gate_up_grouped` gathers its A rows in-kernel via TOK_LD (the emitter's
   gathered cooperative load — no a_perm) and folds the routing weight into its epilogue;
   `moe_down_grouped` atomic-ADDs each row's output into Y[TOK_ST[rm]] (the emitter's
   reduce="add" scatter-accumulate MMA epilogue — no partial, no separate combine pass).
@@ -19,10 +19,10 @@ from M=1 decode, so this is a trace-time constant -> two static plans):
   per-token weight reads.
 - **production T>1 widths (1 < T <= _DET_COMBINE_MAX_T — spec verify AND chunk
   prefill)**: same grouped pipeline, but the down GEMM is the UNFUSED
-  `moe_down_grouped_partial` + `moe_combine_rows` fixed-order reduce — bit-stable,
-  where the fused atomic-ADD's reordered sums make generation non-deterministic
-  (breaks seeded reproducibility; jitters near-tie argmax against the M=1 decode).
-  The partial is 285MB transient at the 4096 chunk, MB-scale at verify widths.
+  `moe_down_grouped_partial` + `moe_combine_rows` fixed-order reduce — the fused
+  atomic-ADD's reordered sums make generation non-deterministic (breaks seeded
+  reproducibility; jitters near-tie argmax against the M=1 decode). The partial is
+  285MB transient at the 4096 chunk, MB-scale at verify widths.
 
 Intermediates flow by data dependency -> static plans. Y is pre-zeroed (`moe_zero_f32`),
 and the down GEMM takes a VIEW of y taken after the zero as its Y_DEP input — the atomic
@@ -74,13 +74,12 @@ _MOE_ZERO_F32 = cast(KernelFunction, moe_zero_f32)
 # Grouped-GEMM tile rows == sort padding granularity. 8 = MMA floor (lowest padding
 # at the ~4 tokens/expert of a 128-token chunk). MUST equal moe_*_grouped's BLOCK_M.
 _PAD_M = 8
-# Rank-scan block size for the block-decomposed counting sort. The flat scan was
-# O(R²) and 23% of qwen3.6:35b's 4096-chunk prefill; block decomposition costs
+# Rank-scan block size for the block-decomposed counting sort. The flat scan is
+# O(R²) (23% of qwen3.6:35b's 4096-chunk prefill); block decomposition costs
 # O(E·R) (block_count) + O(E·NB) (count_from_blocks + block_off) + O(R·SORT_B/2)
 # (perm_scan's in-block rank), so SORT_B trades perm_scan's scan against the
 # NB-walks. Standalone sweep of the 4-kernel chain at R=32768:
-# 64 → 621 µs, 128 → 608 µs,
-# 256 → 699 µs, 512 → 944 µs (vs 25,535 + 2,148 µs flat perm_scan + count_scan).
+# 64 → 621 µs, 128 → 608 µs, 256 → 699 µs, 512 → 944 µs.
 _SORT_B = 128
 # Fixed grouped-GEMM N/K block (passed explicitly with an explicit grid — the kernels have
 # no dispatch_spec, so auto-grid mis-sizes them; tuning these would need that spec).
@@ -88,15 +87,12 @@ _GROUPED_BN = 64
 _GROUPED_BK = 64
 # All production T>1 widths (spec verify 2-16, chunk prefills 128/4096) take the
 # UNFUSED down + fixed-order combine: the fused atomic-ADD's reordered sums make
-# generation non-deterministic — measured ~0.1-0.3-logit run-to-run jitter on
-# 35b prefill logits, which breaks the seeded-determinism contract, flips
-# near-tie argmax between the plain and spec streams, and destabilizes the
-# gate's teacher-forced classifier (same flip measured delta 0.000 and 3.550
-# across runs). The (MAX_ROWS, H) partial that fusion avoids is 285MB transient
-# at the 4096 chunk (~0.6% chunk-time traffic) and MB-scale at verify widths;
-# the 17GB figure that motivated the fusion was a native-context M=262144 plan
-# production never compiles (prefill is chunked). Fused stays for T beyond any
-# production chunk.
+# generation non-deterministic — ~0.1-0.3-logit run-to-run jitter on 35b prefill
+# logits, which breaks the seeded-determinism contract, flips near-tie argmax
+# between the plain and spec streams, and destabilizes the gate's teacher-forced
+# classifier. The (MAX_ROWS, H) partial that fusion avoids is 285MB transient at
+# the 4096 chunk (~0.6% chunk-time traffic) and MB-scale at verify widths. Fused
+# stays for T beyond any production chunk.
 _DET_COMBINE_MAX_T = 4096
 
 
@@ -160,10 +156,9 @@ def _gguf_moe_routed_handler(
 
     # 2. Sort routings into per-expert PAD-padded segments, block-decomposed
     # (see std/moe.py): per-block expert histograms feed BOTH the global COUNT
-    # (per-expert sum over active blocks — replaced the retired O(E·R)
-    # count_scan, 2.1 ms/layer) and the cross-block prefix BLOCK_OFF, so
-    # perm_scan's rank scan is bounded by SORT_B instead of R (the flat scan
-    # was O(R²) — 25.3 ms/layer at the 4096-chunk, 23% of qwen3.6:35b prefill).
+    # (per-expert sum over active blocks) and the cross-block prefix BLOCK_OFF,
+    # so perm_scan's rank scan is bounded by SORT_B instead of R (the flat scan
+    # is O(R²) — 25.3 ms/layer at the 4096-chunk, 23% of qwen3.6:35b prefill).
     nb = _cdiv(R, _SORT_B)
     block_count = _alloc_scratch((nb * num_experts,), int32)
     _MOE_BLOCK_COUNT[(nb * num_experts,)](

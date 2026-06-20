@@ -7,8 +7,7 @@ transcription). Each arch registers a handler via `@register(...)`; an unrecogni
 arch (only reachable under `--force`) falls back to a bare `CausalLMHandler`.
 
 The registry is the source of truth for both the supported-arch set
-(`check_arch_supported`) and a model's kind (`model_kind`). This package depends
-on `gguf` (the loading mechanics), never the reverse — a causal-LM handler is
+(`check_arch_supported`) and a model's kind (`model_kind`). A causal-LM handler is
 injected into `gguf.load_causal_lm` as the `CausalLMHooks`.
 """
 

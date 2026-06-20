@@ -37,17 +37,14 @@ def silu_inplace(
 ):
     """Elementwise SiLU. `out[i] = x[i] * sigmoid(x[i])`.
 
-    Split out from the conv kernel because alloy's MSL emitter
-    doesn't currently hoist post-loop scalar expressions into
-    outer scope correctly (the SiLU on a scalar loop carry emits
-    an undeclared `t47[...]` buffer index). Inside its own
-    per-block elementwise loop the same composition lowers
-    cleanly — same pattern that works in `rms_norm_gated`.
+    Split out from the conv kernel because the MSL emitter doesn't hoist
+    post-loop scalar expressions into outer scope (the SiLU on a scalar loop
+    carry emits an undeclared buffer index); inside its own per-block
+    elementwise loop the same composition lowers cleanly.
 
     **2D launch** over the (B*S, C) conv output: axis-0 = position (B*S),
-    axis-1 = channel block. Element-wise either way, but putting the position on
-    grid axis-0 lets the one-shot prefill recipe shrink the SiLU to the real prompt
-    length (axis-0 = S = M at B=1) instead of running the padded max.
+    axis-1 = channel block. Position on grid axis-0 lets the prefill recipe
+    shrink the SiLU to the real prompt length (axis-0 = S = M at B=1).
     """
     pos = alloy.program_id(0)
     cb = alloy.program_id(1)
@@ -76,11 +73,10 @@ def l2norm_last_dim(
       return x * inv_norm
 
     **2D launch**: axis-0 = position (B*S), axis-1 = head (0..HEADS); the buffer
-    row is `pos*HEADS + head`. The logical row set is identical to a 1D
-    `(B*S*HEADS,)` grid (same program count, same per-row work) — but putting the
-    sequence position on grid axis-0 lets the one-shot prefill recipe shrink the
-    launch to the real prompt length (it only shrinks axis-0). At B=1 axis-0 = S = M,
-    so the padded tail rows beyond the real prompt cost no GPU work.
+    row is `pos*HEADS + head`. Putting the sequence position on grid axis-0 lets
+    the prefill recipe shrink the launch to the real prompt length (it only
+    shrinks axis-0). At B=1 axis-0 = S = M, so the padded tail rows beyond the
+    real prompt cost no GPU work.
     """
     pos = alloy.program_id(0)
     head = alloy.program_id(1)
@@ -116,15 +112,12 @@ def causal_conv1d_with_state_prefill(
     does NOT finalize conv_state. Use the companion `conv_state_save_real_pos`
     kernel afterwards to write the saved K-window.
 
-    Why split: the original kernel also wrote conv_state via a masked store
-    where the address depended on `where(is_finalize, slot, 0)`. Non-finalize
-    threads in the same simdgroup as finalize threads share addr=slot_0 and
-    rely on the masked store to suppress their writes. Empirically that
-    suppression isn't reliable under alloy's masked-store emission — the
-    conv_state[slot_0] ends up clobbered with zero, which corrupts the
-    decode pre-context (4-position transient in qwen3.5:4b/9b's L0 GDN
-    output). conv_state_save_real_pos uses one-thread-per-slot addressing
-    so it has no conflict.
+    Split so the state write uses one-thread-per-slot addressing: a masked
+    store whose address is `where(is_finalize, slot, 0)` lets non-finalize
+    threads in the same simdgroup share addr=slot_0, and alloy's masked-store
+    emission doesn't reliably suppress their writes — conv_state[slot_0] gets
+    clobbered with zero, corrupting the decode pre-context (4-position
+    transient in qwen3.5:4b/9b's L0 GDN output).
 
     x:          (BATCH, S, C)  — reads `mixed_qkv` directly (no transpose to (B,C,S))
     w:          (C, K) — depthwise weight (squeezed from (C, 1, K))
@@ -136,27 +129,21 @@ def causal_conv1d_with_state_prefill(
     tape:       (BATCH*S*C,) — spec-verify conv tape (SAVE_TAPE=1 only): the
                 kernel TEES each row's x value into a persistent bank, so a
                 partial-accept rollback can splice the conv window at any
-                boundary. A tee inside this kernel adds NO consumer of x and
-                changes no fusion decision — the two previous tape attempts
-                (graph outputs; a separate copy kernel) both shifted verify
-                numerics ~2 logits at near-ties through fusion reshaping.
-                DELIBERATELY not alloy.output: nothing in-plan reads the
-                bank (the session reads it host-side between replays), and
+                boundary. DELIBERATELY not alloy.output: nothing in-plan reads
+                the bank (the session reads it host-side between replays), and
                 an output annotation puts the shared SAVE_TAPE=0 dummy into
                 every conv dispatch's write set — the resulting WAW edges
-                reorder the planner's careful conv/state-save scheduling and
-                corrupt the conv pre-context (the conv_state_save_real_pos
-                dep_in hazard class; measured: plain decode garbage). With
-                SAVE_TAPE=0 (all non-spec paths) the store folds away and
-                the param is a dead const pointer; callers bind a 1-element
-                dummy.
+                reorder the planner's conv/state-save scheduling and corrupt
+                the conv pre-context. With SAVE_TAPE=0 (all non-spec paths) the
+                store folds away and the param is a dead const pointer; callers
+                bind a 1-element dummy.
 
     **2D launch**: axis-0 = position p over B*S, axis-1 = channel block. Each
     threadgroup convolves one position's BLOCK_C channels (a vector over channels,
     the K-tap loop scalar in the position). Operating in (B,S,C) — the layout
     `mixed_qkv` already has — avoids a (B,S,C)→(B,C,S) transpose copy, AND puts
-    the sequence position on grid axis-0 so the one-shot prefill recipe shrinks
-    the conv to the real prompt length (axis-0 = S = M at B=1).
+    the sequence position on grid axis-0 so the prefill recipe shrinks the conv
+    to the real prompt length (axis-0 = S = M at B=1).
     """
     p = alloy.program_id(0)        # position index over B*S (B=1 → = s)
     cblk = alloy.program_id(1)
@@ -188,11 +175,10 @@ def causal_conv1d_with_state_prefill(
         ), alloy.float32)
         acc = acc + inp * wv
     if SAVE_TAPE:
-        # Tape the row's own x (a re-load of the cache-hot value the K-loop
-        # just read). Kept OUTSIDE the K-loop: the loop is a RUNTIME loop in
-        # the emitted MSL and an `if` inside it hits the documented SSA-merge
-        # hazard (see causal_conv1d_with_state_decode's docstring) —
-        # corrupting the conv even when the branch is constexpr-dead.
+        # Tape the row's own x. Kept OUTSIDE the K-loop: the loop is a RUNTIME
+        # loop in the emitted MSL and an `if` inside it hits the SSA-merge
+        # hazard (see causal_conv1d_with_state_decode's docstring) — corrupting
+        # the conv even when the branch is constexpr-dead.
         xx = alloy.load(x + b * (S * C) + s * C + c, mask=cmask, other=0.0)
         alloy.store(tape + b * (S * C) + s * C + c, xx, mask=cmask)
     alloy.store(out + b * (S * C) + s * C + c, acc, mask=cmask)
@@ -212,13 +198,12 @@ def conv_state_save_real_pos(
     """Write conv_state[b, c, k] = x[b, c, real_len - K + k] for k in [0, K).
 
     `dep_in` is the conv kernel's output buffer — passed as an unused input
-    just to create a producer→consumer data-flow edge so the planner
-    schedules this kernel AFTER the conv kernel. Without that edge, the
-    planner's topological sort can put this kernel FIRST, and the conv
-    kernel's pre-context reads at s ∈ [0, K-1] pick up real-position bytes
-    we wrote here (4-position transient corrupting the qwen3.5:4b/9b L0
-    GDN output). We read dep_in[0] (one element) into a value that's
-    multiplied by zero so the actual save value is unaffected.
+    to create a producer→consumer data-flow edge so the planner schedules this
+    kernel AFTER the conv kernel. Without that edge the topological sort can put
+    this kernel FIRST, and the conv kernel's pre-context reads at s ∈ [0, K-1]
+    pick up real-position bytes we wrote here (4-position transient corrupting
+    the qwen3.5:4b/9b L0 GDN output). dep_in[0] is multiplied by zero so the
+    save value is unaffected.
 
     conv_state is annotated `alloy.output` so the planner records this
     dispatch's write — without that the WAW conflict isn't tracked.
@@ -242,9 +227,8 @@ def conv_state_save_real_pos(
     src_s = rl_i - K_i + k_i
     src_idx = b * (S * C) + src_s * C + c
     v = alloy.load(x + src_idx, mask=mask, other=0.0)
-    # Read one element from dep_in to force a producer→consumer dep with
-    # the conv kernel that wrote it. Multiply by zero so the value of v
-    # is unchanged; the read itself is what matters for ordering.
+    # Read dep_in to force a producer→consumer dep with the conv kernel;
+    # multiply by zero so v is unchanged (the read is what orders).
     dep_v = alloy.cast(alloy.load(dep_in + 0), alloy.float32) * 0.0
     v = alloy.cast(v, alloy.float32) + dep_v
     alloy.store(conv_state + b * (C * K) + c * K + k, v, mask=mask)
@@ -366,9 +350,7 @@ def causal_conv1d_gated_decode(
     Collapses the `chunk(bcx) -> b*x -> conv -> c*conv_out` diamond: reads the
     b/c/x column-slices of `bcx` (the in_proj output, (B, 1, 3C) flat) directly,
     forms `new_x = b*x`, runs the depthwise causal conv with rolling state, then
-    gates the result by `c`. Identical to
-    `(b*x) -> causal_conv1d_with_state_decode -> (c*)` op-for-op (the f32 gate
-    multiplies are the same), so greedy-bit-exact.
+    gates the result by `c`.
     """
     BLOCK_SIZE = 256
     pid = alloy.program_id(0)
@@ -562,9 +544,9 @@ def recurrent_gated_delta_rule(
         )
         # SAVE_STEPS (speculative verify): write the state after EVERY token to
         # a (S, BATCH, NV, DK, DV) recurrent_state buffer so a partial-accept
-        # rollback is a free slot-copy instead of a target re-run. Otherwise the
-        # normal single-state save: at the last REAL token (HAS_REAL_LEN) or
-        # post-loop, so a following decode continues from the un-polluted state.
+        # rollback is a slot-copy instead of a target re-run. Otherwise the
+        # single-state save: at the last REAL token (HAS_REAL_LEN) or post-loop,
+        # so a following decode continues from the un-polluted state.
         if SAVE_STEPS:
             alloy.store(
                 recurrent_state + s * (BATCH * NV * DK * DV) + state_col_addr,
@@ -607,9 +589,8 @@ def chunked_gdr_stage1(
 
     One threadgroup per (batch, value-head, chunk) — fully parallel over all
     NC×NV chunks (no cross-chunk dependency), so the expensive T-inversion /
-    intra-chunk attention saturates the GPU and is computed exactly ONCE per
-    chunk (vs the single-dispatch kernel's per-DV-block recompute). Emits the
-    per-chunk quantities the serial scan (stage 2) consumes:
+    intra-chunk attention saturates the GPU and is computed once per chunk.
+    Emits the per-chunk quantities the serial scan (stage 2) consumes:
       W   = T @ (kᵦ·exp_gc)         (C, DK)   → W_out      (B,NV,S,DK)
       T   = (I - A)⁻¹               (C, C)    → T_out      (B,NV,NC,C,C)
       attn= tril(q@kᵀ)·dm           (C, C)    → attn_out   (B,NV,NC,C,C)
@@ -758,16 +739,14 @@ def chunked_gdr_stage2(
     )
     state = alloy.cast(alloy.load(recurrent_state + state_addr), alloy.float32)
 
-    # Runtime chunk bound. With HAS_REAL_LEN (padded one-shot / bucketed prefill)
-    # stage-1 zeroed g/beta for tokens past the real boundary, so every chunk that
-    # lies entirely in the pad region is a state-preserving no-op (decay=exp(0)=1,
-    # vb=0 → v_new=0 → state unchanged) AND its `out` rows are padding nobody reads.
-    # Bounding the serial scan to ceil(real_len / C) skips those chunks outright, so
-    # the scan cost tracks the real prompt length instead of the padded S = M_MAX —
-    # this is what removes the one-shot small-prompt floor (stage 2 was the only
-    # kernel whose grid is over heads/DV-blocks, not M, so the exact-grid recipe
-    # couldn't shrink it). Without a real_len (decode / exact-length prefill where
-    # S == real_len) the full static NC is correct.
+    # Runtime chunk bound. With HAS_REAL_LEN (padded prefill) stage-1 zeroed
+    # g/beta past the real boundary, so every chunk entirely in the pad region
+    # is a state-preserving no-op (decay=exp(0)=1, vb=0 → v_new=0 → state
+    # unchanged) AND its `out` rows are padding nobody reads. Bounding the
+    # serial scan to ceil(real_len / C) skips those chunks, so the scan cost
+    # tracks the real prompt length instead of the padded S. Without a real_len
+    # (decode / exact-length prefill where S == real_len) the full static NC is
+    # correct.
     if HAS_REAL_LEN:
         rl_i = alloy.cast(alloy.load(real_len_t + 0), alloy.int32)
         nc_real = (rl_i + (C - 1)) // C
@@ -848,24 +827,22 @@ def recurrent_gdr_dvblock_save(
     verify's GDR. Per-column math is OP-FOR-OP `recurrent_gated_delta_rule`
     (serial-grade numerics — the chunked T-inverse path's f32 logit
     deviation flips gate near-ties at ~6× the rate budget on repetitive
-    rows), but one program owns EIGHT dv columns: the original kernel's
-    one program per (head, dv) re-reads the full 512B k/q rows once PER
-    dv COLUMN (B·NV·DV programs × 1KB × S ≈ 96MB/dispatch at S=16 — the
-    measured ~0.25ms cost, which is neither barriers nor bank stores);
-    blocking 8 columns into one program cuts that 8× while the k/q loads,
-    the qk reduction, and the g/beta scalars amortize across the block.
+    rows), but one program owns EIGHT dv columns: one program per (head, dv)
+    re-reads the full 512B k/q rows once PER dv COLUMN (B·NV·DV programs ×
+    1KB × S ≈ 96MB/dispatch at S=16); blocking 8 columns into one program
+    cuts that 8× while the k/q loads, the qk reduction, and the g/beta
+    scalars amortize across the block.
 
     The eight columns are EXPLICIT NAMED carried (DK,) register tiles
     (state0..state7), not a (DK, 8) tile: the runtime-loop carry contract
     is name-based (ast_rewrite's `defined & modified_in_body`), and a 2D
-    carried tile built via broadcast outer product hits the documented
-    val_loc='address' fallout — concretely, the (1, DVB) delta lives only
-    on thread/row 0 (the emitter row-guards elementwise ops on shmem
-    (1, N) tiles and emits NO inter-thread broadcast), so the
-    (DK,1)·(1,DVB) state update silently consumes garbage on rows 1+ and
-    the elementwise carry update never writes back to the carried shmem
-    tile. Eight 1D columns keep every intermediate either per-thread
-    (DK,) or a reduction scalar — the serial kernel's proven shapes.
+    carried tile built via broadcast outer product hits the val_loc='address'
+    fallout — the (1, DVB) delta lives only on thread/row 0 (the emitter
+    row-guards elementwise ops on shmem (1, N) tiles and emits NO inter-thread
+    broadcast), so the (DK,1)·(1,DVB) state update silently consumes garbage
+    on rows 1+ and the elementwise carry update never writes back to the
+    carried shmem tile. Eight 1D columns keep every intermediate either
+    per-thread (DK,) or a reduction scalar.
 
     Does NOT write recurrent_state (read-only seed — slot 0 must stay
     the PRE-round state for the session's `gdr_state_reconstruct`) and
@@ -1078,18 +1055,16 @@ def gdr_state_reconstruct(
     This is `recurrent_gated_delta_rule`'s math and addressing verbatim
     (minus q/out/bank stores), NOT a replay of the chunked formulation's
     deltas: the chunked T-inverse path deviates from the serial state by
-    ~1e-2 on ill-conditioned (repetitive) rows, which tripped near-tie
+    ~1e-2 on ill-conditioned (repetitive) rows, which trips near-tie
     divergences ~6× over the gate's rate budget; the serial recurrence
     tracks plain decode at ~2e-4. One dispatch per layer per ROUND —
-    dispatched by the SESSION between plan replays — replacing the
-    serial SAVE_STEPS kernel's full slot bank: materializing all S
-    per-token states costs S × the 2MB fp32 state in pure write
-    bandwidth (~0.25ms/layer in-schedule at S=16, the measured floor),
-    while the session only ever consumes ONE of them. n_t holds the
-    runtime token count (num_accepted + 1) as FLOAT32 — an int32 buffer
-    binds as float* and the bit-pattern reads as a denormal → 0-trip
-    loop. The in-place slot-0 read+write within one program is the
-    serial kernel's own SAVE_STEPS=0 pattern.
+    dispatched by the SESSION between plan replays — instead of a full
+    slot bank: materializing all S per-token states costs S × the 2MB fp32
+    state in write bandwidth (~0.25ms/layer at S=16) while the session only
+    ever consumes ONE of them. n_t holds the runtime token count
+    (num_accepted + 1) as FLOAT32 — an int32 buffer binds as float* and the
+    bit-pattern reads as a denormal → 0-trip loop. The in-place slot-0
+    read+write within one program is the serial kernel's SAVE_STEPS=0 pattern.
 
     Grid: (BATCH * NV * DV,), like the serial kernel.
     """
@@ -1149,9 +1124,8 @@ def rms_norm_gated(
       out = h * silu(z)   # gate applied last
 
     **2D launch**: axis-0 = position (B*S), axis-1 = head (0..HEADS); buffer row is
-    `pos*HEADS + head`. Same logical rows as a 1D `(B*S*HEADS,)` grid, but the
-    position on axis-0 lets the one-shot prefill recipe shrink to the real prompt
-    length (it only shrinks axis-0; at B=1 axis-0 = S = M).
+    `pos*HEADS + head`. The position on axis-0 lets the prefill recipe shrink to
+    the real prompt length (it only shrinks axis-0; at B=1 axis-0 = S = M).
     """
     pos = alloy.program_id(0)
     head = alloy.program_id(1)

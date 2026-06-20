@@ -80,12 +80,10 @@ class RowBroadcastTransform(IndexTransform):
     The buffer is indexed only by column: name[col]. The row dimension is ignored.
     This handles the common case of bias (N,) broadcast to (M, N).
 
-    `size` is the column dimension (N). It's only needed by `flat()` so the
-    flat-index path can wrap with modular arithmetic — the tile_2d path
-    ignores the row coordinate directly. When the disambiguation can't infer
-    N (size=0), `flat()` falls back to returning expr unchanged; callers that
-    use a flat-indexing kernel should pass size to avoid the (m*N + col)
-    out-of-bounds bug.
+    `size` is the column dimension (N), needed only by `flat()` to wrap with
+    modular arithmetic; the tile_2d path ignores the row coordinate directly.
+    When N can't be inferred (size=0), `flat()` returns expr unchanged; callers
+    using a flat-indexing kernel must pass size to avoid an out-of-bounds index.
     """
 
     def __init__(self, size: int = 0):

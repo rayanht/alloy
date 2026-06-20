@@ -1,9 +1,8 @@
-"""Shared helper: build the real forward passes a model dispatches.
+"""Build the real forward passes a model dispatches.
 
-Used by `alloy profile` and `alloy inspect` to capture the kernels a model
-actually runs in production — not an idealized re-derivation. The result is a
-`ModelCapture`: a model kind plus an ordered list of `CapturePass`es that the
-commands iterate uniformly.
+Used by `alloy profile` and `alloy inspect` to capture the kernels a model runs
+in production. The result is a `ModelCapture`: a model kind plus an ordered list
+of `CapturePass`es that the commands iterate uniformly.
 
 Two model kinds:
 
@@ -11,7 +10,7 @@ Two model kinds:
     real KV cache. Mirrors the generator's attention path (fp32 Q + fp16 KV
     via the alloy cache-attention ops).
   - **embedder** (nomic-bert): one pass per (batch, seq) shape over the
-    encoder's single forward — no cache, no decode. Drives the exact compiled
+    encoder's single forward — no cache, no decode. Drives the compiled
     forward the embedding server pins, via `nomic_bert.build_nomic_forward`.
 """
 
@@ -35,18 +34,17 @@ from alloy_server.models.attention import set_deltanet_attn_mask, set_use_alloy_
 from alloy_server.models.mtp import MTPDraftStep, load_quantized_mtp
 from alloy_server.models.nomic_bert import build_nomic_forward
 
-# Default prefill depth for `alloy profile` / `alloy inspect`. A representative
-# production context and a tier of `alloy bench --depths {512,4096,16384}`, so a
-# slow (model, depth) row from the bench profiles 1:1 here. Override with --depth.
+# Default prefill depth for `alloy profile` / `alloy inspect`. A tier of
+# `alloy bench --depths {512,4096,16384}`, so a slow (model, depth) bench row
+# profiles 1:1 here. Override with --depth.
 _DEFAULT_DEPTH = 4096
 
 # GGUF `general.architecture` values that route to the encoder/embedding path.
 _EMBEDDER_ARCHITECTURES = frozenset({"nomic-bert"})
 
 # Embedder shape defaults. With no --batch/--seq, profile a short and a long
-# bucket so the output mirrors the causal prefill/decode pair and surfaces the
-# win-short / lose-long contrast directly. Either flag pins a single shape,
-# filling the unpassed dimension from these.
+# bucket (mirroring the causal prefill/decode pair). Either flag pins a single
+# shape, filling the unpassed dimension from these.
 _DEFAULT_EMBED_BATCH = 8
 _DEFAULT_EMBED_SEQ = 128
 _EMBED_SHORT_SHAPE = (8, 32)
@@ -70,18 +68,17 @@ class CapturePass:
     # Explicit plans to profile (passed to `alloy.visualize(plans=…)`). Set for
     # passes that replay an eager-compiled pinned plan — the grid-shrunk partial
     # chunk — which never re-enters the torch.compile backend, so the default
-    # auto-capture from `_all_compiled_plans` would find nothing. None → auto.
+    # auto-capture from `_all_compiled_plans` finds nothing. None → auto.
     # Late-bound: the shrunk pass's setup fills it in (pinned plans only exist
     # after its eager_compile_all).
     plans: list | None = None
     # Context-manager factory `alloy.visualize` wraps around its FIRST run()
     # call (the compile run after the dynamo reset). Causal passes set the
-    # generator's `plan_compile_window` so the compile is record-only (phantom
-    # intermediates, no GPU — a REAL run-0 holds every intermediate of the
-    # forward live at once; measured 100+ GB on qwen3.6:35b's 4096-chunk
-    # prefill) and the captured plan carries the production grid-shrink
-    # properties. None → the compile run executes unwrapped (embedder /
-    # vision / pinned-plan passes, whose first run is small or plan-replay).
+    # generator's `plan_compile_window` so the compile is record-only — a REAL
+    # run-0 holds every intermediate of the forward live at once (100+ GB on
+    # qwen3.6:35b's 4096-chunk prefill) — and the captured plan carries the
+    # production grid-shrink properties. None → the compile run executes
+    # unwrapped (embedder / vision / pinned-plan passes).
     compile_ctx: Callable[[], object] | None = None
 
 
@@ -109,19 +106,16 @@ def build_capture(
 
     Causal models profile the production chunked-prefill + decode paths on
     SYNTHETIC tokens at cache depth `depth` — the same methodology as
-    `alloy bench --depths`, so a slow (model, depth) row from the bench profiles
-    1:1 here (clean bench → profile chain for someone optimizing a model). The
-    KV cache is sized to the model's native context. Prefill emits BOTH shapes
-    generation dispatches: the full chunk (saturated GEMMs, compile-path
-    auto-capture) and the grid-shrunk partial last chunk (pinned-plan replay,
-    profiled at the shrunk launch). Embedders ignore `depth` (they use
-    `batch`/`seq`).
+    `alloy bench --depths`. The KV cache is sized to the model's native context.
+    Prefill emits BOTH shapes generation dispatches: the full chunk (saturated
+    GEMMs, compile-path auto-capture) and the grid-shrunk partial last chunk
+    (pinned-plan replay, profiled at the shrunk launch). Embedders ignore
+    `depth` (they use `batch`/`seq`).
 
     `mtp=True` appends the MTP self-speculation round's two extra forwards — the
     hidden-emitting M=2 verify and the M=1 draft (block + shared lm_head) — so
-    the per-kernel breakdown exposes what a spec round costs over plain decode
-    (the lever for lowering the acceptance break-even). Causal-only; raises if
-    the model ships no MTP head.
+    the per-kernel breakdown exposes what a spec round costs over plain decode.
+    Causal-only; raises if the model ships no MTP head.
     """
     if _model_architecture(model) in _EMBEDDER_ARCHITECTURES:
         if mtp:
@@ -135,39 +129,34 @@ def _build_causal_capture(
 ) -> ModelCapture:
     loaded = load_native_causal_lm(model)
     hf_model = loaded.model.eval()
-    # Build the production generator and profile ITS forwards — that's what makes
-    # this "the kernels the model actually runs". from_model installs the
-    # multi-token-attention patch, sizes the KV cache to the model's native
-    # context, and owns the exact chunked-prefill (cold→warm, per-chunk DeltaNet
-    # mask + cumulative_length threading) and decode paths the server runs. We do
-    # NOT eager_compile: that pins plans and bypasses Dynamo, but `visualize`
-    # reads `_all_compiled_plans` (the torch.compile path), so keep prefill/decode
-    # on the compiled path. (The grid-shrunk pass below is the exception — its
-    # whole point is the pinned exact-grid plan, so it eager-compiles in its
-    # setup and runs LAST, after every auto-capture pass has been profiled.)
+    # Build the production generator and profile ITS forwards. from_model
+    # installs the multi-token-attention patch, sizes the KV cache to the native
+    # context, and owns the chunked-prefill (cold→warm, per-chunk DeltaNet mask +
+    # cumulative_length threading) and decode paths the server runs. We do NOT
+    # eager_compile here: that pins plans and bypasses Dynamo, but `visualize`
+    # reads `_all_compiled_plans` (the torch.compile path), so prefill/decode stay
+    # on the compiled path. (The grid-shrunk pass below is the exception — it
+    # needs the pinned exact-grid plan, so it eager-compiles in its setup and runs
+    # LAST, after every auto-capture pass has been profiled.)
     gen = AlloyGenerator.from_model(
         hf_model, cache_dtype=torch.float16, vision=loaded.vision, audio=loaded.audio,
         chunk_prefill_size=resolve_prefill_policy(),
     )
-    # The engines are pure executors that dispatch INJECTED modules; build them
-    # (cheap — the compile is lazy on first call, which is what `visualize`
-    # captures). Profile/inspect deliberately skip the full eager_compile_all
-    # (it pins plans + bypasses Dynamo), but the modules must still exist.
+    # Build the engine modules (compile is lazy on first call, which is what
+    # `visualize` captures); the full eager_compile_all is skipped here.
     gen.build_modules()
-    context = gen.max_cache_len  # native context (derived, never passed)
+    context = gen.max_cache_len  # native context
     chunk = gen.chunk_prefill_size
     if not (1 <= depth < context):
         raise ValueError(f"--depth {depth} must be in [1, {context}) for {model}")
 
     # Profile ONE chunk-sized forward at the DEEPEST offset (depth − chunk): its
     # full-attention layers scan the whole `depth` KV, so the per-kernel breakdown
-    # is the kernel mix at max depth and `wall − GPU-busy` exposes the per-chunk
-    # dispatch overhead — WITHOUT re-running all ceil(depth/chunk) chunks (visualize
-    # replays each pass ~29× for timing, so a full chunked loop would be ~29·n_chunks
-    # forwards). The cold prime lays down the DeltaNet recurrent state + KV (both
-    # depth-independent in cost); cumulative_length then drives the attention scan
-    # extent. Synthetic tokens are throughput-equivalent to prose (matches
-    # `alloy bench --depths`).
+    # is the kernel mix at max depth — WITHOUT re-running all ceil(depth/chunk)
+    # chunks (visualize replays each pass ~29× for timing, so a full chunked loop
+    # would be ~29·n_chunks forwards). The cold prime lays down the DeltaNet
+    # recurrent state + KV; cumulative_length then drives the attention scan
+    # extent.
     vocab = int(hf_model.config.vocab_size)
     chunk_len = min(chunk, depth)
     offset = depth - chunk_len  # cold (0) when depth <= chunk, else warm at depth−chunk
@@ -179,8 +168,7 @@ def _build_causal_capture(
 
     def _set_fill(cache: object, pos: int) -> None:
         # One cumulative_length aliased across layers drives the full-attention
-        # scan extent; it scans `pos` positions regardless of KV content (cost is
-        # content-independent, which is all profiling needs).
+        # scan extent; it scans `pos` positions regardless of KV content.
         cache.layers[0].cumulative_length.fill_(pos)
 
     prefill_cache = gen.kv.acquire(1, context)
@@ -189,10 +177,9 @@ def _build_causal_capture(
         gen.reset_prefix_state()
         _set_fill(prefill_cache, 0)
         # The cold prime compiles the cold-prefill graph — it MUST run inside
-        # the production plan-compile window (record-only + grid-shrink
-        # globals): a real run-0 of a large chunk OOMs the machine, and the
-        # window is what makes the compiled plan the production plan. Same
-        # for every other compile-triggering prime below.
+        # the production plan-compile window (record-only + grid-shrink globals):
+        # a real run-0 of a large chunk OOMs the machine, and the window makes
+        # the compiled plan the production plan. Same for the primes below.
         with gen.plan_compile_window(chunk):
             gen.prefill.chunk_step(chunk_ids, prefill_cache, chunk, start_pos=0)  # cold prime
 
@@ -236,16 +223,14 @@ def _build_causal_capture(
     ]
 
     # MTP self-speculation: the two extra forwards a spec round runs on top of
-    # plain decode (M=2 verify + M=1 draft), so the per-kernel breakdown shows
-    # what the round costs and where the acceptance break-even can be lowered.
+    # plain decode (M=2 verify + M=1 draft).
     if mtp:
         passes.extend(
             _build_mtp_passes(model, gen, depth=depth, chunk=chunk, chunk_ids=chunk_ids)
         )
 
-    # Modality front-ends (vision today; audio / qwen3.5-vision later) each expose
-    # their profilable forwards via capture_targets() — same seam `alloy tune`
-    # uses. Each becomes its own pass, written to `<model>_<name>.html`.
+    # Modality front-ends expose their profilable forwards via capture_targets().
+    # Each becomes its own pass, written to `<model>_<name>.html`.
     if loaded.vision is not None:
         for target in loaded.vision.capture_targets():
             stage = torch.compile(target.module, backend="alloy", dynamic=False)
@@ -263,11 +248,11 @@ def _build_causal_capture(
     # then ONE partial chunk whose M-tiled grids shrink to the real remainder —
     # via the eager-compiled PINNED plan (the server's replay path). The
     # compile-path prefill pass above cannot show this (grid shrink is a
-    # plan-replay feature), so this pass eager-compiles in its setup, replays
-    # the pinned plan, and profiles at the shrunk grid the run dispatched
-    # (`plans=[…]` + `_last_grid_shrink_updates`). It MUST stay the LAST pass:
-    # eager_compile_all pins plans, after which gen forwards replay them and
-    # the earlier passes' `_all_compiled_plans` auto-capture would find nothing.
+    # plan-replay feature), so this pass eager-compiles in its setup, replays the
+    # pinned plan, and profiles at the shrunk grid (`plans=[…]` +
+    # `_last_grid_shrink_updates`). It MUST stay the LAST pass: eager_compile_all
+    # pins plans, after which the earlier passes' `_all_compiled_plans`
+    # auto-capture finds nothing.
     rem = depth % chunk
     synthesized = rem == 0
     shrunk_len = rem if rem > 0 else min(chunk // 2, depth)
@@ -283,8 +268,8 @@ def _build_causal_capture(
         gen.reset_prefix_state()
         _set_fill(shrunk_cache, 0)
         gen.prefill.chunk_step(chunk_ids, shrunk_cache, chunk, start_pos=0)  # cold prime
-        # Late-bind the pinned plan (it only exists after eager_compile_all):
-        # warm for a mid-prompt partial chunk, cold when the prompt fits one.
+        # Late-bind the pinned plan (only exists after eager_compile_all): warm
+        # for a mid-prompt partial chunk, cold when the prompt fits one.
         pinned = gen.plans.prefill_plans.get((chunk, shrunk_offset > 0))
         if pinned is not None:
             shrunk_pass.plans = [pinned[0]]
@@ -315,8 +300,7 @@ def _build_mtp_passes(
     """The two extra forwards an MTP spec round runs on top of plain decode: the
     hidden-emitting M=2 verify (full backbone at seq_len=2) and the M=1 draft
     (one MTP block + the shared lm_head). Both profiled at cache `depth` so their
-    attention scans the same KV extent as the decode pass — the cost delta vs
-    decode is exactly the speculation overhead the round must amortize.
+    attention scans the same KV extent as the decode pass.
     """
     resolved = resolve_model(model)
     if not isinstance(resolved, ResolvedGGUF):
@@ -336,8 +320,8 @@ def _build_mtp_passes(
     prefill_len = min(chunk, depth)
 
     # --- verify (M=2): full backbone at seq_len=2, emits (argmax, hidden). Primed
-    # like the decode pass (one cold chunk lays down DeltaNet + KV state, then
-    # cumulative_length drives the attention scan to `depth`). ---
+    # like the decode pass: one cold chunk lays down DeltaNet + KV state, then
+    # cumulative_length drives the attention scan to `depth`. ---
     verify = torch.compile(VerifySpecLogits(gen.model, (), True), backend="alloy", dynamic=False)
     vcache = gen.kv.acquire(1, context)
     v_in = chunk_ids[:, -1:].repeat(1, 2).contiguous()  # [t, t]
@@ -368,7 +352,7 @@ def _build_mtp_passes(
 
     # --- draft (M=1): one MTP full-attention block + the shared lm_head, over the
     # MTP's own single-layer cache. cache_position=depth makes its attention scan
-    # `depth` slots (content-independent cost, same trick as decode). ---
+    # `depth` slots. ---
     draft = torch.compile(MTPDraftStep(mtp), backend="alloy", dynamic=False)
     mcache = AlloyStaticCache(
         config=mtp.cache_config, max_cache_len=context,
@@ -378,8 +362,8 @@ def _build_mtp_passes(
     dcp = torch.tensor([depth], dtype=torch.int32)
     te = torch.zeros((1, 1, hidden), dtype=gen.cache_dtype)
     hid = torch.zeros((1, 1, hidden), dtype=gen.cache_dtype)
-    # Real partial-rope cos/sin for position `depth`, straight from the model's
-    # rotary_emb (gives the correct (1, 1, rotary_dim) shape — no head-dim math).
+    # Real partial-rope cos/sin for position `depth`, from the model's
+    # rotary_emb (gives the correct (1, 1, rotary_dim) shape).
     cos, sin = gen.model.model.rotary_emb(te, dpos)
     cos = cos.to(gen.cache_dtype).contiguous()
     sin = sin.to(gen.cache_dtype).contiguous()
@@ -435,24 +419,21 @@ def capture_kernel_dispatch(
     """Capture the production dispatch(es) of `kernel` for `model`, ready to replay.
 
     Drives the model's real chunked-prefill forward at cache `depth` (or the M=1
-    decode forward when `decode=True`) — the SAME warm-offset path `alloy tune`
-    and `alloy inspect` use — and captures the target kernel with its
-    production-resolved constexprs and real input buffers. This is what lets
-    `alloy microbench` / `alloy profile --capture` replay the EXACT kernel the
-    server runs with zero hand-typed constexprs or buffer shapes.
+    decode forward when `decode=True`) and captures the target kernel with its
+    production-resolved constexprs and real input buffers, so `alloy microbench`
+    / `alloy profile --capture` replay the exact kernel the server runs.
 
     Returns `(matches, all_names)`: `matches` are the captured dispatches whose
     name matches `kernel` (exact, else substring); `all_names` is every kernel the
-    forward dispatched (for a useful "not found — kernels seen: …" error).
+    forward dispatched (for the "not found — kernels seen: …" error).
     """
     loaded = load_native_causal_lm(model)
     net = loaded.model.eval()
     context = int(net.config.max_position_embeddings)
     # from_model installs the multi-token-attention patch + wires chunked prefill,
-    # so the captured forward exercises the exact production dispatch path. The
-    # server's chunk policy matters: without it the default 128-chunk makes
-    # `alloy microbench` time an M=128 dispatch that production (4096-chunk)
-    # never runs at depths > 128.
+    # so the captured forward exercises the production dispatch path. The chunk
+    # policy matters: without it the default 128-chunk makes `alloy microbench`
+    # time an M=128 dispatch that production (4096-chunk) never runs at depths > 128.
     gen = AlloyGenerator.from_model(net, chunk_prefill_size=resolve_prefill_policy())
     chunk = gen.chunk_prefill_size
     if not (1 <= depth < context):
@@ -470,9 +451,8 @@ def capture_kernel_dispatch(
         compiled = torch.compile(net, backend="alloy", dynamic=False)
         with torch.inference_mode(), gen.plan_compile_window(chunk):
             # Window: a REAL run-0 of a full chunk holds every forward
-            # intermediate live at once (100+ GB on a 35B MoE) — the prime
-            # only needs the compile + python state side effects, not KV
-            # contents (capture timing is content-independent).
+            # intermediate live at once (100+ GB on a 35B MoE); the prime only
+            # needs the compile + python state side effects, not KV contents.
             compiled(
                 input_ids=torch.zeros((1, chunk), dtype=torch.long),
                 position_ids=torch.arange(chunk).unsqueeze(0),
@@ -498,7 +478,7 @@ def capture_kernel_dispatch(
         compiled = torch.compile(net, backend="alloy", dynamic=False)
         set_deltanet_attn_mask(cache, torch.ones((1, chunk), dtype=torch.long))
         with torch.inference_mode(), gen.plan_compile_window(chunk):
-            # Window: see the decode prime above — compile + state only.
+            # Window: compile + state only (see the decode prime above).
             compiled(
                 input_ids=torch.zeros((1, chunk), dtype=torch.long),
                 position_ids=torch.arange(chunk).unsqueeze(0),
@@ -540,12 +520,11 @@ def capture_kernel_dispatch(
     with torch.inference_mode():
         if pass_name == "prefill":
             # The prefill capture forward is the explosive one (chunk-sized
-            # run-0): capture record-only inside the production window, so
-            # memory stays bounded AND the resolved kernels are the production
+            # run-0): capture record-only inside the production window, so memory
+            # stays bounded AND the resolved kernels are the production
             # (grid-shrink-mode) variants. Phantom intermediates materialize
-            # zero-filled on first replay (`dispatch_captured`). The decode /
-            # mtp captures above stay real — M=1/M=2 intermediates are tiny
-            # and real buffers replay with realistic contents.
+            # zero-filled on first replay. The decode / mtp captures stay real —
+            # M=1/M=2 intermediates are tiny and replay with realistic contents.
             with gen.plan_compile_window(chunk_len):
                 captured = capture_kernel_for_replay(net, inputs, record_only=True)
         else:
@@ -580,9 +559,8 @@ def _build_embedder_capture(
     for name, b, s in shapes:
         if s > ceiling:
             raise ValueError(f"seq {s} exceeds model context length {ceiling}")
-        # Content is irrelevant to kernel shape/timing; the mask is all-ones so
-        # attention runs the full seq×seq cost (the long-seq case we profile),
-        # never a padded short-circuit. Pinned for a static compiled plan.
+        # The mask is all-ones so attention runs the full seq×seq cost, never a
+        # padded short-circuit. Pinned for a static compiled plan.
         input_ids = (torch.arange(b * s, dtype=torch.long) % max(1, vocab - 1)).reshape(b, s)
         input_ids = input_ids.contiguous()
         attention_mask = torch.ones((b, s), dtype=torch.long)

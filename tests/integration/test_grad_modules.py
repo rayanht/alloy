@@ -1,16 +1,13 @@
 """Module-level gradient correctness — small compositions of ops.
 
-These sit between op-level tests (``test_grad_ops.py``) and end-to-end
-model tests (``test_grad_models.py``). They exercise backward paths that
-op-level tests don't cover because each op runs in isolation:
+Between op-level tests (``test_grad_ops.py``) and end-to-end model tests
+(``test_grad_models.py``). Exercises backward paths op-level tests don't
+cover because each op runs in isolation:
 
   * parameter grads for an ``nn.Module`` with multiple layers,
-  * residual connections (grads flow through the add + through the
-    subgraph and must sum correctly),
+  * residual connections (grads through the add + the subgraph must sum),
   * prenorm vs postnorm layouts,
   * GELU / SiLU fused into the MLP block.
-
-Shapes are tiny so the whole file stays under ~5s wall time.
 """
 
 from __future__ import annotations
@@ -198,7 +195,7 @@ class TestTransformerBlock:
 
 # ---------------------------------------------------------------------------
 # LM head + cross-entropy — the tail of a causal LM, including the sliced-
-# label shift pattern that broke Llama training.
+# label shift pattern.
 # ---------------------------------------------------------------------------
 
 

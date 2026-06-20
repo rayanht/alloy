@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import ast
 
-# AST rewrite — convert for/while loops into traced loop hooks
-# ---------------------------------------------------------------------------
-
 
 def _collect_assigned(stmts: list[ast.stmt]) -> set[str]:
     """Collect all variable names assigned in a list of statements."""
@@ -509,12 +506,9 @@ def _rewrite_kernel_source(func_ast: ast.Module) -> ast.Module | None:
     """Apply the loop/flow-control rewrite to a kernel AST in place; returns
     the rewritten AST, or None if no rewrite was needed.
 
-    `func_ast` is mutated directly. Both callers hand us a throwaway
-    `ast.parse(source)` they don't retain, so deep-copying it first (as this
-    did) was pure overhead — and a costly one: the copy ran on every kernel
-    trace and dominated eager-compile time (~7s of `copy.deepcopy` across a
-    full model load, ~8M AST-node copies). `ast.parse` already returns a fresh
-    tree, so re-parsing — not copying — is the way to get an isolated AST.
+    `func_ast` is mutated directly. Callers hand us a throwaway `ast.parse(source)`
+    they don't retain, so no defensive copy is needed (deep-copying it cost ~7s of
+    `copy.deepcopy` per full model load — ~8M AST-node copies).
     """
     tree = func_ast
     func_def = None
@@ -534,6 +528,3 @@ def _rewrite_kernel_source(func_ast: ast.Module) -> ast.Module | None:
 
     ast.fix_missing_locations(tree)
     return tree
-
-
-# ---------------------------------------------------------------------------

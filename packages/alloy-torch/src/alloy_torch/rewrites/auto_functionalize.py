@@ -54,14 +54,11 @@ def rewrite_unwrap_auto_functionalized(graph: torch.fx.Graph) -> int:
             continue
         # args[0] is the wrapped op overload; remaining args/kwargs are its
         # positional args and mutated-input kwargs (named `_<name>_base_index`
-        # and a flat `_all_bases` list per torch internals). For alloy custom
-        # ops we keep things simple: pull every kwarg named after a schema arg
-        # and pass it positionally to the underlying op.
+        # and a flat `_all_bases` list per torch internals). Pull every kwarg
+        # named after a schema arg and pass it positionally to the op.
         op_overload = node.args[0]
         if not isinstance(op_overload, torch._ops.OpOverload):
             continue
-        # Only handle ops in the alloy namespace — other libraries may have
-        # different functionalization conventions.
         if op_overload.namespace != "alloy":
             continue
         arg_names = _arg_specs_for(op_overload)
@@ -84,10 +81,8 @@ def rewrite_unwrap_auto_functionalized(graph: torch.fx.Graph) -> int:
             if name in kw:
                 positional.append(kw.pop(name))
                 continue
-            # Schema default
             positional.append(None)
 
-        # Insert direct call after this HOP node.
         with graph.inserting_after(node):
             direct = graph.call_function(op_overload, tuple(positional), {})
 

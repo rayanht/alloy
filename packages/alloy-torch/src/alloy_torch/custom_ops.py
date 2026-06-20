@@ -131,19 +131,16 @@ _alloy_lib.define(
 )
 # Unified cache-attention op: one FX node for decode (seq_len==1), spec-decode
 # verify (seq_len<=_MAX_VERIFY_K), and prefill (seq_len>_MAX_VERIFY_K). The
-# handler picks the right kernel path from the runtime seq_len, so the model
-# body has no seq_len branch and Dynamo can trace decode + prefill as ONE
-# graph (mirrors `linear_attention_update`, which already branches on seq_len
-# inside its handler). Replaces the 3-way op split in `alloy_cache_attention`.
+# handler picks the kernel path from the runtime seq_len, so the model body has
+# no seq_len branch and Dynamo traces decode + prefill as ONE graph.
 _alloy_lib.define(
     "attention_cache(Tensor q, Tensor new_k, Tensor new_v, "
     "Tensor cache_pos, Tensor k_cache, Tensor v_cache, float scale, "
     "int sliding_window=0, bool write_kv=True, Tensor? last_real=None) -> Tensor"
 )
 # q8_0 quantized-KV decode attention: the codes/scales caches replace the fp16
-# K/V caches. Cache buffers are plain Tensor inputs (alloy-owned, static-
-# address; the kernels mutate them GPU-side) — the same contract
-# `attention_cache` uses for k_cache/v_cache.
+# K/V caches. Cache buffers are plain Tensor inputs (alloy-owned, static-address;
+# kernels mutate them GPU-side) — same contract as `attention_cache`.
 _alloy_lib.define(
     "attention_cache_q8(Tensor q, Tensor new_k, Tensor new_v, "
     "Tensor cache_pos, Tensor k_codes, Tensor k_scales, "
@@ -151,11 +148,10 @@ _alloy_lib.define(
     "float scale=-1.0, int sliding_window=0, bool write_kv=True, "
     "Tensor? last_real=None) -> Tensor"
 )
-# DFlash draft block attention: like
-# attention_kv_update_multi but every query row attends the WHOLE new-token
-# block (bidirectional within block) plus the full context KV — the block
-# diffusion mask. Same fused KV write of the block rows at
-# [cache_pos, cache_pos+M).
+# DFlash draft block attention: like attention_kv_update_multi but every query
+# row attends the WHOLE new-token block (bidirectional within block) plus the
+# full context KV — the block diffusion mask. Same fused KV write of the block
+# rows at [cache_pos, cache_pos+M).
 _alloy_lib.define(
     "attention_kv_update_multi_bidir(Tensor q, Tensor new_k, Tensor new_v, "
     "Tensor cache_pos, Tensor k_cache, Tensor v_cache, "
@@ -175,18 +171,15 @@ _alloy_lib.define(
 )
 # On-GPU categorical sampler — replaces the decode argmax when sampling is
 # requested. `logits` is (..., V); reduces the last dim to a sampled token id
-# (..., ) int64, mirroring `argmax(dim=-1)` so the C++ greedy loop is unchanged.
-# `position` (cache_position) is the RNG counter the loop already advances each
-# step; `seed` + `params` ([temperature, top_p, top_k, min_p]) are stable inputs.
+# (..., ) int64, mirroring `argmax(dim=-1)`. `position` (cache_position) is the
+# RNG counter; `seed` + `params` ([temperature, top_p, top_k, min_p]) are stable.
 _alloy_lib.define(
     "sample_categorical(Tensor logits, Tensor position, Tensor seed, Tensor params) -> Tensor"
 )
-# Qwen 3.5 GatedDeltaNet (linear-attention) layer core. Subsumes the
-# causal Conv1d (with rolling state), the chunked- or recurrent- gated
-# delta rule, and the RMSNormGated. The conv_state and recurrent_state
-# arguments are marked mutable so AOT autograd doesn't lift the in-
-# graph state update — same contract that `attention_kv_update` uses
-# for the regular KV cache.
+# Qwen 3.5 GatedDeltaNet (linear-attention) layer core. Subsumes the causal
+# Conv1d (with rolling state), the chunked-/recurrent- gated delta rule, and the
+# RMSNormGated. conv_state and recurrent_state are marked mutable so AOT autograd
+# doesn't lift the in-graph state update — same contract as `attention_kv_update`.
 #
 # Shape contract:
 #   mixed_qkv:        (B, S, conv_dim) = (B, S, key_dim*2 + value_dim)
@@ -225,11 +218,10 @@ _alloy_lib.define(
     "Tensor n_valid, Tensor grad_loss, int ignore_index) -> Tensor"
 )
 # LFM2 short-conv (conv-mixer) layer core. Subsumes the causal depthwise Conv1d
-# (kernel size conv_kernel_size) with rolling state. The `conv_state` argument is
-# marked mutable so AOT autograd keeps the in-graph state update (same contract
-# `linear_attention_update` uses for the DeltaNet conv). Unlike DeltaNet there is
-# NO SiLU and NO recurrent rule — LFM2's conv emits the linear conv directly;
-# the in_proj `B*x` gate and the post-conv `C*` gate stay in the FX graph.
+# (kernel size conv_kernel_size) with rolling state. `conv_state` is marked
+# mutable so AOT autograd keeps the in-graph state update. Unlike DeltaNet there
+# is NO SiLU and NO recurrent rule — the conv emits the linear conv directly; the
+# in_proj `B*x` gate and the post-conv `C*` gate stay in the FX graph.
 #
 # Shape contract:
 #   bx:           (B, S, C)   — the gated `B * x` channels (C = hidden_size)
@@ -425,9 +417,7 @@ def _linear_attention_update_meta(
     has_previous_state: bool,
     real_len: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    # Output is (B, S, value_dim) = (B, S, num_v_heads * head_v_dim).
-    # `z` already has the right shape contract (B, S, value_dim), so
-    # we use that for shape inference.
+    # Output is (B, S, value_dim); `z` already has that shape contract.
     return torch.empty_like(z)
 
 

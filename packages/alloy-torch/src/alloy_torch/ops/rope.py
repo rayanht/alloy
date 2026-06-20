@@ -33,7 +33,7 @@ def _rope_table(
 ) -> tuple[AlloyBuffer, AlloyBuffer]:
     """Single-kernel rotary cos/sin table: collapses HF's
     (arange+cache_position)->cast->·inv_freq->cos/sin into one dispatch. cos/sin
-    are (1, seq_len, HALF_D), shared across all layers' rope."""
+    are (1, seq_len, HALF_D)."""
     half_d = inv_freq.shape[-1]
     cp = cache_position.reshape((cache_position.size,))
     inv_flat = inv_freq.reshape((half_d,))
@@ -48,13 +48,12 @@ def _fused_rms_norm_rope(
     cos_half: bool = False,
 ) -> AlloyBuffer:
     """Fused rms_norm + rope_apply for per-head Q/K norm before rotary. Non-canonical
-    rope layouts (vision's (B,S,H,D)) are permuted to canonical, run, permuted back —
+    rope layouts (vision's (B,S,H,D)) are permuted to canonical, run, permuted back;
     the rms_norm normalizes the head_dim (last axis), which the permute preserves.
 
-    cos_half: cos/sin are stored at half the rotary width (the rotate_half
-    self-cat duplicate dropped by the rope self-cat strip rewrite). The true
-    rotary span is 2x the table width, and the kernel reads the table at half
-    stride with the second half re-reading the first."""
+    cos_half: cos/sin are stored at half the rotary width. The true rotary span is
+    2x the table width; the kernel reads the table at half stride, the second half
+    re-reading the first."""
     perm = _rope_canonical_perm(x.shape, cos.shape)
     if perm is not None:
         out = _fused_rms_norm_rope_canonical(
@@ -72,17 +71,15 @@ def _fused_rms_norm_rope_canonical(
     """Fused rms_norm + rope_apply for per-head Q/K norm before rotary.
 
     Falls back to the unfused composition when the input is contiguous (the
-    strided dispatch is what enables the per-head reduction; for contiguous
-    inputs the rms_norm kernel runs row-by-row anyway).
+    strided dispatch enables the per-head reduction; for contiguous inputs the
+    rms_norm kernel runs row-by-row anyway).
     """
     shape = x.shape
     # rotary_dim is the cos/sin table width; < head_dim means partial rotary
     # (Qwen3.5: rotate the leading 64 of 256, pass the rest through). Partial
-    # rotary only arises in per-head BHSD layout, so route it through the
-    # strided fused kernel even when seq_len==1 makes the permuted view
-    # nominally contiguous — the contiguous fallback below is full-rotary only.
-    # table_dim is the stored cos/sin width; with cos_half the rotate_half
-    # duplicate is dropped, so the true rotary span is twice the table width.
+    # rotary only arises in per-head BHSD layout, so route it through the strided
+    # fused kernel even when seq_len==1 makes the permuted view nominally
+    # contiguous; the contiguous fallback below is full-rotary only.
     table_dim = cos.shape[-1]
     rotary_dim = table_dim * 2 if cos_half else table_dim
     is_partial = len(shape) == 4 and rotary_dim != shape[-1]
@@ -122,12 +119,10 @@ def _fused_rms_norm_rope_canonical(
         )
         result = result.reshape(shape)
         return result
-    # Contiguous fallback: chain unfused rms_norm + rope_apply. The strided
-    # fused dispatch above is a perf optimization; correctness must work for
-    # the contiguous shape too because the rewrite_rms_norm_rope pass can
-    # match patterns where the post-norm transpose ends up absorbed elsewhere
-    # (e.g. Gemma3's q_norm-before-transpose forward feeds AOT a contiguous
-    # 4D tensor into the fused op).
+    # Contiguous fallback: chain unfused rms_norm + rope_apply. The
+    # rewrite_rms_norm_rope pass can match patterns where the post-norm
+    # transpose is absorbed elsewhere (e.g. Gemma3's q_norm-before-transpose
+    # forward feeds AOT a contiguous 4D tensor into the fused op).
     normed_pair = _fused_rms_norm(x, weight, eps)
     normed = normed_pair[0] if isinstance(normed_pair, tuple) else normed_pair
     return _fused_rope_apply(normed, cos, sin)
@@ -142,10 +137,9 @@ def _rope_canonical_perm(
     (dim -2) — canonical. Vision applies rope in (B,S,H,D) (cos varies along S at
     dim 1, broadcasts over heads at dim -2) — NOT canonical, so the modular index
     picks the wrong cos row. Return a permutation that moves the cos-varying axis
-    to -2 (so the same kernel is correct), or None if already canonical.
+    to -2, or None if already canonical.
 
-    Conservative: only the same-rank, single-varying-axis case (the vision layout);
-    anything else is left to the existing path so the text rope is untouched.
+    Handles only the same-rank, single-varying-axis case (the vision layout).
     """
     nd = len(x_shape)
     if nd != len(cos_shape) or nd < 3:
@@ -171,13 +165,10 @@ def _fused_rope_apply(x: AlloyBuffer, cos: AlloyBuffer, sin: AlloyBuffer) -> All
     perm = _rope_canonical_perm(x.shape, cos.shape)
     if perm is not None and cos.shape[-1] == x.shape[-1] and x._dtype.itemsize == 2:
         # Full-rotary non-canonical layout (vision's (B,S,H,D), cos broadcasting
-        # over heads) IN 16-BIT: compute with elementwise primitives instead of the
-        # permute→fused-kernel→permute-back path. That path reads out-of-bounds in
-        # f16 (a masked vector load past the permuted buffer picks up uninitialized
-        # memory — benign as zeros in f32, NaN/garbage in f16), which is what blocks
-        # native-f16 vision. The elementwise form composes cleanly and is exact, so
-        # it matches the kernel; restricting it to 16-bit keeps f32 vision (which
-        # already works) bit-for-bit on the fast fused kernel.
+        # over heads) in 16-bit: the permute→fused-kernel→permute-back path reads
+        # out-of-bounds in f16 (a masked vector load past the permuted buffer picks
+        # up uninitialized memory — benign as zeros in f32, NaN/garbage in f16), so
+        # use elementwise primitives here and keep the fused kernel for f32.
         return _rope_apply_elementwise(x, cos, sin)
     if perm is not None:
         out = _fused_rope_apply_canonical(

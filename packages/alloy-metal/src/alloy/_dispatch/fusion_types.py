@@ -1,8 +1,5 @@
-"""Shared fusion contracts.
-
-This module is intentionally leaf-level: analysis, row-pass, multi-root,
-transform, and compilation can all import these records without forming cycles.
-"""
+"""Shared fusion contracts: the records analysis, row-pass, multi-root,
+transform, and compilation import."""
 
 from __future__ import annotations
 
@@ -40,11 +37,11 @@ class PlanBufferBinding:
     root_ptr: int
     byte_offset: int
     nbytes: int
-    # (extent, byte_stride) per axis of the bound view. Consumed by the
-    # grid-shrink recipe to verify the M axis is OUTERMOST in every
-    # written buffer — a 1D-flattened kernel whose output stores M innermost
-    # (e.g. the rope-table broadcast (1, freqs, M)) covers the WRONG elements
-    # when its threadgroup prefix is shrunk, so it must keep the full grid.
+    # (extent, byte_stride) per axis of the bound view. The grid-shrink recipe
+    # verifies the M axis is OUTERMOST in every written buffer: a 1D-flattened
+    # kernel storing M innermost (e.g. the rope-table broadcast (1, freqs, M))
+    # covers the WRONG elements when its threadgroup prefix is shrunk, so it
+    # must keep the full grid.
     dims: tuple[tuple[int, int], ...] = ()
 
 
@@ -58,11 +55,10 @@ class RecordedDispatch:
     threadgroup: Grid3D
     write_indices: frozenset[int]
     debug_name: str
-    # MSL + entry point needed by the L5 plan cache to recompile the
-    # pso_handle in a fresh process. Empty string for handles that bypass
-    # CompiledKernel.from_msl (the cached-fusion-dispatch path); those
-    # dispatches make the plan non-cacheable and we fall back to fresh
-    # compilation rather than serialise a partial plan.
+    # MSL + entry point the L5 plan cache uses to recompile the pso_handle in a
+    # fresh process. Empty for handles that bypass CompiledKernel.from_msl (the
+    # cached-fusion-dispatch path); those make the plan non-cacheable, so we
+    # fall back to fresh compilation rather than serialise a partial plan.
     msl_source: str = ""
     function_name: str = ""
 

@@ -1,14 +1,12 @@
 """Op-level gradient correctness — alloy vs CPU eager on individual ATen ops.
 
 Each test wraps one or two ops in a tiny ``nn.Module``/function, runs
-backward, and asserts that parameter+input gradients match the CPU-eager
-reference to within tight tolerance. Shapes are small so the whole file
-runs in a few seconds; the goal is broad coverage of backward paths the
-torch.compile frontend decomposes into.
+backward, and asserts parameter+input gradients match the CPU-eager
+reference within tight tolerance. Broad coverage of the backward paths
+the torch.compile frontend decomposes into.
 
 Failures here point at a broken backward kernel, a fusion bug that
-corrupts an epilogue, or a view-handling bug (see the sliced-label
-cross-entropy regression fixed in a4b14f2).
+corrupts an epilogue, or a view-handling bug.
 """
 
 from __future__ import annotations
@@ -46,7 +44,7 @@ class TestMatmul:
         )
 
     def test_mm_transpose_rhs(self):
-        # b.T exercises the transpose-RHS GEMM path in alloy
+        # b.T exercises the transpose-RHS GEMM path
         check_grads(
             fn_factory(lambda a, b: a @ b.T),
             inputs_factory((8, 16), (32, 16)),
@@ -66,7 +64,7 @@ class TestMatmul:
 
 
 # ---------------------------------------------------------------------------
-# LayerNorm / RMSNorm — the backward that surfaced the MPS ref disagreement
+# LayerNorm / RMSNorm
 # ---------------------------------------------------------------------------
 
 
@@ -127,7 +125,7 @@ class TestSoftmax:
 
 
 # ---------------------------------------------------------------------------
-# Cross-entropy — including the sliced-label shift pattern we just fixed
+# Cross-entropy — including the sliced-label shift pattern
 # ---------------------------------------------------------------------------
 
 

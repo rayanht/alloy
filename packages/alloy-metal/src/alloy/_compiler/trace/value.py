@@ -234,8 +234,8 @@ class TracedValue:
         tv = _ctx().builder.binop("mul", self._tv, other._tv)
         axis = self._pid_axis if self._pid_axis is not None else other._pid_axis
         # Record pid stride: pid(axis) * constant → the constant is the stride.
-        # First-write-wins: captures the block-level stride (e.g., BLOCK_M) for
-        # grid computation. Address-level strides (e.g., M*K for batched GEMM) are
+        # First write wins, capturing the block-level stride (e.g. BLOCK_M) for
+        # grid computation. Address-level strides (e.g. M*K for batched GEMM) are
         # recovered from the IR at load/store sites by _find_store_pid_stride.
         if isinstance(axis, int) and axis != "multi":
             spec = _ctx().spec

@@ -82,7 +82,7 @@ def ref_rope(x, base=10000.0):
 
 
 # ---------------------------------------------------------------------------
-# Test kernels — real @al.kernel functions, no exec/compile hacks
+# Test kernels
 # ---------------------------------------------------------------------------
 
 @al.kernel
@@ -143,11 +143,10 @@ def k_mul(x, y, out: al.output, N: al.constexpr):
 
 
 # ---------------------------------------------------------------------------
-# Kernel factory for parametrized unary tests (no exec/compile)
+# Kernel factory for parametrized unary tests
 # ---------------------------------------------------------------------------
 
-# Map of al.<op_name> → @al.kernel function
-# Built statically — each is a real decorated kernel.
+# Map of al.<op_name> → @al.kernel function.
 _UNARY_KERNELS: dict[str, KernelFunction] = {}
 
 def _register_unary(name, op_fn):
@@ -163,7 +162,6 @@ def _register_unary(name, op_fn):
     _k._init_metadata()
     _UNARY_KERNELS[name] = _k
 
-# Register all unary ops
 _register_unary("exp", lambda v: al.exp(v))
 _register_unary("log", lambda v: al.log(v))
 _register_unary("sqrt", lambda v: al.sqrt(v))

@@ -64,14 +64,12 @@ def _primary_input_chains(consumer_op: LazyOp, producer_op: LazyOp) -> bool:
 
     `_apply_chain` → `_identify_chain_input` picks the chain slot by
     matching the previous output against the consumer's primary Load
-    (the single load whose result directly flows into the Store value)
-    OR one of the named-alias extra Loads from the same store-dep graph.
-    If the producer's output buffer doesn't alias ANY of those, the
-    composer raises FusionUnsupported. Gather-like kernels are a
-    concrete example: `k_gather(src, idx)` sets Store.value to the
-    `src`-load, so `idx` isn't registered as an extra; a chain that
-    tries to deliver data through `idx` has no route through the fused
-    kernel.
+    (the single load whose result flows into the Store value) OR one of
+    the named-alias extra Loads from the same store-dep graph. If the
+    producer's output aliases none of those, the composer raises
+    FusionUnsupported — e.g. `k_gather(src, idx)` sets Store.value to the
+    `src`-load, so `idx` isn't an extra and a chain delivering data
+    through `idx` has no route through the fused kernel.
     """
     producer_out: AlloyBuffer | None = None
     for pname, buf in producer_op.buffer_args:
@@ -81,8 +79,7 @@ def _primary_input_chains(consumer_op: LazyOp, producer_op: LazyOp) -> bool:
     if producer_out is None:
         return False
 
-    # extract_ir_transform walks the TileFunction to find the primary and
-    # extra load ptrs. Deepcopy to avoid mutating the cached op.func.
+    # Deepcopy to avoid mutating the cached op.func.
     func = copy.deepcopy(consumer_op.func)
     raw = extract_ir_transform(func)
     if raw is None:
@@ -227,17 +224,14 @@ def _build_epi(
             else:
                 break
         else:
-            # Fan-out: `c` has >2 consumers. Normally we stop, since
-            # register-forwarding past `c` would hide its raw value
-            # from the extra consumers. But if `c` is a saved-for-bwd
-            # root, the root-split logic below will emit a tee Store
-            # for it, so the raw value IS materialized. In that case
-            # we can keep extending the chain through the smallest-
-            # idx elem consumer (= the in-sort-order successor), as
-            # long as every OTHER consumer sits past that successor
-            # (sort-order guard — an external consumer at idx ≤
-            # successor would be placed in an earlier dep-group and
-            # read stale memory).
+            # Fan-out: `c` has >2 consumers. Normally stop, since
+            # register-forwarding past `c` hides its raw value from the extra
+            # consumers. But if `c` is a saved-for-bwd root, the root-split
+            # logic emits a tee Store, so the raw value IS materialized; then
+            # extend through the smallest-idx elem consumer (the in-sort-order
+            # successor), as long as every OTHER consumer sits past it (an
+            # external consumer at idx ≤ successor lands in an earlier dep-group
+            # and reads stale memory).
             if c in roots:
                 elem_nc = [
                     cc
@@ -274,14 +268,11 @@ def _build_multi_epi(
     if len(consumers) >= 2 and all(c not in planned and ops[c].is_elem_op() for c in consumers):
         branches = [[c] + _build_epi(ops, consumed_by, c, planned, roots) for c in consumers]
         if all(branches):
-            # Multi-branch fusion is only safe when branches are disjoint.
-            # If two branches share a tail op, they've reconverged into a
-            # merge node that the composer would emit twice (once per
-            # branch's clone_param store) — the second write races the
-            # first and silently drops one contribution. Concrete failure:
-            # bwd of `0.5*x*(1+tanh(x))` where both `mul_2 → mul_5` and
-            # `mul_3 → mul_6` branches terminate at `add_1 = mul_5 + mul_6`;
-            # the composer emits add_1 twice and only one branch survives.
+            # Multi-branch fusion is only safe when branches are disjoint. If
+            # two branches share a tail op, they've reconverged into a merge
+            # node the composer emits twice (once per branch's clone_param
+            # store) — the second write races the first and drops one
+            # contribution.
             all_sets = [set(b) for b in branches]
             disjoint = all(
                 not (all_sets[i] & all_sets[j])
@@ -300,15 +291,12 @@ def _branches_feed_gemms(
 ) -> bool:
     """True if any branch's terminal output feeds a non-elementwise op (a GEMM).
 
-    Multi-branch fusion materializes each branch output for downstream reuse, which
-    is correct when the branches write FINAL outputs (AdamW's m/v/param writebacks).
-    But when branches feed GEMMs — gemma4 vision's clipped-linear gate/up/qkv, all
-    clamping a shared rms_norm input — those GEMMs reconverge downstream (at the
-    gated `act(gate)*up` mul, or the attention op consuming q/k/v) and the
-    multi-branch writeback buffers alias incorrectly. Keep such branches as
-    separate dispatches (each clamp then prologue-fuses into its own GEMM). Text's
-    plain gated MLP never reaches the multi-branch case — its rms_norm feeds the
-    GEMMs directly, so the anchor's consumers aren't elementwise."""
+    Multi-branch fusion materializes each branch output for downstream reuse,
+    correct when branches write FINAL outputs (AdamW's m/v/param writebacks).
+    But when branches feed GEMMs — gemma4 vision's clipped-linear gate/up/qkv,
+    all clamping a shared rms_norm input — those GEMMs reconverge downstream and
+    the multi-branch writeback buffers alias incorrectly. Keep such branches as
+    separate dispatches (each clamp prologue-fuses into its own GEMM)."""
     return any(
         not ops[c].is_elem_op() for branch in branches for c in consumed_by.get(branch[-1], [])
     )
@@ -324,10 +312,9 @@ def _find_best_prologue(
 ) -> list[int]:
     """Find the longest absorbable prologue chain ending at anchor_idx.
 
-    Skips chain starts whose op is a save-for-backward root — root-protect
-    will drop any group that includes them anyway, and the dup-fuse pass
-    has already inserted a non-root duplicate of those casts that we want
-    the search to find instead.
+    Skips chain starts that are save-for-backward roots — root-protect drops
+    any group including them, and the dup-fuse pass already inserted a non-root
+    duplicate cast for the search to find instead.
     """
     roots = roots or set()
     best: list[int] = []
@@ -363,15 +350,12 @@ def _find_best_prologue(
         if cur == anchor_idx and len(chain) > len(best):
             if not _elem_chain_has_future_dependency(start, chain, ops, op_idx):
                 # Block prologues with extra side inputs — the cooperative
-                # load addressing uses K (inner dim) but extras get N
-                # (output dim), producing wrong index math.
-                #
-                # `extras` here means OFF-CHAIN producers in excess of the
-                # chain's primary source. A length-N chain naturally has N
-                # input buffers: the first op's input is the new anchor
-                # source, and each subsequent op's chain-link input comes
-                # from the previous op in the chain. Anything beyond that
-                # — e.g. `mul(a, b)` where both a and b are external — is a
+                # load addressing uses K (inner dim) but extras get N (output
+                # dim), producing wrong index math. `extras` = OFF-CHAIN
+                # producers beyond the chain's primary source: a length-N chain
+                # has N input buffers (first op's input is the anchor source,
+                # each later op's chain-link comes from its predecessor), so
+                # anything more — e.g. `mul(a, b)` with both external — is a
                 # side input the cooperative load can't address.
                 chain_set = set(chain)
                 total_inputs = 0
@@ -385,8 +369,6 @@ def _find_best_prologue(
                         pi = op_idx.get(id(prod)) if prod is not None else None
                         if pi is None or pi not in chain_set:
                             external_inputs += 1
-                # Each chain op consumes one chain-link input (or the
-                # primary source for chain[0]); extras = inputs beyond that.
                 extras = total_inputs - len(chain)
                 if extras <= 0 and external_inputs <= 1:
                     best = chain
@@ -536,11 +518,11 @@ class MultiRootPass:
         self, island: Island, context: FusionPassContext, planned: set[int]
     ) -> bool:
         """True if a GEMM-class anchor's epilogue fusion would absorb the WHOLE
-        island. Then defer: AnchorFusionPass folds these elementwise ops into the
-        anchor's store (zero extra dispatches) instead of emitting a standalone
-        multi-root kernel (one extra dispatch + an extra read of the anchor's
-        output). Siblings over a NON-anchor producer (e.g. cos+sin sharing the
-        non-fusable `cat` emb) have no absorbing anchor, so they still fire."""
+        island. Then defer: AnchorFusionPass folds these elementwise ops into
+        the anchor's store instead of emitting a standalone multi-root kernel
+        (one extra dispatch + an extra read of the anchor output). Siblings over
+        a NON-anchor producer (e.g. cos+sin sharing the non-fusable `cat` emb)
+        have no absorbing anchor, so they still fire."""
         members = set(island.indices)
         anchors: set[int] = set()
         for idx in members:

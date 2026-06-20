@@ -27,7 +27,7 @@ _TRAINING_WITHOUT_MODE_WARNED = False
 
 
 def _emit_training_preview_warning() -> None:
-    """Fired once per process from set_training_mode(True)."""
+    """Fire once per process from set_training_mode(True)."""
     global _TRAINING_PREVIEW_WARNED
     if _TRAINING_PREVIEW_WARNED:
         return
@@ -143,12 +143,12 @@ def set_training_mode(mode: bool) -> None:
     set_training_mode_enabled(mode)
 
     _metal_ext.set_training_mode(mode)
-    # Prevent buf_release in __del__ during training to avoid non-deterministic
-    # buffer corruption from Python's cycle collector.
+    # Suppress buf_release in __del__ during training: Python's cycle collector
+    # otherwise corrupts buffers non-deterministically.
     _metal_ext._training_mode_flag = mode
 
-    # Install saved_tensors_hooks to keep alloy-backed tensors in page-aligned
-    # memory through the backward pass, avoiding large per-step memmoves.
+    # Keep alloy-backed tensors page-aligned through the backward pass, avoiding
+    # large per-step memmoves.
     if mode:
         _init_torch_to_ir()
         _saved_tensors_hook_ctx = torch.autograd.graph.saved_tensors_hooks(

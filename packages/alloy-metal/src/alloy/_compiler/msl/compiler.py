@@ -243,9 +243,8 @@ class TileCompiler(
         self._double_buffer = p.double_buffer
         self._db_shmem_offsets: dict[str, str] | None = None  # buf_name → offset expr
         # Async copy: use simdgroup_async_copy_2d for device→threadgroup loads.
-        # Supported for float32 and float16 — AIR patching handles both.
-        # Disabled when any Load has a fusion transform (prologue/epilogue)
-        # because the post-copy transform pass negates the DMA benefit.
+        # Supported for float32 and float16. Disabled when any Load has a
+        # fusion transform — the post-copy transform pass negates the DMA benefit.
         has_load_transform = any(isinstance(op, Load) and op.transform for op in walk_ops(func.ops))
         # Async copy has no bounds checking — only safe when tile dimensions
         # evenly divide the matrix dimensions (M % BLOCK_M == 0, N % BLOCK_N == 0).
@@ -288,19 +287,13 @@ class TileCompiler(
         self._coop_constant_trip = False  # set per coop loop; True = constant-trip form
         # Shmem buffers WRITTEN since the last barrier. An incoming op flushes
         # the deferred barrier when its read/write conflicts with one of these:
-        #   - reader of a buffer in this set (RAW)
-        #   - writer of a buffer in this set (WAW)
-        # Consecutive coop-loads to distinct buffers (Q→_s2 then dO→_s3) and
-        # dot-then-coop-load-different-buffer skip the inter-op barrier; the
-        # eventual reader absorbs it. Same-buffer reuse across iterations
-        # still gets caught by the WAW path.
+        # reader (RAW) or writer (WAW). Consecutive coop-loads to distinct
+        # buffers skip the inter-op barrier; the eventual reader absorbs it.
         self._buffers_since_barrier: set[str] = set()
         # Shmem buffers READ since the last barrier. A subsequent WRITE to one
-        # of these forces a flush (WAR — the new writer must wait for prior
-        # readers across all simdgroups). Reads of these are fine (RAR), so
-        # tracking reads separately avoids spurious flushes between two ops
-        # that both read the same buffer (e.g. persistent MMA z67 reads _s6
-        # then chain2 also reads _s6 — no barrier needed between them).
+        # of these forces a flush (WAR). Reads are fine (RAR), so tracking reads
+        # separately avoids spurious flushes between two ops that both read the
+        # same buffer.
         self._buffers_read: set[str] = set()
         # Set when a scalar op (BinOp/UnaryOp/Select/Ternary) touches shmem.
         # Since scalar ops typically run only on the first BLOCK_M rows (masked
@@ -309,8 +302,7 @@ class TileCompiler(
         # threads finish their shmem accesses.  Cleared on barrier emission.
         self._scalar_shmem_dirty = False
         # Tile swizzle disabled by default — at small M (decode-shape GEMMs)
-        # the grid is too small for Z-order L2 benefit. Helps at larger M
-        # (batched prefill).
+        # the grid is too small for Z-order L2 benefit.
         self._tile_swizzle = False
 
         # Use-count tracking for copy-on-write: how many times each IR value
@@ -354,7 +346,7 @@ class TileCompiler(
 
         # Opaque-vector values: load4_vec / interleave / as_char4 results carry
         # shape () but ARE vec4 (uchar4/float4). BinOp/Cast/Unary over them stay
-        # vec4. These must NOT be CSE-materialized as scalars (a `float t = v4`
+        # vec4 and must NOT be CSE-materialized as scalars (a `float t = v4`
         # mis-declares the type). unpack4/dot4 consume a vec and yield a true
         # scalar, breaking the chain.
         self._opaque_vec: set[str] = set()
@@ -857,11 +849,9 @@ class TileCompiler(
         # Persistent MMA accumulators live in simdgroup_matrix registers and
         # can only be consumed directly by Dot (chained MMA, handled in
         # _emit_mma) or Store (which routes to _emit_persistent_mma_store).
-        # For any other op kind (the SiLU epilogue chain that follows
-        # dot_q4_k_silu's K-loop is the canonical case), spill the persistent
-        # acc to shmem once so the consumer reads it through the regular
-        # shared-memory path. `_materialize_mma_to_shmem` is a no-op for
-        # non-persistent MMA results.
+        # For any other op kind, spill the persistent acc to shmem once so the
+        # consumer reads it through the regular shared-memory path.
+        # `_materialize_mma_to_shmem` is a no-op for non-persistent MMA results.
         if not isinstance(op, (Dot, Store)):
             for v in op.operand_values():
                 loc = self._val_loc.get(v.name)
@@ -1131,8 +1121,7 @@ class TileCompiler(
 
         # Column variable and expression map. `use_flat` is captured by the
         # `_resolve` closure below so (M, 1) row-broadcast operands whose
-        # cached expression literally contains `tid` (e.g. bound checks
-        # `(gid.x*M + tid) < SEQ_LEN`) get rewritten to use `_row` instead —
+        # cached expression contains `tid` get rewritten to use `_row` —
         # under flat threading kernel-scope `tid` ≠ this element's row.
         col_var = "_c"
         exprs: dict[str, str] = {}
@@ -1152,9 +1141,8 @@ class TileCompiler(
             if loc.kind == "flat_load_inline":
                 return self._flat_loads_inline[val.name].format(col=col_var)
             # 1D local array (broadcast load like LSE/Delta): index by
-            # column inside the chain loop. Without this, the fused
-            # emit produced `(_s5[..] - ld79)` — `ld79` is `float[16]`,
-            # not a scalar, and Metal rejects the binary op.
+            # column inside the chain loop. Without this the chain references
+            # the array name as a scalar, which Metal rejects in a binary op.
             if loc.kind == "local_array":
                 arr = self._exprs.get(val.name, val.name)
                 return f"{arr}[{col_var}]"
@@ -1188,10 +1176,9 @@ class TileCompiler(
                     expr = expr.replace("tid", "_row")
             return expr
 
-        # Emit the loop. Flat-threaded form (chain.flat_threaded set by
-        # `_chain_is_flat_safe`): one element per thread, strided across
-        # NUM_THREADS for tiles bigger than the threadgroup. Row-iter form
-        # is the fallback for tpr > 1 (softmax-style) or rejected chains.
+        # Emit the loop. Flat-threaded form: one element per thread, strided
+        # across NUM_THREADS for tiles bigger than the threadgroup. Row-iter
+        # form is the fallback for tpr > 1 (softmax-style) or rejected chains.
         if use_flat:
             total = rows * cols
             self._emit(f"for (uint _flat = tid; _flat < {total}u; _flat += {self._threads}u) {{")
@@ -1238,10 +1225,10 @@ class TileCompiler(
             self._indent -= 1
             self._emit("}")
 
-        # Mirror `_emit_2d_shared_loop`: a row-guarded scalar write to shmem
-        # is visible only to the writing thread; subsequent cross-thread reads
-        # (simdgroup_load, cross-thread reduce, another fused chain) need a
-        # barrier first, otherwise neighbour lanes observe stale shmem.
+        # A row-guarded scalar write to shmem is visible only to the writing
+        # thread; subsequent cross-thread reads (simdgroup_load, cross-thread
+        # reduce, another fused chain) need a barrier first, otherwise neighbour
+        # lanes observe stale shmem.
         self._scalar_shmem_dirty = True
         # Buffer-aware tracking lets the flush logic catch WAR/RAW conflicts
         # even when `_scalar_shmem_dirty` is cleared by an intervening barrier.
@@ -1477,13 +1464,12 @@ class TileCompiler(
         """Emit type cast (uses _alloy_cast_<type> to work on scalar or vec).
 
         For 2D inputs that live in shared/local memory, the cast is recorded
-        as deferred (input ref + target dtype) so `_elem_access` can apply it
-        at the element-access point. Without this, `_get(cast_result)` would
-        return `_alloy_cast_float(ld37)` referencing the load var name `ld37`
-        which only exists inside the cooperative-load loop scope; downstream
-        BinOp/Reduce that read the cast outside that scope hit `ld37
-        undeclared`. The deferred cast lets BinOp emit
-        `_alloy_cast_float(_s0[_row * stride + col])` which is valid.
+        as deferred (input ref + target dtype) so `_elem_access` applies it at
+        the element-access point. Otherwise the cast references the load var
+        name, which only exists inside the cooperative-load loop scope, and
+        downstream BinOp/Reduce reading it outside that scope hit an undeclared
+        reference. The deferred cast emits the cast against the shmem element
+        access instead.
         """
         msl_type = from_ir(op.target_dtype).msl
         # Inherit the input's location so element access on the cast falls

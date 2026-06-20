@@ -3,9 +3,7 @@
 `CausalLMHandler` is the base every chat arch subclasses: its `load` runs the
 shared `gguf.load_causal_lm` with the handler itself as the `CausalLMHooks`, and
 its hook methods are no-ops by default — an arch overrides only what it needs.
-Archs with no arch-specific GGUF interpretation (llama / qwen2 / qwen3 / gemma3)
-register a bare `CausalLMHandler` (see `models/llama.py`); the registry also
-falls back to a bare one for an unrecognized arch loaded under `--force`.
+Archs with no arch-specific GGUF interpretation register a bare `CausalLMHandler`.
 """
 
 from __future__ import annotations
@@ -55,7 +53,7 @@ class CausalLMHandler:
             hf_tokenizer_id=hf_tokenizer_id,
         )
 
-    # --- CausalLMHooks (no-ops by default; archs override what they need) ---
+    # CausalLMHooks — archs override what they need.
 
     def config_fixup(self, config_dict: dict, reader) -> None:
         return None

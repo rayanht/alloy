@@ -168,17 +168,11 @@ ATEN_TO_ALLOY = {
     torch.ops.aten.logical_not.default: lambda x: k_logical_not(x.contiguous(), N=x.size).reshape(
         x.shape
     ),
-    # Qwen3.5 GatedDeltaNet attention-mask path uses logical_and(a, b)
-    # on bool masks. `_bitwise_and_tensor` already routes bool×bool
-    # through `mask_a * mask_b` which gives the logical-and semantic.
     torch.ops.aten.logical_and.default: _bitwise_and_tensor,
-    # gemma4 audio combines padding + sliding-window masks with logical_or.
     torch.ops.aten.logical_or.default: _bitwise_or_tensor,
-    # gemma4 audio block-local attention windows K/V with unfold (strided view).
     torch.ops.aten.unfold.default: _unfold,
-    # `log1p(x) = log(x + 1)` — used by softplus(dt + dt_bias) inside
-    # the GatedDeltaNet selective-scan. AlloyBuffer.__add__ handles the
-    # scalar add and .log() the natural log.
+    # log1p(x) = log(x + 1), used by softplus(dt + dt_bias) in the
+    # GatedDeltaNet selective-scan.
     torch.ops.aten.log.default: lambda x: x.log(),
     torch.ops.aten.log1p.default: lambda x: (x + 1.0).log(),
     torch.ops.aten.index_copy.default: lambda x, dim, index, source: _cache_write_dim2_4d(

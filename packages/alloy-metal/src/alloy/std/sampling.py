@@ -1,36 +1,25 @@
 """Categorical sampling kernel — on-GPU temperature / top-k / top-p / min-p.
 
-This replaces the decode argmax with a full sampler that runs *entirely inside
-the compiled plan* (one kernel, no sampling work in Python). It writes the same
-`(M,)` int64 token-id output slot that `argmax_last_dim` writes, so the decode
-loop's token feedback keeps working untouched.
+Writes the same `(M,)` int64 token-id slot that `argmax_last_dim` writes.
 
 Two design choices make this sampler-state-free and sort-free:
 
 * **Counter-based RNG.** The uniform for vocab entry `i` at decode step `pos`
   is `hash(seed, pos, i)`. `pos` is the `cache_position` the decode loop
-  already advances every step, so reproducible *seeded* sampling needs
-  no new per-step state — the counter is already there. Same (seed, prompt) →
-  bit-identical stream.
+  already advances every step, so seeded sampling needs no new per-step state.
 
 * **Gumbel-max sampling.** A categorical draw from softmax(logits/T) equals
-  `argmax_i(logits_i/T + g_i)` with `g_i = -log(-log(u_i))`. That is the *same
-  reduction shape* as `argmax_last_dim`, so we reuse it instead of a sort or a
-  CDF prefix-sum. top-k / top-p / min-p become a keep-mask: filtered-out entries
-  get key `-inf`. The mask thresholds are found by in-kernel branchless binary
-  search (count-based for top-k, mass-based for top-p) — a handful of
-  bandwidth-bound passes over the vocab row, sub-millisecond against the ~ms
-  transformer forward.
+  `argmax_i(logits_i/T + g_i)` with `g_i = -log(-log(u_i))` — the same reduction
+  shape as `argmax_last_dim`. top-k / top-p / min-p become a keep-mask:
+  filtered-out entries get key `-inf`. The thresholds are found by in-kernel
+  branchless binary search (count-based for top-k, mass-based for top-p).
 
 `params` layout (float32): `[temperature, top_p, top_k, min_p]`. Disabled
 sentinels: `top_p >= 1`, `top_k < 1`, `min_p <= 0` (each lifts its constraint).
 
-`temperature <= 0` is greedy: the kernel returns an exact argmax (raw logits,
-zeroed Gumbel, lowest-index tie-break), so the decode path needs only ONE
-compiled plan — greedy is just this kernel with temperature 0, and switching
-between greedy and sampling is a write to the runtime `params` buffer, not a
-recompile. The top-k / top-p bisections are gated behind `if`, so greedy and
-pure-temperature decode pay nothing for filters they don't use.
+`temperature <= 0` is greedy: exact argmax (raw logits, zeroed Gumbel,
+lowest-index tie-break), so switching greedy↔sampling is a write to the runtime
+`params` buffer. The top-k / top-p bisections are gated behind `if`.
 """
 
 import alloy as al
@@ -137,8 +126,8 @@ def sample_categorical(
 ):
     """Single-threadgroup sampler (one program per row). Used by the per-step
     constrained loop and spec verify; the compiled decode/prefill plan uses the
-    split + combine kernels below (bandwidth-bound). One greedy vocab pass (the
-    argmax is fused into the max sweep via arg_lane)."""
+    split + combine kernels below. The argmax is fused into the max sweep via
+    arg_lane."""
     M, N = logits.shape
     row = al.program_id(0)
 
@@ -247,13 +236,11 @@ def sample_categorical(
 
 # Vocab-split count for the decode sampler. The argmax/Gumbel reduction over the
 # ~150k-entry vocab is split across this many threadgroups (a single TG can't
-# saturate memory bandwidth — it was the ~40-70us/token bottleneck). `params[4]`
-# selects the ACTIVE split count at runtime, per request: top-k/p/min-p needs a
-# GLOBAL threshold bisection that can't be split, so those set n_splits=1 (split
-# 0 covers the whole vocab); greedy / pure-temperature set n_splits=SAMPLE_SPLITS
-# for the bandwidth-bound parallel argmax. Idle splits get an empty slice and
-# emit a sentinel partial. (Per-request via the same params buffer that already
-# carries temperature/top-k — no recompile, no separate plan.)
+# saturate memory bandwidth). `params[4]` selects the ACTIVE split count at
+# runtime: top-k/p/min-p needs a GLOBAL threshold bisection that can't be split,
+# so those set n_splits=1 (split 0 covers the whole vocab); greedy /
+# pure-temperature set n_splits=SAMPLE_SPLITS for the parallel argmax. Idle
+# splits get an empty slice and emit a sentinel partial.
 SAMPLE_SPLITS = 64
 
 
@@ -288,8 +275,7 @@ def sample_categorical_split(
     seed_u = al.cast(al.load(seed + 0), al.uint32)
 
     # temperature <= 0 is greedy: operate on raw logits (inv_t = 1) and zero the
-    # Gumbel noise below, so the result is bit-identical to argmax_last_dim
-    # (lowest-index tie-break). Sampling scales by 1/T.
+    # Gumbel noise below (lowest-index tie-break). Sampling scales by 1/T.
     do_sample = temperature > 0.0
     inv_t = al.where(do_sample, 1.0 / al.maximum(temperature, 1e-6), 1.0)
 
@@ -411,9 +397,7 @@ def sample_categorical_combine(
     out: al.output,    # (M,)    int64   — sampled token id
 ):
     """Reduce the per-split partials to the final token: the global max key, with
-    the lowest vocab index on a tie (slices are vocab-ordered, so the per-split
-    lowest-index reduce + this min make it bit-identical to a single sweep).
-    Empty splits carry _NEG_INF and lose."""
+    the lowest vocab index on a tie. Empty splits carry _NEG_INF and lose."""
     M, SP = partial_val.shape
     row = al.program_id(0)
     j = al.arange(0, SP)

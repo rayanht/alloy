@@ -2,7 +2,7 @@
 
 Owns the Python function, AST, source code, signature parsing, kernel
 classification, tracing, compilation, and tune config resolution.
-Dispatch logic (_queue_op) lives in _lazy.py.
+Dispatch logic (_queue_op) lives in lazy.py.
 """
 
 from __future__ import annotations
@@ -248,12 +248,10 @@ class KernelFunction:
                     else:
                         itemsize = arg._dtype.itemsize
                         elem_strides = tuple(s // itemsize for s in arg._strides)
-                        # Stride meta drives stride decomposition for non-contig
-                        # views. The view's byte offset is NOT baked into MSL —
-                        # runtime binding (_execute_plan / _batch_to_v2) applies
-                        # it via the Metal buffer offset. Baking it here would
-                        # double-apply when the compiled plan also adds the
-                        # tensor's storage_offset at bind time.
+                        # The view's byte offset is NOT baked into MSL — runtime
+                        # binding applies it via the Metal buffer offset. Baking
+                        # it here would double-apply when the compiled plan also
+                        # adds the tensor's storage_offset at bind time.
                         stride_meta[f"_{pname}_shape"] = arg._shape
                         stride_meta[f"_{pname}_strides"] = elem_strides
                         root_buf = AlloyBuffer(
@@ -280,8 +278,8 @@ class KernelFunction:
                 buffer_args.append((pname, arg))
             else:
                 arg = to_alloy_buffer(arg)
-                # External buffers used as al.output would get a one-time Metal copy
-                # that diverges from the original memory. Replace with a fresh alloy
+                # External buffers used as al.output would get a Metal copy that
+                # diverges from the original memory. Replace with a fresh alloy
                 # buffer of the same shape so the kernel output is GPU-native.
                 if pname in self._output_params and arg._parent_handle < 0:
                     arg = _alloc_aligned(arg.shape, arg._dtype)
@@ -444,14 +442,12 @@ class KernelFunction:
                 for di, dim in enumerate(arg.shape):
                     key_values[f"_{pname}_dim{di}"] = int(dim)
 
-        # In-memory cache (avoids repeated dict lookups for the same shape)
         cache_key = tuple(sorted(key_values.items()))
         cached = self._tune_cache.get(cache_key)
         if cached is not None:
             return cached
 
         cfg = resolve_config(self.name, key_values)
-        # Wrap in TuneConfig for resolve_constexprs
         result = TuneConfig(constexprs=dict(cfg.constexprs), options=dict(cfg.options))
         self._tune_cache[cache_key] = result
         return result

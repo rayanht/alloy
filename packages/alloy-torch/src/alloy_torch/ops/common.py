@@ -103,9 +103,9 @@ def _root_flat_buf(buf: AlloyBuffer) -> AlloyBuffer:
     """Return a contiguous 1D view of buf's entire root allocation.
 
     Used when a kernel handles strided access via explicit offset/stride
-    constexprs. The caller has already extracted offset and strides from
-    the original view; this just gives the kernel a flat, contiguous buffer
-    to index into, so _queue_op never sees non-contiguous data.
+    constexprs. The caller has already extracted offset and strides from the
+    original view; this gives the kernel a flat, contiguous buffer to index
+    into.
     """
     root = AlloyBuffer(
         buf._parent_handle,

@@ -108,11 +108,10 @@ def _apply_subsystem_overrides() -> None:
 class AlloyOnlyFilter(logging.Filter):
     """Drop records that didn't originate from an alloy* logger.
 
-    We attach to our handlers so foreign loggers (httpx, transformers,
+    Attached to our handlers so foreign loggers (httpx, transformers,
     torch._dynamo, …) don't end up in the alloy log file even when the
     user has set root to INFO. Those foreign records still go to any
-    handler the user installed via logging.basicConfig — we just don't
-    capture them in ours.
+    handler the user installed via logging.basicConfig.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:

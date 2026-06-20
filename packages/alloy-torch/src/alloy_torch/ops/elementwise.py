@@ -142,8 +142,7 @@ def _bitwise_and_tensor(a: AlloyBuffer, b: AlloyBuffer) -> AlloyBuffer:
 def _bitwise_or_tensor(a: AlloyBuffer, b: AlloyBuffer) -> AlloyBuffer:
     bool_like = _is_bool_dtype(_dtype_of(a)) or _is_bool_dtype(_dtype_of(b))
     if bool_like:
-        # OR of 0/1 masks: a + b - a*b (stays in {0,1}), mirroring the AND path's
-        # `a * b`. Used by gemma4 audio's blocked attention-mask construction.
+        # OR of 0/1 masks: a + b - a*b (stays in {0,1}).
         ma, mb = _coerce_mask_numeric(a), _coerce_mask_numeric(b)
         return ma + mb - ma * mb
 
@@ -207,22 +206,17 @@ def _where_self(condition: AlloyBuffer, x: AlloyBuffer, y: AlloyBuffer) -> Alloy
     if x_buf._dtype.is_float() and y_buf._dtype.is_float():
         if not cond_buf._dtype.is_float():
             cond_buf = _to_copy(cond_buf, dtype=torch.float32)
-        # k_where_nd reads each operand with the strides `_broadcast_layout`
-        # derives from `buf._strides`. The kernel dispatch contiguizes input
-        # buffers, so a non-contiguous view (e.g. a `transpose`/`permute` of
-        # the operand) would be read with its pre-contiguize permuted strides
-        # → wrong elements. Force contiguity so the strides match the memory
-        # the kernel actually sees. (`.contiguous()` is a no-op when already
-        # contiguous; broadcast size-1 dims are preserved and still map to
-        # stride 0 below.)
+        # The kernel dispatch contiguizes input buffers, so a non-contiguous
+        # view would be read with its pre-contiguize permuted strides → wrong
+        # elements. Force contiguity so the strides match the memory the kernel
+        # sees (broadcast size-1 dims still map to stride 0 below).
         cond_buf = cond_buf.contiguous()
         x_buf = x_buf.contiguous()
         y_buf = y_buf.contiguous()
-        # >4D: the 4D stride layout (OUT0..OUT3) collapses a *contiguous* >4D
-        # tensor cleanly, but a broadcast (stride-0) axis can't be folded, so it
-        # silently drops a dim. Materialize each broadcast operand to the full
-        # output shape (gemma4 audio's block-attention masked_fill broadcasts a
-        # (1,1,blocks,chunk,ctx) mask + a scalar fill over the heads axis).
+        # >4D: the 4D stride layout (OUT0..OUT3) collapses a contiguous >4D
+        # tensor cleanly, but a broadcast (stride-0) axis can't be folded and
+        # drops a dim. Materialize each broadcast operand to the full output
+        # shape.
         if len(out_shape) > 4:
             if tuple(cond_buf.shape) != out_shape:
                 cond_buf = _expand_buf(cond_buf, out_shape).contiguous()

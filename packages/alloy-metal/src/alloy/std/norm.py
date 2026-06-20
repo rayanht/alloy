@@ -46,8 +46,8 @@ def rms_norm(
     BLOCK_SIZE: al.constexpr = 256,
 ):
     """RMSNorm with F32 accumulation. Emits per-row rsqrt as a second output
-    so AOT autograd's saved-for-backward `rsqrt(mean(x^2)+eps)` can be sourced
-    from this kernel rather than recomputed via a parallel decomposed chain."""
+    so AOT autograd's saved-for-backward `rsqrt(mean(x^2)+eps)` is sourced
+    from this kernel rather than a parallel decomposed chain."""
     M, N = x.shape
     row = al.program_id(0)
     sq_sum = 0.0
@@ -63,13 +63,11 @@ def rms_norm(
         mask = offs < N
         v = al.cast(al.load(x + row * N + offs, mask=mask, other=0.0), al.float32)
         w = al.load(weight + offs, mask=mask, other=0.0)
-        # Match eager Llama/Qwen RMSNorm precision exactly: truncate the
-        # normalized value to the input dtype BEFORE the weight multiply.
-        # `out` is bf16/fp16 typed so the store implicitly casts; rebinding
-        # through `cast` collapses to the same precision but ensures the
-        # subsequent `w * normed` mul happens in the narrow type rather than
-        # being implicitly promoted (which would diverge from eager and amp
-        # downstream errors when bias values are large — Qwen K bias path).
+        # Match eager Llama/Qwen RMSNorm precision: truncate the normalized
+        # value to the input dtype BEFORE the weight multiply, so `w * normed`
+        # happens in the narrow type rather than being implicitly promoted
+        # (promotion diverges from eager and amplifies downstream errors when
+        # bias values are large — Qwen K bias path).
         normed = al.cast(v * rrms, w.dtype)
         al.store(out + row * N + offs, w * normed, mask=mask)
 

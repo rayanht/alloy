@@ -277,11 +277,9 @@ def dot_q8_0_v2(
 @al.kernel
 def dot_q8_0_v2_rows(A, B_q8, scales, C: al.output, GROUP_SIZE: al.constexpr = 32):
     """Q8_0 GEMV for the draft's multi-token propose, M in 2..8: dequant ONCE,
-    read weights ONCE, accumulate all rows. Each row's accumulation matches
-    dot_q8_0_v2 (NUM_SPLITS=1) exactly — same lane→k map, same scale-then-dot4
-    order — so the draft's M-row propose forward stays numerically consistent
-    with its M=1 decode and acceptance doesn't drop. Traced K-loop + 8 named
-    accumulators (clamp rows >= M to M-1, store only M); M==1 keeps dot_q8_0_v2."""
+    read weights ONCE, accumulate all rows. Per-row accumulation matches
+    dot_q8_0_v2 (NUM_SPLITS=1) — same lane→k map, same scale-then-dot4 order.
+    8 named accumulators (clamp rows >= M to M-1, store only M)."""
     M, K = A.shape
     N = B_q8.shape[0]
     N_GROUPS = K // GROUP_SIZE
@@ -368,9 +366,8 @@ def dot_q8_0_silu_v2_rows(
 ):
     """Q8_0 gate+up GEMV with SiLU for the draft's multi-token propose, M 2..8:
     dequant gate+up ONCE, read each set ONCE, all rows. Per-row accumulation
-    matches dot_q8_0_silu_v2 (M=1) so the draft propose stays consistent with
-    decode. Traced K-loop, 16 named accumulators (gate ag, up au per row); clamp
-    rows >= M to M-1, store only M."""
+    matches dot_q8_0_silu_v2 (M=1). 16 named accumulators (gate ag, up au per
+    row); clamp rows >= M to M-1, store only M."""
     M, K = A.shape
     N = B_gate_q8.shape[0]
     N_GROUPS = K // GROUP_SIZE
@@ -1782,12 +1779,9 @@ def dot_q4_k_silu_v2_rows(
     C: al.output,
 ):
     """Q4_K gate+up GEMV with silu fusion for verify M (2..8): decode each
-    weight superblock ONCE (gate and up), apply to all M rows. The FFN gate+up
-    is the majority of a layer's weight bytes, so re-reading them per row is
-    what put verify ~40% over the memory roofline. One program per output col
-    (grid (N,)); native 144-byte superblocks, ix-stride; 16 named accumulators
-    (8 gate + 8 up, the verify K ceiling). Rows >= M clamp to M-1, only M
-    stored. M==1 decode keeps using dot_q4_k_silu_v2."""
+    weight superblock ONCE (gate and up), apply to all M rows. One program per
+    output col (grid (N,)); native 144-byte superblocks, ix-stride; 16 named
+    accumulators (8 gate + 8 up). Rows >= M clamp to M-1, only M stored."""
     M, K = A.shape
     N = GATE.shape[0]
     NB = K // 256
@@ -2143,11 +2137,9 @@ def _unroll(n: int) -> tuple[int, ...]:
 @al.kernel
 def dot_q6_k_v2_rows(A, B_q6, C: al.output, GROUP_SIZE: al.constexpr = 256):
     """Q6_K GEMV for verify M (2..8): dequant each block ONCE, read weights
-    ONCE, accumulate all rows. TRACED g/quadrant loops (compact MSL; the full
-    `_unroll` form collides SSA load names under epilogue fusion) + 8 named
-    accumulators (verify K ceiling), rows >= M clamped to M-1, only M stored.
-    M==1 decode keeps using dot_q6_k_v2. Crucially the lm_head (q6_k, 248K
-    vocab) verifies all rows for one weight read instead of an 8-row MMA."""
+    ONCE, accumulate all rows. Traced g/quadrant loops (the full `_unroll` form
+    collides SSA load names under epilogue fusion) + 8 named accumulators (verify
+    K ceiling), rows >= M clamped to M-1, only M stored."""
     M, K = A.shape
     N = B_q6.shape[0]
     BLOCK_BYTES = 210

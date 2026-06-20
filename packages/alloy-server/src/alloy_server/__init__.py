@@ -1,7 +1,5 @@
 """Alloy LLM inference + serving stack: GGUF loading, the batch-1 generation
 engine, speculative decoding, and the OpenAI/Ollama/Anthropic-compatible server.
-
-Builds on the alloy_torch backend; alloy_torch never imports this package.
 """
 
 from __future__ import annotations
@@ -19,17 +17,14 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, ContextManager, cast
 
 # Suppress transformers load-noise + optional sklearn/scipy imports before any
-# model class loads (import side effect; see _compat). Kept first so it runs
-# ahead of the alloy_server.models import below.
+# model class loads. Kept first so it runs ahead of the alloy_server.models import.
 import alloy_server.compat  # noqa: F401
 import torch
 import transformers
-# Register the "alloy" torch.compile backend + the alloy.* custom ops (gguf_*_mm,
-# sample_categorical, …) BEFORE any moved submodule loads: gguf.quant and others
-# read `torch.ops.alloy.*` at import time. Every `import alloy_server.*` runs this
-# __init__ first, so registering here covers all entry points.
-import alloy_torch.backend  # noqa: F401  registers the alloy torch.compile backend
-import alloy_torch.custom_ops  # noqa: F401  registers the alloy.* custom ops
+# Register the "alloy" torch.compile backend + the alloy.* custom ops BEFORE any
+# submodule loads: gguf.quant and others read `torch.ops.alloy.*` at import time.
+import alloy_torch.backend  # noqa: F401
+import alloy_torch.custom_ops  # noqa: F401
 
 from alloy import get_logger
 from alloy_server.constrain import Constraint, GrammarFactory, xgrammar_tool_format
@@ -102,9 +97,8 @@ def create_server(
 ) -> AlloyServer:
     def installed_chat_names() -> tuple[str, ...]:
         # The served chat model (if any) first, then GGUF models discovered on disk
-        # (Ollama store / HF cache) — a catalog listing for client model pickers,
-        # not a load surface. `discovered_chat_names` is looked up dynamically so
-        # tests can monkeypatch it.
+        # (Ollama store / HF cache) — a catalog listing for client model pickers.
+        # `discovered_chat_names` looked up dynamically so tests can monkeypatch it.
         served_names = (chat_model.name,) if chat_model is not None else ()
         seen = set(served_names)
         discovered: list[str] = []
@@ -316,20 +310,15 @@ def tokenizer_chat_encoder(tokenizer: transformers.PreTrainedTokenizerBase) -> C
 def resolve_prefill_policy() -> int:
     """The production prefill chunk size (ALLOY_CHUNK_PREFILL_SIZE, default 4096).
 
-    LARGE-CHUNK prefill is the production path: chunks of 4096 saturate the
-    GEMMs and the final partial chunk runs at an exact grid-shrunk size, so no
-    padded rows cost GPU work. Faster than 128-chunking at every depth >= 512 on
-    every tracked model (qwen3.6:35b 1.08-1.25x, qwen3.5:0.8b 1.13-1.23x).
-    Requires the per-model shrink-chunk tune (`alloy tune <m> --shrink-max 4096
-    --only-shrink`); an untuned model still runs (fallback configs), just
-    slower. ALLOY_CHUNK_PREFILL_SIZE=128 reproduces the historical small-chunk
-    prefill exactly (chunks below generation._MIN_SHRINK_CHUNK compile the
-    classic plans, no shrink machinery).
+    Chunks of 4096 saturate the GEMMs and the final partial chunk runs at an
+    exact grid-shrunk size, so no padded rows cost GPU work. Requires the
+    per-model shrink-chunk tune (`alloy tune <m> --shrink-max 4096 --only-shrink`);
+    an untuned model still runs on fallback configs, just slower.
+    ALLOY_CHUNK_PREFILL_SIZE=128 reproduces the small-chunk prefill (chunks below
+    generation._MIN_SHRINK_CHUNK compile the classic plans, no shrink machinery).
 
-    Benchmarks that want production parity (alloy_cli.benchmark, the release
-    scorecard's correctness worker) MUST resolve through this function rather
-    than hardcoding from_model kwargs — otherwise they measure a path
-    production never runs.
+    Benchmarks that want production parity resolve through this function rather
+    than hardcoding from_model kwargs.
     """
     chunk_env = os.environ.get("ALLOY_CHUNK_PREFILL_SIZE")
     return int(chunk_env) if chunk_env and int(chunk_env) > 0 else 4096
@@ -365,18 +354,11 @@ def chat_template_uses_think_blocks(
     tokenizer: transformers.PreTrainedTokenizerBase,
 ) -> bool:
     """Detect whether this model's chat template participates in the
-    ``<think>...</think>`` protocol — Qwen3-style reasoning models thread
-    a ``<think>`` marker through the rendered template (either in the
-    generation prompt or in conditional logic around saved assistant
-    content). For Llama, Gemma3, plain instruct chat templates etc., the
-    literal ``</think>`` is just a token sequence the model could emit in
-    normal text and carries no protocol meaning.
-
-    Detection strategy: inspect the raw chat-template source and the
-    rendered generation prompt. Reasoning-enabled templates reference
-    ``<think>`` literally either in the source (to inject / branch on
-    it) or in the rendered prompt (to push the model into a think
-    block). Plain-text models do neither.
+    ``<think>...</think>`` protocol. Reasoning-enabled templates reference
+    ``<think>`` literally in the source (to inject / branch on it) or in the
+    rendered generation prompt (to push the model into a think block);
+    plain-text models do neither, where ``</think>`` is just a token sequence
+    the model could emit in normal text.
     """
     template = tokenizer.chat_template if hasattr(tokenizer, "chat_template") else None
     if isinstance(template, str) and "<think>" in template:
@@ -402,17 +384,15 @@ def resolve_heal_tokens(
         scanning the decoded stream for this subsequence.
       - `mid_think_heal_seq`: tokens to append when truncated inside a
         `<think>` block. Closes the think block with a `</think>` + the
-        post-think truncated-notice text + turn-end. The resulting cache
-        ends in a "completed turn with brief post-think answer" state so
-        the next turn's auto-injected `<think>\n` starts a fresh think
-        cycle rather than the model echoing a "brief-think" style.
+        post-think truncated-notice text + turn-end, so the cache ends in a
+        completed-turn state and the next turn's auto-injected `<think>\n`
+        starts a fresh think cycle.
       - `post_think_heal_seq`: tokens to append when truncated past
         `</think>` — just turn-end.
 
     Models whose chat template doesn't participate in the ``<think>`` /
     ``</think>`` protocol (Llama, Gemma3, plain instruct models) get an
-    empty ``close_think_seq`` and the post-think heal for both branches —
-    truncation just appends turn-end with no spurious ``</think>`` notice.
+    empty ``close_think_seq`` and the post-think heal for both branches.
     """
     def encode(text: str) -> tuple[int, ...]:
         try:
@@ -462,9 +442,6 @@ def chat_template_auto_injects_assistant_markers(
       can only safely reuse the prompt portion of the cache.
     - Llama: no auto-injection. Saved decode tokens line up with the
       next turn's re-rendered prompt, enabling full prefix reuse.
-
-    Probe with sentinel content rather than checking model class — robust
-    across the long tail of model-specific templates without a registry.
     """
     user = "PROBE_USER_TEXT_xxyyzz"
     asst = "PROBE_ASSISTANT_TEXT_xxyyzz"
@@ -553,7 +530,7 @@ def create_native_served_model(
         native_context = generator.max_cache_len
         max_fill = generator.max_fill
         # Pre-compile cold + warm prefill + decode + verify + the vision tower
-        # (if any) at the native cache. No real request pays torch.compile cost.
+        # (if any) at the native cache.
         generator.eager_compile_all()
 
     logger.info(
@@ -570,10 +547,9 @@ def create_native_served_model(
 
     # Drop EOS-style stop tokens before decoding so they don't leak into
     # streamed content, but KEEP non-stop specials like `<think>` /
-    # `</think>` so reasoning-trace UIs can detect the boundary. With
-    # `skip_special_tokens=True` qwen3.5's single-token `</think>`
-    # (id 248069) is stripped and the Mac App can't split thinking from
-    # answer.
+    # `</think>` so reasoning-trace UIs can detect the boundary
+    # (`skip_special_tokens=True` strips qwen3.5's single-token `</think>`
+    # id 248069, leaving thinking and answer unsplittable).
     decode_strip_ids: frozenset[int] = (
         frozenset(generator.eos_token_ids)
         if isinstance(generator, AlloyGenerator)
@@ -589,8 +565,7 @@ def create_native_served_model(
 
     # Lazy grammar factory (built on first constrained request, so unconstrained
     # deployments never pay the xgrammar TokenizerInfo cost). `reasoning` is
-    # DETECTED from the chat template (a non-empty </think> heal sequence), never
-    # hardcoded per model — so the tool grammar gates correctly for any reasoning model.
+    # detected from the chat template (a non-empty </think> heal sequence).
     grammar: list = [None]
 
     def build_matcher(constraint: Constraint):
@@ -684,8 +659,8 @@ def create_native_served_model(
     count_tokens = tokenizer_text_counter(tokenizer)
 
     # Sampling for the NEXT request, threaded into its Sequence. The spec and
-    # constrained paths still read the pinned buffers directly, so apply the
-    # params there too (in-place pinned-buffer write, never a recompile).
+    # constrained paths read the pinned buffers directly, so apply the params
+    # there too (in-place pinned-buffer write).
     pending_sampling: list[SamplingParams | None] = [None]
 
     def apply_sampling(params: SamplingParams) -> None:
@@ -697,18 +672,18 @@ def create_native_served_model(
             generator.plans.params[3] = float(params.min_p)
             generator.plans.seed[0] = int(params.seed)
 
-    # Vision: a multimodal GGUF (gemma4) carries a dense vision front-end the loader
+    # A multimodal GGUF (gemma4) carries a dense vision front-end the loader
     # surfaces as `loaded.vision`. When present, wire the multimodal (encode,
     # generate, stream) hooks so image requests run end-to-end through alloy's
-    # quantized decode — no per-model branching here.
+    # quantized decode.
     mm_encode: MultimodalEncoder | None = None
     mm_generate: MultimodalGenerator | None = None
     mm_stream: MultimodalStreamer | None = None
     if isinstance(generator, AlloyGenerator) and (
         loaded.vision is not None or loaded.audio is not None
     ):
-        # Modality plans were already compiled by generator.eager_compile_all above
-        # (the generator owns the adapters) — here we only wire the request hooks.
+        # Modality plans were already compiled by generator.eager_compile_all above;
+        # here we only wire the request hooks.
         mm_encode, mm_generate, mm_stream = build_multimodal_hooks(
             loaded.vision, loaded.audio, tokenizer, generator,
         )
@@ -817,13 +792,10 @@ def discovered_chat_names() -> list[str]:
 
 
 def check_port_collision(host: str, port: int) -> None:
-    """Probe `host:port` before binding so we can surface a useful
-    error instead of a raw `OSError: Address already in use`.
-
-    Spec §7.4: if the squatter answers `/api/version` with Ollama's
-    version string, point the user at `alloy doctor`. Don't auto-
-    fall-back to a different port — that would silently break the
-    drop-in promise.
+    """Probe `host:port` before binding to surface a useful error instead of a
+    raw `OSError: Address already in use`. If the squatter answers
+    `/api/version` with Ollama's version string, point the user at `alloy
+    doctor`; we don't auto-fall-back to a different port.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -875,8 +847,6 @@ def main(argv: tuple[str, ...] | None = None) -> int:
     except KeyboardInterrupt:
         return 130
     except PortCollisionError as exc:
-        # Print the actionable message on stderr instead of a stack
-        # trace and exit non-zero.
         print(f"alloy serve: {exc}", file=sys.stderr)
         return 78  # EX_CONFIG — convention for "config error, fix and restart"
     return 0

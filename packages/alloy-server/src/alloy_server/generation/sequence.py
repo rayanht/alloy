@@ -1,8 +1,4 @@
-"""Sequence: the request as a first-class object.
-
-Exactly one Sequence is live at a time (single-user serving), but the
-generation pipeline operates on the Sequence, not on generator-global state.
-"""
+"""Sequence: the request as a first-class object."""
 
 from __future__ import annotations
 
@@ -14,8 +10,7 @@ import torch
 @dataclass(frozen=True, slots=True)
 class SamplingParams:
     """Decode sampling config parsed from a request. temperature <= 0 is greedy
-    (the on-GPU sampler returns an exact argmax). Defaults are greedy, so a
-    request that omits all sampling fields decodes deterministically."""
+    (the on-GPU sampler returns an exact argmax); defaults are greedy."""
 
     temperature: float = 0.0
     top_p: float = 1.0
@@ -40,9 +35,8 @@ class Sequence:
 
     `sampling=None` leaves the pinned sampling buffers untouched (greedy unless
     a previous request set otherwise); a SamplingParams writes them at request
-    start. `stream=True` selects the small decode-chunk cascade so tokens reach
-    the consumer in ~8-token bursts; non-streaming requests use larger chunks
-    to amortize command-buffer commits.
+    start. `stream=True` selects the small decode-chunk cascade (~8-token
+    bursts); non-streaming uses larger chunks to amortize command-buffer commits.
     """
 
     input_ids: torch.Tensor  # (1, prompt_len), int64

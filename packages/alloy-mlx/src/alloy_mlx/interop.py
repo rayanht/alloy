@@ -1,10 +1,8 @@
 """Interop between MLX arrays and Alloy Metal buffers.
 
-MLX arrays on Apple Silicon use unified memory. Evaluated MLX arrays can be
-viewed as numpy arrays without copying via np.array(arr, copy=False) when MLX exposes a
-compatible storage view. This numpy view is then wrapped as a MetalBuffer.
-
-The intended direct path: mlx.array → numpy view → MetalBuffer → GPU kernel.
+MLX arrays on Apple Silicon use unified memory, so an evaluated array views as a
+numpy array without copying (np.array(arr, copy=False)), then wraps as a
+MetalBuffer: mlx.array → numpy view → MetalBuffer → GPU kernel.
 """
 
 from __future__ import annotations
@@ -26,9 +24,6 @@ _NP_TO_MLX_DTYPE = {v: k for k, v in _MLX_TO_NP_DTYPE.items()}
 
 def array_to_buffer(array: mx.array, device: MetalDevice | None = None) -> MetalBuffer:
     """Convert an MLX array to a MetalBuffer.
-
-    The array is evaluated if needed, then viewed as numpy when MLX exposes a compatible
-    storage view, then wrapped as a MetalBuffer.
 
     Args:
         array: Input MLX array.
@@ -55,8 +50,6 @@ def buffer_to_array(
 ) -> mx.array:
     """View a MetalBuffer as an MLX array.
 
-    Goes through a numpy view where the underlying storage supports it.
-
     Args:
         buffer: Source MetalBuffer.
         dtype: MLX dtype for the result.
@@ -74,9 +67,6 @@ def buffer_to_array(
 
 
 def array_to_numpy(array: mx.array) -> np.ndarray:
-    """Convert an MLX array to a numpy array for Alloy kernel dispatch.
-
-    Evaluates the array if needed, then returns a numpy view when MLX exposes one.
-    """
+    """Convert an MLX array to a numpy array for Alloy kernel dispatch."""
     mx.eval(array)
     return np.array(array, copy=False)

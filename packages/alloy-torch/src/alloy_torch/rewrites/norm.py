@@ -63,11 +63,10 @@ def _other_node(node: torch.fx.Node, known: torch.fx.Node) -> torch.fx.Node | No
 def _is_rsqrt_like(node: torch.fx.Node) -> bool:
     """The reciprocal-sqrt step of an RMSNorm.
 
-    Most models emit `aten.rsqrt`. Gemma4's RMSNorm deliberately uses
-    `torch.pow(mean_squared, -0.5)` ("to address compiler differences between
-    Torch and JAX"), which decomposes to `aten.pow.Tensor_Scalar` with exponent
-    -0.5 — mathematically identical. Accept both so gemma4 routes to the f32-safe
-    `alloy.rms_norm` kernel instead of falling back to the decomposed ATen path
+    Most models emit `aten.rsqrt`. Gemma4's RMSNorm uses
+    `torch.pow(mean_squared, -0.5)`, which decomposes to `aten.pow.Tensor_Scalar`
+    with exponent -0.5 — mathematically identical. Accept both so gemma4 routes
+    to the f32-safe `alloy.rms_norm` kernel instead of the decomposed ATen path
     (which overflows f16 on gemma4's large pre-norm activations).
     """
     if node.target is torch.ops.aten.rsqrt.default:
@@ -125,14 +124,12 @@ def _find_rms_norm_chain(pow_node: torch.fx.Node) -> RmsNormForwardMatch | None:
 
     # The learnable-scale multiply is optional. An affine-free RMSNorm (no
     # weight) ends at `x * rsqrt(...)` and feeds the next op directly — gemma4's
-    # vision pre-projection norm (`mul_2 -> view -> projection mm`). Without
-    # this branch the chain failed to match, the norm stayed on the decomposed
-    # ATen path, and its variance square overflowed f16 on the pooler's large
-    # input (~5e4) -> rsqrt(inf)=0 -> all-zero vision features. `weight_node`
+    # vision pre-projection norm (`mul_2 -> view -> projection mm`). Without it the
+    # norm stays on the decomposed ATen path, whose variance square overflows f16
+    # on the pooler's ~5e4 input -> rsqrt(inf)=0 -> all-zero features. weight_node
     # is None then; the rewrite synthesizes a ones weight.
     weight_mul = find_single_consumer(current)
     if weight_mul is None:
-        # Ambiguous (no consumer, or more than one) — don't risk a wrong match.
         return None
     if weight_mul.target in _MUL_TARGETS:
         weight_node = _other_node(weight_mul, current)

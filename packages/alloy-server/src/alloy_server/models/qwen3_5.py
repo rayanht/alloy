@@ -58,23 +58,21 @@ QWEN3_5_CONFIG_MAPPING = {
     "ssm.conv_kernel": "linear_conv_kernel_dim",
     "ssm.state_size": "linear_key_head_dim",
     # `ssm.group_count` is the KEY/group head count → `linear_num_key_heads`.
-    # Mapping it to *value* (as a prior revision did) collapsed NV to NK=16
-    # and built the value projections at half width, so the GVA 4B/9B models
-    # failed to load with a Q4_K shape mismatch.
+    # Mapping it to *value* collapses NV to NK=16 and builds the value
+    # projections at half width (Q4_K shape mismatch on the GVA 4B/9B).
     "ssm.group_count": "linear_num_key_heads",
     # `ssm.inner_size` (= num_value_heads * value_head_dim) must be mapped for
     # the GGUF loader to derive `linear_num_value_heads` = inner_size/head_dim
     # — 32 for the GVA 4B/9B, 16 for 0.8B/2B. Without this entry NV is left
-    # unset. The loader consumes the value into linear_num_value_heads; the
-    # `linear_inner_size` landing key does not survive into the HF config.
+    # unset. The `linear_inner_size` landing key does not survive into the HF config.
     "ssm.inner_size": "linear_inner_size",
 }
 
 
 # Qwen3.5-MoE (GGUF arch `qwen35moe`, shipped by ollama as "qwen3.6:35b"):
-# the same hybrid linear/full-attention backbone as the dense models, but the
-# dense FFN is replaced by a fine-grained MoE block. The four extra GGUF keys
-# describe the experts; everything else maps exactly as in the dense case.
+# the dense hybrid backbone with the dense FFN replaced by a fine-grained MoE
+# block. The four extra GGUF keys describe the experts; everything else maps as
+# in the dense case.
 QWEN3_5_MOE_CONFIG_MAPPING = {
     **QWEN3_5_CONFIG_MAPPING,
     "expert_count": "num_experts",
@@ -90,10 +88,9 @@ DT_BIAS_PATTERN = ".linear_attn.dt_bias"
 class Qwen35TensorProcessor(modeling_gguf_pytorch_utils.TensorProcessor):
     """GGUF→HF tensor adapter for Qwen 3.5 hybrid layers.
 
-    Two transformations the upstream MambaTensorProcessor would *almost*
-    cover, except its `"ssm_a" in name` substring match overzealously
-    also matches `ssm_alpha` and `ssm_beta` (Q8_0-quantized projection
-    weights, not the A_log scalar). Match the trailing component exactly.
+    The upstream MambaTensorProcessor's `"ssm_a" in name` substring match also
+    matches `ssm_alpha`/`ssm_beta` (Q8_0 projection weights, not the A_log
+    scalar), so match the trailing component exactly.
 
       - `blk.N.ssm_conv1d.weight`: GGUF stores (D, 4); PyTorch's depthwise
         Conv1d expects (D, 1, 4) with groups=D. Insert a size-1 dim.
@@ -319,8 +316,8 @@ class GGUFQwen35MoeBlock(torch.nn.Module):
         moe_intermediate: int,
     ) -> None:
         super().__init__()
-        self.gate = orig_block.gate                       # router (dense .weight)
-        self.experts = orig_block.experts                 # GGUFQwen35MoeExperts
+        self.gate = orig_block.gate
+        self.experts = orig_block.experts
         self.shared_expert = orig_block.shared_expert
         self.shared_expert_gate = orig_block.shared_expert_gate
         self.num_experts = int(num_experts)

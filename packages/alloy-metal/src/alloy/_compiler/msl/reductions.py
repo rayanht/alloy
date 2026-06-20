@@ -93,14 +93,12 @@ class ReductionEmitterMixin:
         The natural form `for (_c = _lane; _c < cols; _c += tpr)` starts at a
         runtime value, so the Metal compiler can't prove the trip count is
         uniform across the SIMD group and runs the WHOLE body under a predicate
-        mask — the GPU profiler bills that as "Predication" (~6-7% per such loop
-        on attention's softmax epilogue at depth). When `tpr` divides `cols`
-        (the common power-of-two case) every lane runs exactly `cols/tpr`
-        in-bounds iterations, so emit a CONSTANT-TRIP loop that the compiler
-        unrolls with no per-iteration predicate. Same fix as the cooperative
-        loads' `_emit_coop_loop_open`. Increments indent; the caller emits the
+        mask (~6-7% "Predication" per such loop on attention's softmax epilogue
+        at depth). When `tpr` divides `cols` every lane runs exactly `cols/tpr`
+        in-bounds iterations, so emit a CONSTANT-TRIP loop the compiler unrolls
+        with no per-iteration predicate. Increments indent; the caller emits the
         body and closes one brace. Falls back to the data-dependent form for
-        `tpr == 1` (scalar) or a non-dividing `cols`.
+        `tpr == 1` or a non-dividing `cols`.
         """
         tpr = self._tpr
         if tpr > 1 and cols % tpr == 0:
@@ -122,8 +120,7 @@ class ReductionEmitterMixin:
         within each width-lane group — crucial when tpr < 32 packs several
         rows into one simdgroup (e.g. attention's softmax at tpr=16 puts two
         rows per simdgroup, so offset 16 would cross into the neighbour row).
-        Defaults to 32 (a full simdgroup), preserving the cross-simdgroup
-        and tpr=32 reduction paths bit-for-bit.
+        Defaults to 32 (a full simdgroup).
         """
         off = width // 2
         while off >= 1:
@@ -243,9 +240,7 @@ class ReductionEmitterMixin:
             # EVERY threadgroup lane with `base[tid]` — threads N..threads-1
             # hold out-of-tile (adjacent-memory) values, not zeros. The butterfly
             # below sums all `self._threads` lanes, so without a mask those stray
-            # lanes corrupt the result. (Chunked delta-rule's per-chunk g-sum hit
-            # this: chunk 0's 8-lane sum pulled in chunk 1's g[8:16], scaling the
-            # carried state by exp(Σg_chunk1).) Seed stray lanes with identity.
+            # lanes corrupt the result. Seed stray lanes with identity.
             n_elems = inp.shape[0] if inp.shape else self._threads
             if isinstance(n_elems, int) and n_elems < self._threads:
                 seed_expr = f"(tid < {n_elems}u) ? ({input_expr}) : {identity}"
@@ -257,12 +252,9 @@ class ReductionEmitterMixin:
             sg = f"_sg{uid}"
             ln = f"_ln{uid}"
             self._emit(f"uint {sg} = tid / 32, {ln} = tid % 32;")
-            # Pre-write barrier. Skipping it on uid==0 is incorrect when
-            # the reduction lives inside a loop: at runtime the "first"
-            # emit re-executes for iteration N+1 after iteration N's last
-            # reduction wrote to _red, so we still need the barrier.
-            # Unconditional emit is the safe choice; the no-op cost on
-            # uid==0 of a kernel-wide-first reduction is negligible.
+            # Pre-write barrier, emitted unconditionally. Skipping it on uid==0
+            # is incorrect inside a loop: at runtime that "first" emit re-executes
+            # for iteration N+1 after iteration N's reduction wrote to _red.
             self._emit("threadgroup_barrier(mem_flags::mem_threadgroup);")
             self._emit(f"if ({ln} == 0) _red[{sg}] = {name};")
             self._emit("threadgroup_barrier(mem_flags::mem_threadgroup);")

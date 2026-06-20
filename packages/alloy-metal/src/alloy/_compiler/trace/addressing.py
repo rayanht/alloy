@@ -134,8 +134,7 @@ def _extract_2d_addr_standard(offsets: TileValue):
     # addend on the way down. The address may carry more than one program-derived
     # scalar base — e.g. multi-head q/k loads address `bi*(S·NK·DK) + h_kv*DK +
     # (t0+rc)*stride + col`, where `bi*…` and `h_kv*DK` sit at different add
-    # levels. Capturing only the scalar adjacent to the row*stride mul silently
-    # dropped the other (every head read head 0). Collect all and sum them.
+    # levels. Collect all and sum them.
     scalar_addends: list = []
     cur = op_map.get(row_val.name)
     while isinstance(cur, BinOp) and cur.op == "add":

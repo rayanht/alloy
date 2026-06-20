@@ -6,8 +6,6 @@ only to the slice, the fusion engine should:
   2. Clone the Store for the slice output
   3. Guard with column bounds
   4. Remap addressing to the slice's contiguous output layout
-
-Real-world pattern: batched QKV GEMM → gate slice → sigmoid.
 """
 
 import alloy as al
@@ -40,9 +38,7 @@ class TestColumnSliceEpilogue:
         B = (rng.standard_normal((K, N)) * 0.1).astype(np.float32)
 
         gemm_out = al.dot(A, B, BLOCK_M=16, BLOCK_N=32, BLOCK_K=16)
-        # Column slice: first half_N columns
         left_slice = gemm_out.slice(1, 0, half_N)
-        # Apply scale to the slice — this is the epilogue
         flat_N = M * half_N
         scaled = k_scale[((flat_N + 1023) // 1024,)](
             left_slice, np.zeros(flat_N, dtype=np.float32), N=flat_N
@@ -56,8 +52,8 @@ class TestColumnSliceEpilogue:
         """dot(A, B) → scale(left_half) + bias(right_half).
 
         Both column slices of the GEMM output get different epilogues.
-        Correctness check — fusion may or may not happen depending on
-        whether the fusion engine handles multi-branch column slices.
+        Fusion may or may not happen for multi-branch column slices; this
+        checks correctness either way.
         """
         M, K, N = 32, 32, 64
         half_N = N // 2
@@ -94,7 +90,6 @@ class TestColumnSliceEpilogue:
         M, N = 16, 64
         half_N = N // 2
 
-        # Build a LazyOp that reads the column slice
         rng = np.random.default_rng(42)
         x = (rng.standard_normal((M, N)) * 0.1).astype(np.float32)
         gemm_out = al.dot(x[:, :M], x[:M, :N], BLOCK_M=8, BLOCK_N=32, BLOCK_K=8)
@@ -103,13 +98,9 @@ class TestColumnSliceEpilogue:
         scaled = k_scale[((flat_N + 1023) // 1024,)](
             left, np.zeros(flat_N, dtype=np.float32), N=flat_N
         )
-        # Collect ops to get the LazyOp for the scale
         ops, _ = _collect_pending_ops((scaled,))
-        # The scale op should be the last one
         scale_op = ops[-1]
-        # Detect column slice
         result = _detect_column_slice_epilogue(scale_op, gemm_out)
-        # Should detect: col_start=0, col_end=half_N, slice_width=half_N
         if result is not None:
             col_start, col_end, slice_width = result
             assert col_start == 0

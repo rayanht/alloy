@@ -70,11 +70,9 @@ class TestDiamondFusion:
         result_buf = k_mul[grid](x, sig, np.zeros(N, dtype=np.float32), N=N)
 
         result, n_dispatches = _dispatches(lambda: np.array(result_buf))
-        # Diamond may fuse to 1 or stay at 2 depending on the analysis —
-        # the key constraint is correctness.
+        # Diamond may fuse to 1 or stay at 2 depending on the analysis.
         expected = x * ref_sigmoid(x)
         np.testing.assert_allclose(result, expected, rtol=1e-5)
-        # But it should be at most 2 (not 3 separate dispatches)
         assert n_dispatches <= 2, f"SiLU diamond: expected ≤2 dispatches, got {n_dispatches}"
 
 

@@ -52,7 +52,7 @@ class TestRowBroadcastTransform:
         assert RowBroadcastTransform().tile_2d("r", "c") == "c"
 
     def test_flat_passthrough(self):
-        # In flat context, row broadcast falls through to identity
+        # row broadcast falls through to identity in flat context
         assert RowBroadcastTransform().flat("idx") == "idx"
 
 
@@ -85,7 +85,6 @@ class TestScatterTransform:
     def test_3d_flat(self):
         xf = ScatterTransform(nd_shape=(2, 4, 8), nd_strides=(64, 1, 4))
         expr = xf.flat("idx")
-        # Should decompose idx into 3D indices and apply strides
         assert "64u" in expr
         assert "4u" in expr
 

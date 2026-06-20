@@ -1,14 +1,8 @@
 """Tile kernel planning — analyze tile IR and produce optimization decisions.
 
-This module is the optimization pass between tile IR lowering and MSL emission.
-It inspects the tile IR structure and produces a TileKernelPlan that captures
-all decisions: thread model, shared memory layout, column tiling, register
-blocking, etc. The emitter reads the plan without making any decisions.
-
-Architecture: plan_tile_kernel() runs a pipeline of optimization passes.
-Each pass is a function(func, plan) → None that reads the IR and mutates
-the plan. Passes run in dependency order — later passes can read decisions
-made by earlier ones.
+plan_tile_kernel() runs a pipeline of passes, each a function(func, plan) → None
+that reads the IR and mutates the plan. Passes run in dependency order: thread
+model, shared memory layout, column tiling, register blocking, etc.
 """
 
 from __future__ import annotations
@@ -49,22 +43,16 @@ def pick_dot_reg(
     skipped at codegen.
 
     Used by the planner to size `n_simdgroups` per-Dot AND by the MSL
-    emitter to emit per-Dot guards/accumulators that match. A mixed-shape
-    kernel (e.g. SDPA bwd dq has 16x8 and 16x128 dots side by side) gets
-    a different `reg` per dot — the small one falls back to `reg=1`
-    because N=8 doesn't fit `reg=2`'s TN=16, while the big one stays at
-    `reg=2`. Both must use the same picker so per-dot decisions agree.
+    emitter to emit per-Dot guards/accumulators that match — both use this
+    picker so per-dot decisions agree. A mixed-shape kernel (e.g. SDPA bwd
+    dq has 16x8 and 16x128 dots side by side) gets a different `reg` per dot.
 
     `target_n_sg`: when set, additionally downsize reg if the default
     (M, N)-only pick would use ≤ ¼ of the available simdgroups. Dropping
     reg by one step quadruples this dot's simdgroup count (each lane gets
-    a smaller output tile, more lanes can run in parallel). Used in
-    kernels where one dot is small (low n_sg) and shares NUM_THREADS
-    with a large dot (high n_sg) — without this, the small dot lets
-    most simdgroups idle during its compute-dense K-loop. Concrete win:
-    SDPA bwd dkdv at BM=16 BN=32, dot119/dot148 (32×16) drop reg=2→1
-    so they use 8 simdgroups instead of 2 (4× parallelism on these
-    K-loops, which are the FLOP-densest phase).
+    a smaller output tile, more lanes can run in parallel). Needed when a
+    small dot shares NUM_THREADS with a large dot — otherwise the small
+    dot lets most simdgroups idle during its compute-dense K-loop.
     """
     if override in (1, 2, 4):
         reg = override
@@ -121,7 +109,7 @@ def _auto_shmem_plan(
     reuse requires the candidate value's dtype to match the slot's existing
     dtype — values whose shmem layouts are different sizes (e.g. bf16 vs
     f32) cannot safely share a buffer. When omitted, all values are treated
-    as the same dtype (legacy behavior).
+    as the same dtype.
     """
     # Collect all ops with timestamps + loop span info
     flat_ops = list(walk_ops(func.ops))
@@ -145,23 +133,20 @@ def _auto_shmem_plan(
         if isinstance(op, Dot) and op.result:
             # Persistent MMA accumulators (op.acc set by _opt_persistent_mma)
             # live in simdgroup registers across the loop. Skip the shmem
-            # slot unless the result is consumed by ANOTHER Dot (chained
-            # GEMM; `_materialize_mma_to_shmem` spills only when a downstream
-            # Dot reads the persistent accumulator).
+            # slot unless the result is consumed by ANOTHER Dot (chained GEMM).
             #
             # FA-2 forward's acc_pre_scale path keeps everything in registers:
-            # alpha lives in a tiny per-row scratch (`_acc_pre_scale_*[BLOCK_M]`)
-            # and the rescale is applied via thread_elements() writes on the
-            # persistent simdgroup_matrix accumulator. Allocating a full
-            # (BLOCK_M, HEAD_DIM) slot here would bloat the shmem budget
+            # alpha lives in a tiny per-row scratch and the rescale is applied
+            # via thread_elements() writes on the persistent accumulator.
+            # A full (BLOCK_M, HEAD_DIM) slot would bloat the shmem budget
             # without ever being written, and force mask/exp slots to inherit
             # the wide stride via slot-reuse.
             if op.acc is not None:
                 result_name = op.result.name
-                # In-loop consumers (rescales like FA-2's `o = o * alpha`)
-                # are emitted as in-register simdgroup ops and do NOT need a
-                # shmem slot. Only POST-LOOP consumers that aren't a direct
-                # Store (or chained Dot) need a slot to spill into.
+                # In-loop consumers (rescales like `o = o * alpha`) are emitted
+                # as in-register simdgroup ops and need no shmem slot. Only
+                # post-loop consumers that aren't a Store (or chained Dot) need
+                # a slot to spill into.
                 in_loop_end = -1
                 for ls, le in loop_spans:
                     if ls <= t <= le and le > in_loop_end:
@@ -181,9 +166,8 @@ def _auto_shmem_plan(
                                 consumed_by_other = True
                                 break
                 if not (consumed_by_dot or consumed_by_other):
-                    # Store-only consumer: _emit_persistent_mma_store writes
-                    # straight from registers to device memory, so the
-                    # planner doesn't need to allocate a shmem slot.
+                    # Store-only consumer writes straight from registers to
+                    # device memory — no shmem slot needed.
                     continue
             shmem_vals.append([op.result.name, *op.result.shape, t, t])
             val_names.add(op.result.name)
@@ -192,12 +176,11 @@ def _auto_shmem_plan(
     # — they need their own shmem slot so simdgroup_load (Dot) or the
     # `_row * stride + _n` shmem walk (Reduce, see _emit_reduce in
     # msl/reductions.py) can read them. Must be done before in-place chain
-    # extension so we know which nodes have their own slot (chain terminates
-    # at own-slot nodes). Without the Reduce side of this rule, the M=1
-    # vector-path attention chain `sum(...) → where(...) → max(axis=0)`
-    # emits a `_ssel*[...]` shmem reference for the Where output that the
-    # decl-emission pass never sees, producing MSL with undeclared
-    # identifiers and a Metal compile-time error.
+    # extension so the chain terminates at own-slot nodes. Without the Reduce
+    # side of this rule, the M=1 vector-path attention chain `sum(...) →
+    # where(...) → max(axis=0)` emits a `_ssel*[...]` shmem reference for the
+    # Where output the decl-emission pass never sees, producing MSL with
+    # undeclared identifiers and a Metal compile error.
     shmem_consumer_inputs: set[str] = set()
     for op in flat_ops:
         if isinstance(op, Dot):
@@ -277,9 +260,9 @@ def _auto_shmem_plan(
     # In-place score-buffer merge (attention softmax). A Select/BinOp/UnaryOp
     # result that feeds a Reduce/Dot normally takes its OWN slot, but when this
     # op is the LAST reader of an element-wise shmem input, it can overwrite that
-    # input's slot in place instead — the input is dead, so the element-wise
-    # write is safe (the emitter's COW still guards any survivor). This collapses
-    # the causal-mask / subtract / exp outputs back onto the QK-score slot: ONE
+    # input's slot in place instead — the input is dead, so the write is safe
+    # (the emitter's COW still guards any survivor). This collapses the
+    # causal-mask / subtract / exp outputs back onto the QK-score slot: ONE
     # (BLOCK_M, BLOCK_N) buffer for the whole softmax instead of two, freeing a
     # shmem resident (deep-prefill split-K attention is shmem-occupancy-bound:
     # 12.8KB/TG → 2 residents; dropping a score buffer → ~8.7KB → 3). Gated to
@@ -526,12 +509,9 @@ def _pass_detect_dtypes(func: TileFunction, plan: TileKernelPlan):
         # bf16 model wastes 2× shmem and 2× MMA throughput. Tile-level Reduce
         # ops still need f32 shmem accumulation, so fall back there.
         #
-        # Caller can opt into f32 shmem via HIGH_PRECISION=1 constexpr —
-        # used by the SDPA backward dq/dkdv kernels when K-bias amplification
-        # makes the FA-2 cancellation `ds = p * (dp - delta)` lose meaningful
-        # precision through the bf16 shmem spill. The handler dispatches with
-        # HIGH_PRECISION=1 only when K's actual magnitude exceeds the safe
-        # threshold, so K-bias-free models keep the bf16 fast path.
+        # HIGH_PRECISION=1 forces f32 shmem — used by the SDPA backward dq/dkdv
+        # kernels when K-bias amplification makes the cancellation
+        # `ds = p * (dp - delta)` lose precision through the bf16 shmem spill.
         force_f32 = func.constexpr_values.get("HIGH_PRECISION", 0) == 1
         ops_iter = list(walk_ops(func.ops))
         has_dot = any(isinstance(op, Dot) for op in ops_iter)
@@ -728,11 +708,9 @@ def _pass_thread_model(func: TileFunction, plan: TileKernelPlan):
         plan.threads = block_m
 
     # Fail loudly if the chosen launch exceeds the hardware threadgroup-thread
-    # cap. Without this the overflow is silent garbage (see gemma4 head_dim-512
-    # prefill: the p@v dot at reg=1 wanted n_simdgroups = head_dim/8 = 64 →
-    # 2048 threads, double the limit; only 32 simdgroups ran and output columns
-    # 256..511 were never written). Fix by lowering n_simdgroups — bigger reg /
-    # BLOCK_M so each simdgroup covers a larger output tile, or head_dim tiling.
+    # cap. Without this the overflow is silent garbage — Metal runs only the
+    # first 1024 threads, leaving the rest of the output unwritten. Fix by
+    # lowering n_simdgroups (bigger reg/BLOCK_M, or head_dim tiling).
     if plan.threads > _MAX_THREADS_PER_THREADGROUP:
         raise ValueError(
             f"kernel {func.name!r}: {plan.threads} threads/threadgroup "
@@ -826,9 +804,7 @@ def _compute_per_value_shmem_dtype(
     # Pre-mark single-Dot-consumer 2D BinOp/UnaryOp/Select results as
     # bfloat-preferred so union-find collapses their MMA partner classes
     # to bf16 too. Small per-dispatch shmem savings free room for larger
-    # BM/BN tiles. Apple bf16 MMA is bit-identical to f32 MMA per
-    # microbench; residual error comes from the K*SCALE prologue rounding
-    # and other compounding paths, not the MMA itself.
+    # BM/BN tiles.
     has_dot_user_pre: dict[str, bool] = {}
     has_nondot_user_pre: dict[str, bool] = {}
     for op in flat_ops:
@@ -957,13 +933,10 @@ def _pass_device_direct(func: TileFunction, plan: TileKernelPlan):
     RHS (K) is reloaded fresh every KV-block iteration, reused only sg_rows (2-8)
     times, and the shmem it occupies caps BLOCK_N over a thousands-deep KV scan —
     the amortization (saving one cheap simdgroup_load) is dwarfed by the lost
-    occupancy. `sg_rows` alone is a leaky GEMM proxy: it reads == 1 for attention
-    only when BLOCK_M <= reg*8 (== 8). At BLOCK_M = 16 (gemma4 head_dim-512 global
-    layers) the QK dot reads sg_rows = 2 and was wrongly forced to stage K — which
-    pinned BLOCK_N at 8 (Q 16.6KB + K 8.3KB ≈ 25KB, and BLOCK_N=16 overflows the
-    32KB budget). The honest discriminator is the actual FA-vs-GEMM signature, not
-    sg_rows: a non-accumulating score dot (`op.acc is None`) inside a loop-carried
-    softmax (`_has_loop_carried_reduce`) streams its RHS regardless of sg_rows; a
+    occupancy. `sg_rows` alone is a leaky GEMM proxy (it reads 1 for attention
+    only when BLOCK_M <= reg*8). The discriminator is the FA-vs-GEMM signature:
+    a non-accumulating score dot (`op.acc is None`) inside a loop-carried softmax
+    (`_has_loop_carried_reduce`) streams its RHS regardless of sg_rows; a
     persistent-MMA accumulator dot (`op.acc is not None`) keeps the sg_rows rule.
 
     (LHS A is symmetric under sg_cols == 1, but in attention Q/p are shared across
@@ -1206,7 +1179,7 @@ def _pass_double_buffer(func: TileFunction, plan: TileKernelPlan):
 
 
 def _pass_persistent_o_budget(func: TileFunction, plan: TileKernelPlan):
-    """Disable persistent-o (FA-2 forward rescale-accumulate, 014f28a) when
+    """Disable persistent-o (FA-2 forward rescale-accumulate) when
     its threadgroup scratch (`_acc_pre_scale_*` + `_acc_post_scale_*`,
     BLOCK_M floats each) would push the kernel over the 32 KB
     threadgroup-memory limit.

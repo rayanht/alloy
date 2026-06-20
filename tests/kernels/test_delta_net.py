@@ -92,8 +92,8 @@ def _run_2stage(B, NV, DK, DV, S, C, DVB, real_len=None, seed=0):
 @pytest.mark.parametrize("NV,S,C,DVB", [(1, 16, 8, 16), (2, 24, 8, 8), (16, 128, 8, 8)])
 def test_2stage_chunked(NV, S, C, DVB):
     """Stage1 (parallel intra-chunk) + stage2 (DV-blocked scan). The NV=16 case
-    is a regression for the multi-head cooperative-load address (the `h_kv*DK`
-    base offset was dropped, so every head read head 0)."""
+    guards the multi-head cooperative-load address (the `h_kv*DK` base offset
+    must reach each head, not head 0)."""
     d = 128 if NV == 16 else 16
     ql, kl, v, g, beta, o_k, s_k = _run_2stage(1, NV, d, d, S, C, DVB)
     for h in range(NV):

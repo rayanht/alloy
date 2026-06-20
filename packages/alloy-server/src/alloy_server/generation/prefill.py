@@ -59,12 +59,11 @@ def grid_shrink_safe(d, m_max: int) -> bool:
     M-block-tiled or 1D-flattened, and the threadgroup prefix covers the first
     ceil(m_pad/m_max) FRACTION of the kernel's linear work — which equals "the
     first m_pad M-rows" only if M is the OUTERMOST axis of every buffer it
-    writes. Counter-example: the rope-table
-    broadcast `mul` writes freqs = inv_freq ⊗ positions as (1, n_freqs, M) — M
-    INNERMOST — so its shrunk prefix wrote "freq row 0, first chunk of
-    positions" instead of "all freqs for the first m_pad positions", leaving
-    the real rows' tables for freqs >= 1 holding whatever the uninitialized
-    pool contained.
+    writes. Counter-example: the rope-table broadcast `mul` writes
+    freqs = inv_freq ⊗ positions as (1, n_freqs, M) — M INNERMOST — so its
+    shrunk prefix covers "freq row 0, first chunk of positions" instead of
+    "all freqs for the first m_pad positions", leaving the real rows' tables
+    for freqs >= 1 holding uninitialized pool memory.
 
     The gate checks the recording-time view layout of every written buffer:
     an M-bearing axis (extent % m_max == 0) must be the max-stride axis. A
@@ -129,14 +128,14 @@ def compute_grid_shrink_recipe(
       - AFFINE: ext = base + k*M with base > 0   (grids whose tile count carries a
         constant offset — the MoE grouped GEMMs grid max_tiles = NUM_EXPERTS + M*TOP_K/
         PAD_M, i.e. 256 + M, and the sort/sanitize passes derived from it). Neither
-        divisibility nor probe-proportionality holds (the +base breaks both), so at
-        native these ran the FULL M_MAX grid every call — and their full-buffer
-        writes faulted in ~the whole intermediate pool (~117GB on qwen3.6:35b at
-        262144) regardless of prompt length. Detected by an exact two-point affine
-        fit: k = (ext_max-ext_probe)/(m_max-m_probe) as an exact rational, base =
+        divisibility nor probe-proportionality holds (the +base breaks both), so
+        without this branch these run the FULL M_MAX grid every call regardless of
+        prompt length, their full-buffer writes faulting in ~the whole intermediate
+        pool. Detected by an exact two-point affine fit: k =
+        (ext_max-ext_probe)/(m_max-m_probe) as an exact rational, base =
         ext_max - k*m_max > 0. Tuned-BLOCK GEMMs cannot mis-match here: their
         block-tiled extents divide m_max, so the divisibility gate claims them
-        first, probe-independent (the §10.2 pitfall stays fixed).
+        first, probe-independent.
 
     Dispatches are matched by (debug_name, occurrence) so a dispatch-count
     mismatch (split-K SPLITS shifting per shape) only drops the unmatched ones.
@@ -247,13 +246,13 @@ class ChunkPrefill(torch.nn.Module):
     ) -> None:
         super().__init__()
         self.model = model
-        # Speculative-drafter taps: when a drafter is
-        # attached before the prefill module builds, every chunk also emits
-        # the tapped decoder layers' hidden states (hidden_states[i+1] is the
-        # OUTPUT of layer i); unrequested layers stay dead lazy buffers.
+        # Speculative-drafter taps: when a drafter is attached before the
+        # prefill module builds, every chunk also emits the tapped decoder
+        # layers' hidden states (hidden_states[i+1] is the OUTPUT of layer i);
+        # unrequested layers stay dead lazy buffers.
         self.tap_layers = tuple(tap_layers)
-        # Splits the FX-graph-cache signature: a tapped prefill graph is a
-        # different graph from the tapless one (same source, same model).
+        # Splits the FX-graph-cache signature: a tapped prefill graph differs
+        # from the tapless one.
         self._cache_variant = f"taps={self.tap_layers}" if tap_layers else None
 
     def forward(
@@ -279,19 +278,17 @@ class ChunkPrefill(torch.nn.Module):
             cache_position=cache_position,
             logits_to_keep=last_real_pos,
         )
-        # Shared cumulative_length advance (see GreedyNextToken.forward).
-        # PrefillEngine.chunked overrides this eagerly with fill_(start_pos +
-        # real_len) post-forward, so the in-graph value is corrected for the
-        # padded-chunk case — but tracing the .add_ keeps cumulative_length
-        # marked as an input mutation and stable across the pinned-storage
-        # path.
+        # PrefillEngine.chunk_step overrides cumulative_length eagerly post-
+        # forward (fill_(start_pos + real_len)) for the padded-chunk case;
+        # tracing the .add_ here keeps it marked as an input mutation and
+        # stable across the pinned-storage path.
         past_key_values.layers[0].cumulative_length.add_(input_ids.shape[1])
         logits = output.logits
         if logits is None:
             raise ValueError("causal LM output did not include logits")
-        # Sample (or argmax when greedy) the first token on-GPU, mirroring
-        # `GreedyNextToken`. The kept logit is at the last real position
-        # (logits_to_keep=last_real_pos), so logits[:, -1:, :] is its row.
+        # Sample (or argmax when greedy) the first token on-GPU. The kept logit
+        # is at the last real position (logits_to_keep=last_real_pos), so
+        # logits[:, -1:, :] is its row.
         token = torch.ops.alloy.sample_categorical(
             logits[:, -1:, :], cache_position, seed, params
         )
@@ -343,11 +340,11 @@ class EmbedTokens(torch.nn.Module):
 
 
 class ChunkPrefillEmbeds(torch.nn.Module):
-    """Bucketed prefill from `inputs_embeds` (vision features already spliced in)
-    plus the precomputed `per_layer_inputs`, sampling the first token on-GPU. The
-    multimodal counterpart of `BucketedPrefill`: identical padding / warm-op /
-    sampling semantics, but the input is embeddings (so the quantized embed_tokens
-    isn't re-run and the vision splice survives) and `per_layer_inputs` is forwarded
+    """Prefill from `inputs_embeds` (vision features already spliced in) plus
+    the precomputed `per_layer_inputs`, sampling the first token on-GPU. The
+    multimodal counterpart of `ChunkPrefill`: same padding / warm-op / sampling
+    semantics, but the input is embeddings (so the quantized embed_tokens isn't
+    re-run and the vision splice survives) and `per_layer_inputs` is forwarded
     through `**kwargs` so the decoder skips its embeds→ids reverse path."""
 
     model: transformers.PreTrainedModel
@@ -410,13 +407,11 @@ class PrefillEngine:
         self.cache_dtype = cache_dtype
         # Attached spec-decode session (taps + observe). Set by attach_spec.
         self.spec: SpecSession | None = None
-        # Compiled modules INJECTED by AlloyGenerator.build_modules
-        # (eager_compile_all is the mandatory precondition). This engine is a
-        # pure executor: it dispatches them, it never compiles. `module` is the
+        # Compiled modules INJECTED by AlloyGenerator.build_modules. This
+        # engine dispatches them, it never compiles. `module` is the
         # chunked-prefill wrapper (one cached plan per unique chunk, SEQ_LEN
         # constexpr); the two embed modules are the multimodal text-embed
-        # lookup + chunked inputs_embeds prefill (built only for vision/audio
-        # models).
+        # lookup + chunked inputs_embeds prefill (vision/audio models only).
         self.module: torch.nn.Module | None = None
         self.embed_module_compiled: torch.nn.Module | None = None
         self.embeds_module: torch.nn.Module | None = None
@@ -444,12 +439,10 @@ class PrefillEngine:
         start_pos: int = 0,
         on_chunk: Callable[[int], None] | None = None,
     ) -> torch.Tensor:
-        """Prefill the prompt suffix: THE one text-prefill entry point — every
-        caller (run pipeline, warm-suffix, constrained, spec-decode) lands here,
-        and it is nothing but `chunked` at the production chunk size. With a
-        shrink-capable chunk plan, full chunks saturate the GPU and the final
-        partial chunk runs at an exact shrunk grid, so no padded rows cost GPU
-        work anywhere."""
+        """Prefill the prompt suffix: THE one text-prefill entry point —
+        `chunked` at the production chunk size. With a shrink-capable chunk
+        plan, full chunks saturate the GPU and the final partial chunk runs at
+        an exact shrunk grid, so no padded rows cost GPU work."""
         return self.chunked(input_ids, cache, start_pos=start_pos, on_chunk=on_chunk)
 
     def chunked(
@@ -477,12 +470,11 @@ class PrefillEngine:
             # Split the final segment so a chunk boundary (= a prefix-mark
             # resume point) lands TAIL_MARK tokens before the prompt end —
             # full-prefix forks (a request matching everything but the last
-            # few mutated tokens) otherwise resume a whole partial chunk
-            # back. Multi-chunk prefills only: the extra small forward costs
-            # ~0.4s of fixed per-chunk overhead, a measured 7% pp hit on a
-            # single-chunk prefill but <1% on the long prompts whose forks
-            # the mark exists for. Applies in both KV modes so prefill stays
-            # bit-identical across them.
+            # few mutated tokens) otherwise resume a whole partial chunk back.
+            # Multi-chunk prefills only: the extra forward costs ~0.4s of fixed
+            # overhead (7% pp on a single-chunk prefill, <1% on the long
+            # prompts whose forks the mark exists for). Applies in both KV
+            # modes.
             if end == real_len and pos > 0 and end - pos > 2 * TAIL_MARK:
                 end -= TAIL_MARK
             slice_ids = input_ids[:, pos:end]
@@ -562,27 +554,24 @@ class PrefillEngine:
                 # Grid shrink: dispatch exactly the real prompt length (padded
                 # up to the tile multiple) against the chunk-compiled plan —
                 # only the M-tiled dispatches' grids change per call, so the
-                # padding rows beyond `m_pad` cost no GPU work. This is a PLAN
-                # property: a plan compiled without a shrink recipe (small
-                # chunks below the shrink threshold) yields grid_updates=None
-                # and keeps its full registered grid.
+                # padding rows beyond `m_pad` cost no GPU work. A plan compiled
+                # without a shrink recipe (small chunks below the threshold)
+                # yields grid_updates=None and keeps its full registered grid.
                 m_pad = (real_len + 63) // 64 * 64
-                # Request-bounded pool: grow the M-outer intermediates to
-                # cover this prompt (monotone high-water; doubles to
-                # amortize, capped at the plan's M_MAX). Rare path — the
-                # steady state pays nothing.
+                # Request-bounded pool: grow the M-outer intermediates to cover
+                # this prompt (monotone high-water; doubles to amortize, capped
+                # at the plan's M_MAX).
                 if plan._pool_trunc and m_pad > plan._pool_bound:
                     _grow_plan_pool(plan, max(m_pad, 2 * plan._pool_bound))
                 updates = grid_shrink_updates(plan, m_pad)
                 # Record the shrunk grid so `alloy.visualize` can profile
                 # this plan at the same launch the run just dispatched.
                 plan._last_grid_shrink_updates = updates
-                # `_execute_plan` returns the FX-flat output tuple (or a
-                # single tensor when the graph has just one output). The
-                # entries other than `next_token_idx` are AOT input-mutation
-                # tracebacks (per-layer cumulative_length / keys / values)
-                # that fold back into the input storages via aliasing — we
-                # don't need to return them.
+                # `_execute_plan` returns the FX-flat output tuple (or a single
+                # tensor for a one-output graph). Entries other than
+                # `next_token_idx` are AOT input-mutation tracebacks (per-layer
+                # cumulative_length / keys / values) that fold back into the
+                # input storages via aliasing — no need to return them.
                 result = _execute_plan(plan, args, grid_updates=updates)
                 tap_tensors: tuple[torch.Tensor, ...] = ()
                 if isinstance(result, tuple):
@@ -613,25 +602,22 @@ class PrefillEngine:
             set_taps_enabled(False)
             if cache_last_real is not None:
                 cache_last_real.fill_(-1)
-        # The model's forward incremented every layer's cumulative_length by
-        # `chunk`. Real-position decode wants it at `start_pos + real_len`.
-        # has_previous_state is the SAME contract: the module path sets it
-        # True inside the DN forward, but a pinned-plan replay has no python
-        # side effects — without replicating it here, the request's FIRST
-        # decode token runs the has_previous_state=False S=1 graph, whose
-        # conv path computes a correct OUTPUT (it reads the saved pre-
-        # context) but NEVER WRITES the token's input into conv_states. The
-        # dropped column corrupts every window for the next conv_kernel_size
-        # positions — a silent plain-decode wrongness near the prefill
-        # boundary.
+        # The forward incremented every layer's cumulative_length by `chunk`;
+        # real-position decode wants it at `start_pos + real_len`.
+        # has_previous_state is the same contract: the module path sets it True
+        # inside the DN forward, but a pinned-plan replay has no python side
+        # effects — without replicating it here, the request's FIRST decode
+        # token runs the has_previous_state=False S=1 graph, whose conv path
+        # computes a correct OUTPUT but NEVER WRITES the token's input into
+        # conv_states, corrupting every window for the next conv_kernel_size
+        # positions near the prefill boundary.
         for layer in cache.layers:
             layer.cumulative_length.fill_(start_pos + real_len)
             if isinstance(layer, AlloyLinearAttentionLayer):
                 layer.has_previous_state = True
-        # Drafter taps: hand this chunk's tapped hidden
-        # states to the attached drafter — rows [0, real_len) are real, the
-        # padded tail is dead (TapBatch.rows bounds validity; the tensors stay
-        # chunk-wide for fixed shapes). record-only compiles skip (phantom
+        # Drafter taps: hand this chunk's tapped hidden states to the attached
+        # drafter — rows [0, real_len) are real, the padded tail is dead
+        # (TapBatch.rows bounds validity). record-only compiles skip (phantom
         # buffers, no data).
         if tap_tensors and self.spec is not None and not is_record_only():
             self.spec.drafter.observe(
@@ -677,18 +663,16 @@ class PrefillEngine:
         if m_probe < 64:
             return  # no room for a second discovery point; keep the full grid
         probe_cache = self.kv.acquire(1, max_cache)
-        # Trace the probe in grid-shrink mode so its attention is single-pass too —
-        # the same structure as the pinned chunk plan, so the attention
-        # dispatches align and land in the recipe (without this the probe would
-        # take the handler's split-K branch and the attention would diverge).
-        # The window caps the probe's M-scaled configs to the same
-        # representative-M tune the pinned max plan resolved against, so the
-        # two plans pick identical tile configs (→ identical grids) and the
-        # recipe diff isn't polluted by a config mismatch. m_probe (not m_max)
-        # — the probe is compiled at m_probe.
+        # Trace the probe in grid-shrink mode so its attention is single-pass,
+        # matching the pinned chunk plan's structure — otherwise the probe
+        # takes the handler's split-K branch and the attention dispatches don't
+        # align. The window caps the probe's M-scaled configs to the same
+        # representative-M tune the max plan resolved against, so the two plans
+        # pick identical tile configs (→ identical grids) and the recipe diff
+        # isn't polluted by a config mismatch.
         # Record-only: the recipe only needs the probe plan's resolved grids
         # (metadata), so build it without allocating M=m_probe intermediates or
-        # running the GPU — same memory bound as the M_MAX plan compile.
+        # running the GPU.
         set_record_only(True)
         try:
             with grid_shrink_compile(m_probe), torch.inference_mode():
@@ -714,10 +698,9 @@ class PrefillEngine:
         # free it so it doesn't leak for the process (no Metal GC).
         release_plan_intermediates(probe_plan)
         # The static shrink-safety gate (write-layout provenance) is the
-        # production mechanism — zero load-time cost. The empirical validator
-        # (6 full-chunk prefills + a bisect per culprit, 2-27s/load measured)
-        # stays as an opt-in bring-up harness for new models/kernels whose
-        # layouts the static gate cannot see.
+        # production mechanism. The empirical validator is an opt-in bring-up
+        # harness for new models/kernels whose layouts the static gate cannot
+        # see.
         n_pinned = 0
         if os.environ.get("ALLOY_GRID_SHRINK_VALIDATE", "") not in ("", "0"):
             n_pinned = self.validate_grid_shrink_recipe(max_plan, m_max, max_cache)
@@ -755,15 +738,13 @@ class PrefillEngine:
         m_max -> all grids full), then prefill a shorter prompt Y twice — once
         shrunk (production grids), once full — and require identical next-token
         + KV rows. A dispatch whose shrink misses real work leaves X's
-        wrong-content values in rows Y needs, so the comparison fails for
-        content-dependent and content-independent corruption alike; a bisect
-        over the recipe prefix then pins the culprit. Pinning keeps the recipe
-        ENTRY but sets (base=ext_max, lin=0) — the dispatch gets an explicit
-        full grid every call (grid overrides are sticky in C++, so entries must
-        never just disappear). Worst case pins everything: full grids are
-        always correct, just unshrunk. The X-priming run doubles as the pool
-        warmup: every pad row a masked read can touch holds finite values
-        afterwards, never uninitialized memory."""
+        wrong-content values in rows Y needs; a bisect over the recipe prefix
+        then pins the culprit. Pinning keeps the recipe ENTRY but sets
+        (base=ext_max, lin=0) — the dispatch gets an explicit full grid every
+        call (grid overrides are sticky in C++, so entries must never just
+        disappear). Worst case pins everything. The X-priming run doubles as
+        the pool warmup: every pad row a masked read can touch holds finite
+        values afterwards."""
         recipe = plan._grid_shrink_recipe
         if not recipe:
             return 0
@@ -807,11 +788,10 @@ class PrefillEngine:
             return d
 
         # Noise floor: plans with atomic scatter-accumulate (the fused MoE
-        # prefill's reduce="add" stores) are not bit-stable run-to-run — two
-        # IDENTICAL full-grid runs differ at f32 ULP and can flip a garbage-
+        # prefill's reduce="add" stores) aren't bit-stable run-to-run — two
+        # identical full-grid runs differ at f32 ULP and can flip a garbage-
         # prompt argmax. Measure that jitter on two full-grid runs and compare
-        # shrunk-vs-full against it: corruption (wrong-CONTENT values from the
-        # X priming left in rows Y needs) is orders of magnitude above ULP.
+        # shrunk-vs-full against it: corruption is orders of magnitude above ULP.
         prefill_token(ids_x, set())
         tok_f1, cache_f1 = prefill_token(ids_y, set(keys))
         snap_f1 = snapshot(cache_f1, len_y)
@@ -826,7 +806,7 @@ class PrefillEngine:
             )
 
         def probe(pinned: set[int]) -> bool:
-            """True when the shrunk-Y run matches the full-Y run (bit-exact for
+            """True when the shrunk-Y run matches the full-Y run (exactly for
             deterministic plans; within the measured noise floor otherwise)."""
             prefill_token(ids_x, set())          # prime pads at full coverage
             tok_s, cache_s = prefill_token(ids_y, pinned)
@@ -896,9 +876,7 @@ class PrefillEngine:
 
         Always chunks at `EMBEDS_CHUNK_SIZE` (NOT the text chunk): the embeds
         path has no pinned plan and no grid shrink, so a large chunk would pay
-        REAL pad-row GPU work (up to chunk-1 rows) on every short multimodal
-        prompt — the opposite trade of the text path. Port the shrink machinery
-        before unifying."""
+        REAL pad-row GPU work on every short multimodal prompt."""
         chunk = EMBEDS_CHUNK_SIZE
         real_len = int(embeds.shape[1])
         assert real_len > 0

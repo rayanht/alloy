@@ -1,9 +1,9 @@
 """PagedKV contract tests — no model, no GPU.
 
-Guards the multi-slice dispatch surface: `supports_slices` silently falling
-back to ContiguousKV's False disables the whole conversation table (forks,
-prefix marks, slice switching) while every bit-exactness gauntlet stays
-green — exactly the regression that shipped once.
+Guards the multi-slice dispatch surface: `supports_slices` silently
+falling back to ContiguousKV's False disables the whole conversation
+table (forks, prefix marks, slice switching) while the bit-exactness
+gauntlets stay green.
 """
 
 from types import SimpleNamespace

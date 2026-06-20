@@ -43,17 +43,13 @@ logger = get_logger("alloy.compiler")
 def _emitter_source_digest() -> str:
     """SHA-256 over the codegen source tree (``alloy/_compiler/``).
 
-    Folded into every :class:`KernelKey` so that ANY change to the compiler —
-    the MSL emitter (``_compiler/msl/``), the planner (``tile_plan``), the IR
-    opt passes (``tile_opt``), the tracer (``trace/``) — automatically
-    invalidates the on-disk L1 MSL cache. Without it the key is derived from the
-    *kernel's* Python source + config only, so editing the emitter is silently
-    shadowed by stale cached ``.metal`` files: every dispatch keeps running the
-    old codegen until the cache dir is hand-cleared. Hashing only ``msl/`` would
-    miss planner/opt-pass edits that change the emitted MSL just as much, so we
-    cover the whole ``_compiler/`` tree — over-invalidation is a grid-shrink
-    recompile, under-invalidation is a silent-staleness bug. Computed once at
-    import; the walk is a few dozen small files, sorted for a deterministic
+    Folded into every :class:`KernelKey` so a change to the compiler — the MSL
+    emitter (``_compiler/msl/``), the planner (``tile_plan``), the IR opt passes
+    (``tile_opt``), the tracer (``trace/``) — invalidates the on-disk L1 MSL
+    cache. Without it the key derives from the kernel's Python source + config
+    only, so editing the emitter is silently shadowed by stale cached ``.metal``
+    files. Covers the whole ``_compiler/`` tree, not just ``msl/``, since
+    planner/opt-pass edits change the emitted MSL too. Sorted for a deterministic
     digest.
     """
     compiler_dir = Path(__file__).resolve().parent.parent / "_compiler"
@@ -67,7 +63,7 @@ def _emitter_source_digest() -> str:
 
 
 # Digest of the codegen source. Changes to the emitter/planner/IR passes bust
-# the disk MSL cache automatically (computed once at import).
+# the disk MSL cache.
 _EMITTER_DIGEST = _emitter_source_digest()
 
 @dataclass(frozen=True, slots=True)
@@ -272,14 +268,13 @@ class CacheManager:
         """Clear the per-batch dispatch caches (L4 opaque + fused) between
         dispatch batches.
 
-        The L3 `trace_cache` is intentionally NOT cleared here. Unlike the
-        opaque/fused caches — which are keyed by op identity / buffer id, both
-        recycled across batches and therefore stale-prone — the trace cache is
-        keyed purely by value: (contract version, kernel source, constexprs,
-        dtypes, shapes, grid). It holds the traced IR, a pure function of that
-        key with no buffer references, so persisting it across batches is both
-        safe and necessary: clearing it forced every kernel to re-trace once
-        per layer during compile (~1.2k traces for ~94 unique kernels)."""
+        The L3 `trace_cache` is not cleared here. Unlike the opaque/fused caches
+        — keyed by op identity / buffer id, both recycled across batches and so
+        stale-prone — the trace cache is keyed purely by value: (contract
+        version, kernel source, constexprs, dtypes, shapes, grid). It holds the
+        traced IR, a pure function of that key with no buffer references, so
+        persisting it across batches is safe; clearing it re-traces every kernel
+        once per layer during compile (~1.2k traces for ~94 unique kernels)."""
         self.opaque_cache.clear()
         self.fused_cache.clear()
 

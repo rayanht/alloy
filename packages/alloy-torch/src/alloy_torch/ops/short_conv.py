@@ -4,8 +4,8 @@ Subsumes the causal depthwise Conv1d (with rolling state) of the eager
 `Lfm2ShortConv.forward` so the conv-state cache write stays inside the FX graph
 (the op schema declares `conv_state` mutable; otherwise AOT autograd lifts the
 `.copy_()` and decode reads zero state → garbage). Reuses the DeltaNet conv
-kernels verbatim — LFM2's conv is the same causal depthwise Conv1d, minus the
-SiLU activation and the recurrent rule.
+kernels — LFM2's conv is the same causal depthwise Conv1d, minus the SiLU
+activation and the recurrent rule.
 """
 
 from __future__ import annotations

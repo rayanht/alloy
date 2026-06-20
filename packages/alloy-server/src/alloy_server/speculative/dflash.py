@@ -13,7 +13,7 @@ alloy mapping (everything position-aligned, dead rows by overwrite):
 - ctx KV cache: per draft layer, (1, KV_H, S_native, D) fp16 alloy buffers —
   slot i == absolute position i. `observe()` appends feature K/V rows for ALL
   forwarded rows; the committed pointer makes overshoot rows dead, and the
-  next round's append overwrites them (same trick as the target cache).
+  next round's append overwrites them.
 - propose plan: block embeds → 5 layers (attention via
   `attention_kv_update_multi_bidir`: fused block-KV write at
   [pos, pos+B) + every row attends [0, pos+B)) → final norm → shared lm_head
@@ -116,7 +116,7 @@ class DFlashAttention(nn.Module):
         v = self.v_proj(x).view(b, m, self.kv_heads, self.head_dim).transpose(1, 2)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
-        # rope from staged tables: cos/sin (1, M, head_dim), broadcast over heads.
+        # cos/sin (1, M, head_dim), broadcast over heads.
         cos_b = cos.unsqueeze(1)
         sin_b = sin.unsqueeze(1)
         q = (q * cos_b) + (_rotate_half(q) * sin_b)
@@ -243,7 +243,7 @@ class DFlashDrafter:
         self._gen: "AlloyGenerator | None" = None
         self._draft: DFlashDraftModel | None = None
         self._pins: dict | None = None
-        self._ctx_len = 0  # ctx rows valid for positions [0, _ctx_len)
+        self._ctx_len = 0  # ctx rows valid for positions [0, ctx_len)
 
     # ------------------------------------------------------------- contract
 
@@ -259,8 +259,8 @@ class DFlashDrafter:
         draft = DFlashDraftModel(cfg)
         weights = load_file(str(self._ckpt / "model.safetensors"))
         # assign=True adopts the fp16 tensors as the params; a plain
-        # load_state_dict would COPY the values into the fp32-constructed
-        # params and silently leave the module fp32.
+        # load_state_dict copies into the fp32-constructed params and leaves
+        # the module fp32.
         draft.load_state_dict(
             {k: v.to(torch.float16) for k, v in weights.items()},
             strict=True, assign=True,
@@ -269,7 +269,7 @@ class DFlashDrafter:
         for p in draft.parameters():
             p.requires_grad_(False)
         self._draft = draft
-        # ctx KV caches: slot == absolute position, native-sized, demand-paged.
+        # ctx KV caches: slot == absolute position, native-sized.
         kvh, hd = cfg["num_key_value_heads"], cfg["head_dim"]
         s_max = gen.kv.max_cache_len
         self._ctx_arrs = []
@@ -291,8 +291,7 @@ class DFlashDrafter:
             self._pins = self._pin_plans()
             # Observe plans for the prefill chunk widths (the verify width is
             # pinned in _pin_plans). Prefill taps arrive bucket-padded; each
-            # bucket is its own fixed shape. Other widths pin lazily —
-            # _pin_observe restores the ctx rows it clobbers, so that's safe.
+            # bucket is its own fixed shape. Other widths pin lazily.
             for width in self._gen.prefill_chunks:
                 self._pin_observe(width)
 
@@ -322,7 +321,7 @@ class DFlashDrafter:
             self.warmup()
         if self._ctx_len < position:
             # Feature gap (cold prompt without prefill taps, or a rewind past
-            # saved features): the draft cannot attend unwritten ctx rows.
+            # saved features): the draft can't attend unwritten ctx rows.
             return Proposal([])
         pins = self._pins
         plan, args, out_idx, emb_in, cos_in, sin_in, pos_in = pins["block"]
@@ -438,8 +437,8 @@ class DFlashDrafter:
         h = cfg["hidden_size"]
         cos_full, sin_full = self._rope_tables()
 
-        # Dequantized embedding table for host-side block staging (the
-        # MTPDrafter pattern; qwen3.5 ties lm_head to token_embd).
+        # Dequantized embedding table for host-side block staging (qwen3.5
+        # ties lm_head to token_embd).
         vocab = cfg["vocab_size"]
         reader = gguf.GGUFReader(str(self._blob_path))
         et = next(x for x in reader.tensors if x.name == "token_embd.weight")
@@ -504,9 +503,9 @@ class DFlashDrafter:
         o_pos = torch.arange(m, dtype=torch.long)
         # The pin executes the observe module with ZERO tap inputs at
         # positions [0, m) — writing garbage feature rows into the LIVE ctx
-        # cache. Harmless at warmup, but a lazy mid-request pin poisons rows
-        # the draft attends (measured: acceptance collapses to 0). Snapshot
-        # and restore the clobbered rows so pinning is safe anywhere.
+        # cache. A lazy mid-request pin would poison rows the draft attends
+        # (acceptance collapses to 0), so snapshot and restore the clobbered
+        # rows.
         snaps = [(t, t[:, :, :m].clone()) for t in ctx]
         try:
             with torch.inference_mode():

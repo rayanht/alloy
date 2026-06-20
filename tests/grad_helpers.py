@@ -1,20 +1,17 @@
 """Gradient correctness helpers — strict alloy-vs-CPU-eager comparisons.
 
-Every helper here runs the same computation twice on CPU: once with vanilla
-PyTorch eager (the ground truth) and once with ``torch.compile(..., backend=
-"alloy")`` driving alloy-metal's compiled plan. Both forward output and
-parameter/input gradients are compared with tight tolerances.
+Each helper runs the same computation twice on CPU: once with vanilla PyTorch
+eager (the ground truth) and once with ``torch.compile(..., backend="alloy")``.
+Forward output and parameter/input gradients are compared with tight tolerances.
 
-Design notes:
-  * alloy training mode must be on — enable it at import time via
-    ``set_training_mode(True)`` so the compiled plan decomposes SDPA and
-    routes optimiser updates through alloy memory.
-  * The test callable and inputs are produced by factories that are invoked
-    twice (once per backend) so the two runs never share state — no stale
-    grads, no aliased tensors.
-  * ``torch._dynamo.reset()`` is called between runs to force a fresh AOT
-    trace; otherwise the Dynamo cache may hand the alloy backend a graph
-    that was already guarded against different inputs.
+  * alloy training mode is enabled at import via ``set_training_mode(True)`` so
+    the compiled plan decomposes SDPA and routes optimiser updates through alloy
+    memory.
+  * The callable and inputs come from factories invoked twice (once per backend)
+    so the runs share no state — no stale grads, no aliased tensors.
+  * ``torch._dynamo.reset()`` between runs forces a fresh AOT trace; otherwise
+    the Dynamo cache may hand the alloy backend a graph guarded against
+    different inputs.
 """
 
 from __future__ import annotations
@@ -42,9 +39,7 @@ InputSpec = tuple[int, ...] | tuple[tuple[int, ...], InputOptions]
 def _reduce_to_scalar(out: Any) -> torch.Tensor:
     """Turn a forward output (tensor, tuple of tensors, or dict) into a scalar.
 
-    We deliberately use ``.float().sum()`` so the backward seed is dtype-
-    independent — mixing bf16 seeds through fp32 grads picks up precision
-    we'd rather have on the reference side only.
+    Uses ``.float().sum()`` so the backward seed is dtype-independent.
     """
     if isinstance(out, torch.Tensor):
         return out.float().sum()
@@ -78,7 +73,7 @@ def _collect_tensor_outputs(out: Any) -> list[torch.Tensor]:
     if isinstance(out, dict):
         return [t for v in out.values() for t in _collect_tensor_outputs(v)]
     if hasattr(out, "loss") and isinstance(out.loss, torch.Tensor):
-        # HF-style ModelOutput: loss and logits both worth checking.
+        # HF-style ModelOutput: check both loss and logits.
         found = [out.loss]
         if hasattr(out, "logits") and isinstance(out.logits, torch.Tensor):
             found.append(out.logits)
@@ -107,7 +102,6 @@ def _assert_close(
     ref_max = ref.detach().float().abs().max().item()
     allowed = atol + rtol * ref_max
     if max_diff > allowed:
-        # Find the worst element for a more legible failure
         flat_idx = int(diff.flatten().argmax().item())
         a_val = actual.detach().float().flatten()[flat_idx].item()
         r_val = ref.detach().float().flatten()[flat_idx].item()
@@ -134,11 +128,9 @@ def check_grads(
 ) -> None:
     """Assert that alloy's forward output and gradients match CPU eager.
 
-    ``make_fn`` and ``make_inputs`` are called twice — once to produce the
-    reference run, once for the alloy run — so each side has fully
-    independent state. Returning the same module instance twice would
-    share ``.grad`` buffers between the two backward passes and make the
-    comparison meaningless.
+    ``make_fn`` and ``make_inputs`` are called twice (reference run, alloy run)
+    so each side has independent state. Returning the same module instance twice
+    would share ``.grad`` buffers between the two backward passes.
     """
     # ---- Reference (CPU eager) ----
     ref_fn = make_fn()
@@ -199,7 +191,7 @@ def check_grads(
             assert a_in.grad is not None, f"alloy did not produce a grad for input[{i}]"
             _assert_close(a_in.grad, r_grad, atol=atol, rtol=rtol, tag=f"input[{i}].grad")
 
-    # ---- Cleanup: drop dynamo cache so the next test traces fresh ----
+    # Drop dynamo cache so the next test traces fresh.
     torch._dynamo.reset()
 
 

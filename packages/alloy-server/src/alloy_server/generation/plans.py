@@ -59,11 +59,10 @@ kernel void alloy_decode_chunk_copy8(
 
 # 8-byte scalar self-increment for the cumulative_length counter mutation. The
 # model's `cumulative_length.add_(input_ids.shape[1])` is a self-increment
-# (cumulative_length = cumulative_length + 1 at M=1 decode) whose only consumer
-# is the AOT mutation writeback. Folding it here lets the chunked plan ELIDE
-# that standalone `add` dispatch (disconnected from the compute DAG, it drained
-# the pipeline every token) and its copy8 propagation — the counter advances in
-# the feedback instead, exactly like cache_position.
+# (= +1 at M=1 decode) whose only consumer is the AOT mutation writeback.
+# Folding it here lets the chunked plan elide that standalone `add` dispatch
+# (disconnected from the compute DAG, it drained the pipeline every token) and
+# its copy8 propagation — the counter advances in the feedback instead.
 DECODE_INCR8_MSL = """
 #include <metal_stdlib>
 using namespace metal;
@@ -122,8 +121,8 @@ class PlanStore:
         # and replays the plan directly.
         self.prefill_plans: dict[tuple[int, bool], tuple] = {}
         # input_ids / cache_position / last_real_pos / attention_mask tensors
-        # held stable per prefill chunk so the captured args tuple's storage
-        # pointers don't invalidate between calls.
+        # held stable per prefill chunk so the captured args' storage pointers
+        # don't invalidate between calls.
         self.prefill_inputs: dict[int, tuple[torch.Tensor, ...]] = {}
         # Pinned decode plan keyed by cache length (single entry under the
         # native length; the key is kept for the lookup call sites).
@@ -142,11 +141,11 @@ class PlanStore:
         self.cache_position = torch.zeros((1,), dtype=torch.int32)
         # Sampling config as stable input slots. Default = greedy (temperature
         # 0 -> exact argmax). Written in place; the GPU reads them live, so
-        # greedy<->sampling is never a recompile.
+        # switching greedy<->sampling needs no recompile.
         # params layout: [temperature, top_p, top_k, min_p, n_splits]. n_splits
         # is the sampler's active vocab-split count (SAMPLE_SPLITS for greedy/
         # pure-temp, 1 when a top-k/p/min-p filter needs the global bisection),
-        # set per request in generator alongside the rest — default greedy.
+        # set per request in generator.
         self.seed = torch.zeros((1,), dtype=torch.long)
         self.params = torch.tensor(
             [0.0, 1.0, 0.0, 0.0, float(SAMPLE_SPLITS)], dtype=torch.float32
@@ -173,10 +172,10 @@ class PlanStore:
 
     def pin_prefill_plan(self, chunk: int, is_warm: bool, captured: CapturedPlan) -> None:
         """Pin (plan, args, next_token_idx, tap_idxs) from a `capture_plan()`
-        scope for the prefill replay fast path. Caller has just run a prefill
-        at (chunk, is_warm) inside the scope twice — the first run builds the
-        plan, the second goes down the cached path — so `captured` holds the
-        executed plan with `_cached_input_updates` populated.
+        scope for the prefill replay fast path. Caller has run a prefill at
+        (chunk, is_warm) inside the scope twice (build + cached execute), so
+        `captured` holds the executed plan with `_cached_input_updates`
+        populated.
 
         `next_token_idx` is the FX flat-output entry for the returned
         next_token (shape (1, 1) int64); other entries are AOT input-mutation
@@ -241,9 +240,9 @@ class PlanStore:
         # Split AOT input mutations into two kinds. A self-increment counter
         # (cumulative_length: out = cumulative_length + 1, produced by a scalar
         # add whose ONLY consumer is this writeback) folds into the GPU feedback
-        # as `dst += 1` — which lets us elide the producing add (a dispatch
-        # disconnected from the compute DAG that drained the pipeline every
-        # token). Everything else keeps the copy8 src->dst propagation.
+        # as `dst += 1`, eliding the producing add (a dispatch disconnected from
+        # the compute DAG that drained the pipeline every token). Everything
+        # else keeps the copy8 src->dst propagation.
         producer_of: dict[int, int] = {}
         for di, d in enumerate(plan.dispatches):
             for ws in d.write_slot_indices:
@@ -361,18 +360,16 @@ class PlanStore:
 
         - record-only gives run-0 phantom intermediates and skips the GPU. A
           REAL run-0 materializes every intermediate of the whole forward at
-          once (each one an individually-allocated Metal buffer held live by
-          the dispatch recording, with Metal wiring full residency at first
-          encoder use) — measured 100+ GB on qwen3.6:35b's 4096-chunk prefill,
-          an instant machine OOM. Production never executes run-0.
+          once (each an individually-allocated Metal buffer held live by the
+          dispatch recording, Metal wiring full residency at first encoder
+          use) — 100+ GB on qwen3.6:35b's 4096-chunk prefill, an instant OOM.
         - the grid-shrink flags make the captured plan THE production plan
           (single-pass shrinkable attention, M-saturated config resolution,
           request-bounded intermediate pool). Without them the plan compiles
           with the handler's split-K choice and an unbounded pool.
 
         `chunk` is the prefill chunk size; `None` is the M=1 decode/verify
-        window (record-only alone, matching the decode loop). Mirrors the
-        windows `eager_compile_all` sets inline — keep the two in sync.
+        window (record-only alone, matching the decode loop).
         """
         shrinkable = chunk is not None and self.grid_shrink
         with contextlib.ExitStack() as stack:

@@ -1,4 +1,4 @@
-"""Regression tests for elementwise kernels that previously missed fusion."""
+"""Regression tests guarding fusion of elementwise kernels that are prone to missing it."""
 
 import alloy as al
 import numpy as np
@@ -16,10 +16,7 @@ def _dispatches(fn):
 
 
 def test_log_fuses_with_scale():
-    """scale(x) → log(scaled) should fuse to 1 dispatch.
-
-    k_log is a standard load→al.log→store pattern.
-    """
+    """scale(x) → log(scaled) should fuse to 1 dispatch."""
     N = 4096
     grid = (N + 1023) // 1024
     rng = np.random.default_rng(42)
@@ -41,8 +38,8 @@ def test_log_fuses_with_scale():
 def test_le_nd_fuses_with_scale():
     """scale(x) → le_nd(scaled, threshold) should fuse to 1 dispatch.
 
-    k_le_nd uses 4D strided indexing but in the 1D contiguous case
-    it's a standard load→compare→where→store pattern.
+    k_le_nd uses 4D strided indexing but the 1D contiguous case
+    is load→compare→where→store, which must still fuse.
     """
     N = 4096
     grid = (N + 1023) // 1024
@@ -90,10 +87,7 @@ def test_bitwise_and_nd_fuses_with_scale():
 
 
 def test_where_nd_fuses_with_scale():
-    """scale(x) → where(cond, scaled, y) should fuse to 1 dispatch.
-
-    k_where_nd uses al.where with a single store.
-    """
+    """scale(x) → where(cond, scaled, y) should fuse to 1 dispatch."""
     N = 4096
     grid = (N + 1023) // 1024
     rng = np.random.default_rng(42)
@@ -117,10 +111,7 @@ def test_where_nd_fuses_with_scale():
 
 
 def test_logical_not_fuses_with_compare():
-    """compare(x, 0) → logical_not should fuse to 1 dispatch.
-
-    k_logical_not uses al.where(v == 0, 1, 0) — standard elem pattern.
-    """
+    """compare(x, 0) → logical_not should fuse to 1 dispatch."""
     N = 4096
     grid = (N + 1023) // 1024
     rng = np.random.default_rng(42)

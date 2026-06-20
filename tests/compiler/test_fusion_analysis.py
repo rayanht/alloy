@@ -74,8 +74,8 @@ class TestPlanFusion:
 
     def test_dot_fanout_absorbed_by_anchor_not_multiroot(self):
         """Two elem siblings reading a GEMM output fold into the dot's epilogue
-        (one ANCHOR plan), not a standalone MULTI_ROOT kernel. Multi-root defers
-        to the anchor because its store absorbs both for free."""
+        (one ANCHOR plan), not a standalone MULTI_ROOT kernel: the anchor's
+        store absorbs both."""
         M, N, K = 64, 64, 64
         A = np.random.randn(M, K).astype(np.float32) * 0.1
         B = np.random.randn(K, N).astype(np.float32) * 0.1

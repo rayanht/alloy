@@ -1,5 +1,5 @@
 """MLX model-reference resolution: local dir / HuggingFace cache -> a model
-directory (config.json + *.safetensors + tokenizer). Serving never downloads."""
+directory (config.json + *.safetensors + tokenizer)."""
 
 from __future__ import annotations
 

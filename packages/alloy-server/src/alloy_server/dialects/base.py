@@ -4,8 +4,7 @@ through, one implementation per wire format (OpenAI / Ollama / Anthropic).
 A path resolves to a Dialect and the handler drives the chat pipeline uniformly:
 wants_stream -> parse_chat -> render_chat / render_chat_stream, with render_error
 for the dialect's error envelope. Endpoints a given dialect does not serve
-(Anthropic has no embeddings or catalog) raise NotSupported; their paths never
-route to that dialect, so the stub is never reached.
+(Anthropic has no embeddings or catalog) raise NotSupported.
 """
 
 from __future__ import annotations

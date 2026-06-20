@@ -128,9 +128,8 @@ def trace_load(
     mask_tv = _ensure_traced(mask)._tv if mask is not None else None
     dtype = ptr_tv.dtype if ptr_tv else "f32"
     row_indices, col_indices, row_stride, base_offset, addr_transposed = _extract_2d_addr(off_tv)
-    # Detect packed addressing: col = original_col // pack_factor
-    # Only for integer buffer types (uint8/int8) — check the ORIGINAL buffer
-    # dtype from buffer_dtypes, not the promoted dtype.
+    # Packed addressing (col = original_col // pack_factor) for integer buffer
+    # types only — check the ORIGINAL buffer dtype, not the promoted dtype.
     pack_factor = 0
     pack_bits = 0
     ptr_name = ptr_tv.name if ptr_tv else ""

@@ -9,14 +9,12 @@ per-position LOGITS (+ the drafter's tap hidden states); the session samples
 each row with `sample_categorical` at that row's absolute cache position —
 the same counter-based RNG plain decode uses — greedy (temperature 0, argmax
 with lowest-index tie-break) and sampled through one mechanism. The committed
-stream matches non-spec decode at the same seed up to the MEASURED numerics
-envelope: M>1 projections accumulate in
-a different order than M=1, the hybrid recurrence amplifies that with
-in-window row depth, so a deep-row commit can pick a different
-still-high-probability token at a decision point. Inherent, not a bug; the
-gate bounds divergence rate and plausibility instead of asserting
-bit-identity. Grammar masking applies the per-row xgrammar bitmask between
-logits and sampling, mirroring `_masked_sample`.
+stream matches non-spec decode at the same seed up to a numerics envelope:
+M>1 projections accumulate in a different order than M=1 and the hybrid
+recurrence amplifies that with in-window row depth, so a deep-row commit can
+pick a different still-high-probability token at a decision point. Grammar
+masking applies the per-row xgrammar bitmask between logits and sampling,
+mirroring `_masked_sample`.
 
 Target-state rollback:
 - KV rows past the committed point are dead (cumulative_length is set once per
@@ -89,10 +87,9 @@ class SpecSession:
         self._verify_states: dict[int, VerifyState] = {}
         self._sample_bufs: dict[int, dict] = {}
         # Committed-count input for the per-round gdr_state_reconstruct
-        # dispatch (tape-replay DN rollback). FLOAT32, not int32: the
-        # kernel's scalar load binds float and would read int bits as a
-        # denormal -> cast -> 0-trip loop (a silent no-op; found as spec
-        # output cycling with period tau).
+        # dispatch (tape-replay DN rollback). FLOAT32, not int32: the kernel's
+        # scalar load binds float and would read int bits as a denormal ->
+        # cast -> 0-trip loop (a silent no-op).
         self._recon_n = _alloc_aligned((1,), float32)
         # Verify width: anchor + up to max_draft_tokens proposal rows.
         self.verify_m = 1 + drafter.max_draft_tokens
@@ -215,7 +212,7 @@ class SpecSession:
         # Row-parallel position-keyed sampling (lazy alloy kernels — one
         # command buffer at the sync). Greedy is temperature==0 inside the
         # kernel; row j's RNG counter is its absolute position, so each row
-        # samples exactly what plain decode would sample there (§3.4). Both
+        # samples exactly what plain decode would sample there. Both
         # kernels are dispatch_spec-less — explicit one-program-per-row grids.
         vocab = bufs["vocab"]
         logits_buf = to_alloy_buffer(logits.reshape(m, vocab))
@@ -245,9 +242,8 @@ class SpecSession:
         the conv-tape / round-buffer registries are data_ptr-keyed — both are
         pinned to whichever slice was bound at warmup, so without this a
         request on any other conversation's slice reads the wrong KV (or
-        misses the scratch lookup and crashes). Runs once per switch, after
-        cast — `_verify` calls it before every round but the epoch only moves
-        on a bind."""
+        misses the scratch lookup and crashes). Runs once per switch; the
+        epoch only moves on a bind."""
         epoch = self.gen.kv.slice_epoch
         if epoch == self._bound_epoch:
             return
@@ -283,10 +279,9 @@ class SpecSession:
         max_new_tokens: int,
         matcher=None,
     ) -> Iterator[int]:
-        """Speculative generation for one request. Yields committed new tokens;
-        the stream is bit-identical to the equivalent non-spec decode at the
-        same pinned seed/params (greedy and sampled alike), and grammar-valid
-        when a matcher is given."""
+        """Speculative generation for one request. Yields committed new tokens,
+        grammar-valid when a matcher is given (see the module docstring on how
+        the stream tracks non-spec decode)."""
         gen = self.gen
         drafter = self.drafter
         if int(input_ids.shape[0]) != 1:
@@ -383,11 +378,10 @@ class SpecSession:
             anchor = first
             sp = prompt_len  # absolute position of `anchor`
 
-            # No boundary buffer/wash machinery: cold-boundary divergence is
-            # handled at the prefill epilogues, which replicate the module
-            # path's `has_previous_state = True` side effect on pinned-plan
-            # replays (see generation), so plain decode and verify agree from a
-            # cold boundary.
+            # Cold-boundary divergence is handled at the prefill epilogues,
+            # which replicate the module path's `has_previous_state = True`
+            # side effect on pinned-plan replays, so plain decode and verify
+            # agree from a cold boundary.
             while len(committed) < max_new_tokens:
                 t0 = time.perf_counter()
                 proposal: Proposal = drafter.propose(anchor, sp)
@@ -417,7 +411,7 @@ class SpecSession:
 
                 # Pad short proposals to the pinned width with the anchor id —
                 # rows are verified like any other; a lucky match is still the
-                # target's own choice (lossless either way).
+                # target's own choice.
                 pad = m_max - 1 - n_prop
                 toks = [anchor, *proposal.tokens] + [anchor] * pad
                 m = len(toks)
@@ -433,8 +427,7 @@ class SpecSession:
                 t_verify = time.perf_counter()
 
                 # Longest matching prefix over the proposal rows; padded rows
-                # may extend acceptance (a padded match is still the target's
-                # own choice).
+                # may extend acceptance.
                 num_accepted = 0
                 for j in range(m - 1):
                     if toks[j + 1] == choices[j]:

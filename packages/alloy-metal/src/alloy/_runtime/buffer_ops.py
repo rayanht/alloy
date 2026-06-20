@@ -341,8 +341,8 @@ def _annotate_logical(flat: AlloyBuffer, shape: tuple[int, ...]) -> AlloyBuffer:
     Flat 1D kernels walk their output in storage order, so the logical
     (extent, byte_stride) axes tell the compiled-plan recorder which axis is
     outermost — without this, the one-shot grid-shrink recipe cannot tell a
-    row-major (M, k) write from a (k, M) one (the rope-table broadcast bug:
-    identical flat extents, opposite shrink semantics)."""
+    row-major (M, k) write from a (k, M) one (identical flat extents, opposite
+    shrink semantics)."""
     flat._pre_flatten_dims = tuple(
         zip(shape, _compute_contiguous_strides(shape, flat._dtype.itemsize))
     )

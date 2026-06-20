@@ -50,10 +50,10 @@ def moe_router_topk(
     ACTIVE_OUT records how many rows this launch actually routed — the counting
     sort's row bound must EXACTLY match the slots the router wrote (a looser
     bound scans stale slots, a tighter one leaves phantom slots the perm scan
-    still scatters: measured 8.2 KV drift). num_programs is the launch grid, so
-    the bound is exact for ANY dispatched grid — full, grid-shrunk, or a
-    partial recipe that pinned this dispatch. Every program stores the same
-    value (aligned 4B, value-identical: race-free overwrite, no atomics).
+    still scatters). num_programs is the launch grid, so the bound is exact for
+    ANY dispatched grid — full, grid-shrunk, or a partial recipe that pinned
+    this dispatch. Every program stores the same value (aligned 4B,
+    value-identical: race-free overwrite, no atomics).
     """
     row = al.program_id(0)
     al.store(ACTIVE_OUT + 0, al.cast(al.num_programs(0), al.int32))
@@ -426,15 +426,12 @@ def moe_down_grouped_partial(
     output lands in PARTIAL[rm] for `moe_combine_rows`' fixed-order reduce.
     The production T>1 path (spec verify AND chunk prefill): the fused
     kernel's cross-tile atomic-ADD combine is associative-reordered (not
-    bit-stable) — measured ~0.1-0.3-logit run-to-run prefill jitter on
-    qwen3.6:35b, which breaks seeded reproducibility and flips near-tie
-    argmax between the plain and spec streams. The (MAX_ROWS, H) partial
-    buffer the fusion exists to avoid is 285MB transient at the 4096
-    chunk (~0.6% chunk-time traffic; the 17GB figure was a native-context
-    M=262144 plan production never compiles). Pad rows store garbage
-    partials that `moe_combine_rows` never reads (INV_PERM addresses
-    active rows only) — the sort's fill-free philosophy. Keep the body
-    in sync with `moe_down_grouped`.
+    bit-stable) — ~0.1-0.3-logit run-to-run prefill jitter on qwen3.6:35b,
+    which breaks seeded reproducibility and flips near-tie argmax between
+    the plain and spec streams. The (MAX_ROWS, H) partial buffer is 285MB
+    transient at the 4096 chunk (~0.6% chunk-time traffic). Pad rows store
+    garbage partials that `moe_combine_rows` never reads (INV_PERM addresses
+    active rows only). Keep the body in sync with `moe_down_grouped`.
     """
     I = MOE_INTER
     BLOCK_BYTES = 210
@@ -520,11 +517,10 @@ def moe_combine_rows(
 #   moe_row_tokens            sanitized TOK_LD / TOK_ST / W_ROW per padded row (full overwrite)
 #
 # The rank computation is BLOCK-DECOMPOSED (block_count -> block_off -> perm_scan):
-# a flat rank scan is O(R²) total work in 1-thread threadgroups — measured 25.3 ms/layer
-# (23% of qwen3.6:35b prefill) at the production 4096-chunk (R = 32768), scaling 3.5-3.9×
-# per R doubling. Splitting R into SORT_B-sized blocks makes it O(E·R + R·SORT_B/2) with
-# 1024× the threadgroup parallelism, while staying stable (block-major + in-block order
-# = ts order), deterministic, fill-free, and atomic-free (dispatch_plan-robust).
+# a flat rank scan is O(R²) total work in 1-thread threadgroups. Splitting R into
+# SORT_B-sized blocks makes it O(E·R + R·SORT_B/2) with 1024× the threadgroup
+# parallelism, while staying stable (block-major + in-block order = ts order),
+# deterministic, fill-free, and atomic-free (dispatch_plan-robust).
 
 
 @al.kernel
@@ -537,11 +533,9 @@ def moe_sort_count_from_blocks(
     NUM_EXPERTS: al.constexpr,
     TOP_K: al.constexpr,
 ):
-    """COUNT[e] = Σ_b BLOCK_COUNT[b,e] over the ACTIVE blocks. Replaces the
-    retired moe_sort_count_scan (each of E programs re-scanned the full R
-    routings: O(E·R) serial loads — 2.1 ms/layer at the 4096-chunk) with an
-    O(E·NB) reduction of stage-1's block histograms. Grid (NUM_EXPERTS,);
-    overwrite, no atomics.
+    """COUNT[e] = Σ_b BLOCK_COUNT[b,e] over the ACTIVE blocks — an O(E·NB)
+    reduction of stage-1's block histograms. Grid (NUM_EXPERTS,); overwrite,
+    no atomics.
 
     ACTIVE_ROWS is a (1,) int32 RUNTIME row bound — the chunk's m_pad under
     grid shrink, the bucket otherwise. The clamp is REQUIRED here, not just an

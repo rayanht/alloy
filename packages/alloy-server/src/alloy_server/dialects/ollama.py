@@ -80,13 +80,9 @@ def now() -> str:
 
 
 def max_tokens(payload: JsonObject) -> int:
-    """Ollama nests generation options under `options.num_predict`.
-
-    Default 2048 is enough for typical single-turn chat responses
-    without truncation. Real Ollama defaults to `-1` (no cap until
-    natural EOS or context overflow); `parse_max_tokens` has no
-    "unlimited" sentinel, so 2048 is a safe middle ground.
-    """
+    """Ollama nests generation options under `options.num_predict`. Real Ollama
+    defaults to `-1` (no cap until EOS or context overflow); `parse_max_tokens`
+    has no "unlimited" sentinel, so default to 2048."""
     opts = payload.get("options")
     if isinstance(opts, dict):
         value = opts.get("num_predict")
@@ -103,9 +99,8 @@ def error_payload(status: HTTPStatus, code: str, message: str) -> JsonObject:
 
 
 def model_details() -> JsonObject:
-    """Empty Ollama `details` envelope. Clients commonly destructure this
-    so we ship the full shape with empty values rather than `{}`.
-    """
+    """Empty Ollama `details` envelope. Clients destructure this, so ship the
+    full shape with empty values rather than `{}`."""
     return {
         "parent_model": "",
         "format": "safetensors",
@@ -117,11 +112,8 @@ def model_details() -> JsonObject:
 
 
 def tags_payload(names: tuple[str, ...]) -> JsonObject:
-    """`/api/tags` — list of installed models in Ollama's shape.
-
-    Shows the *installed* catalog from disk (plus the served model),
-    so client model pickers have something to render.
-    """
+    """`/api/tags` — installed models (from disk, plus the served model) in
+    Ollama's shape, so client model pickers have something to render."""
     return {
         "models": [
             {
@@ -138,10 +130,7 @@ def tags_payload(names: tuple[str, ...]) -> JsonObject:
 
 
 def show_payload() -> JsonObject:
-    """`/api/show` — model metadata. v1 returns a minimal envelope; richer
-    metadata (Modelfile, template, GGUF parameter counts) is a future
-    enhancement that depends on the GGUF loader exposing manifest fields.
-    """
+    """`/api/show` — minimal model-metadata envelope in Ollama's shape."""
     return {
         "modelfile": "",
         "parameters": "",
@@ -172,9 +161,8 @@ def chat_request(model: ServedModel, payload: JsonObject) -> ChatCompletionReque
 
 
 def generate_request(model: ServedModel, payload: JsonObject) -> ChatCompletionRequest:
-    """`/api/generate` takes a `prompt` field; we wrap it as a single user
-    message so the same downstream complete/stream callables apply.
-    """
+    """`/api/generate` takes a `prompt` field, wrapped as a single user message
+    so the same downstream complete/stream callables apply."""
     prompt = string_field(payload, "prompt")
     messages = (ChatMessage(role="user", content=prompt),)
     new_tokens = max_tokens(payload)
@@ -217,11 +205,9 @@ def chat_payload(model: ServedModel, payload: JsonObject) -> JsonObject:
 
 
 def generate_payload(model: ServedModel, payload: JsonObject) -> JsonObject:
-    # `prompt_eval_count` here counts message content tokens only; chat-
-    # template wrappers add ~10-15 tokens per turn that we don't surface in
-    # v1. Tools that derive tokens/sec from this field will overestimate
-    # slightly. Future enhancement: when ServedModel exposes a
-    # template-aware token counter.
+    # `prompt_eval_count` counts message content tokens only; chat-template
+    # wrappers add ~10-15 tokens per turn that aren't surfaced, so tokens/sec
+    # derived from this field overestimates slightly.
     request = generate_request(model, payload)
     started_ns = time.monotonic_ns()
     gen = Generation(request)
@@ -325,9 +311,8 @@ def embed_payload(model: "EmbeddingModel", payload: JsonObject) -> JsonObject:
 
 def legacy_embeddings_payload(model: "EmbeddingModel", payload: JsonObject) -> JsonObject:
     """Ollama legacy `/api/embeddings` response — single string only, flat
-    `embedding` field (singular). Kept for older clients still pinned to
-    the pre-`/api/embed` shape.
-    """
+    `embedding` field (singular), for clients pinned to the pre-`/api/embed`
+    shape."""
     prompt = string_field(payload, "prompt")
     vectors = model.embed([prompt])
     return {"embedding": vectors[0]}

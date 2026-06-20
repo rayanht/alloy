@@ -115,12 +115,9 @@ def _is_row_reduce(op: LazyOp) -> bool:
       1. At least one Reduce(axis=0) somewhere in the ops.
       2. The top-level Store writes a SCALAR value (shape ()), not a tile.
 
-    The second condition distinguishes row-reduce kernels from layernorm /
-    softmax / attention, which all contain internal Reduces but store a
-    per-row tile of shape (BLOCK_SIZE,). Without it, _is_row_reduce would
-    seed ROW_PASS groups on any kernel that happens to reduce internally,
-    and the extractor would then walk a much bigger op graph than it can
-    handle.
+    The second condition excludes layernorm/softmax/attention, which contain
+    internal Reduces but store a per-row tile of shape (BLOCK_SIZE,); without
+    it the extractor would walk a much bigger op graph than it can handle.
     """
     func = op.func
     if func is None:
@@ -130,9 +127,8 @@ def _is_row_reduce(op: LazyOp) -> bool:
     )
     if not has_row_reduce:
         return False
-    # Distinguish row-reduce from layernorm/softmax/attention, all of which
-    # contain internal Reduces but store a per-row TILE (shape (BLOCK_SIZE,)).
-    # A row-reduce stores a per-row scalar.
+    # Layernorm/softmax/attention contain internal Reduces but store a per-row
+    # TILE (shape (BLOCK_SIZE,)); a row-reduce stores a per-row scalar.
     for o in func.ops:
         if isinstance(o, Store) and o.value is not None:
             return o.value.shape == ()
@@ -214,23 +210,17 @@ def grow_group(
     N = cv.get("N")
     if not isinstance(M, int) or not isinstance(N, int):
         return None
-    # Two composer paths: single-chunk for N ≤ 1024 (one thread per column),
-    # chunked for larger N (column loop with reduce carry). compose_chunked
-    # below only handles the common softmax-bwd shape (one Reduce whose input
-    # is external FULL_2D, post-reduce elem chain ending in a single
-    # terminal-root sink). Cases outside that fall back to per-op.
 
     group: set[int] = {seed}
-    # The reduce's input is external — an upstream LazyOp wrote it. We do
-    # NOT pull that upstream op into the group; its output becomes one of
-    # the group's external inputs. Starting the group strictly at the
-    # reduce keeps it a single-output chain.
+    # The reduce's input is external; its producer op becomes one of the
+    # group's external inputs rather than being pulled in, which keeps the
+    # group a single-output chain.
 
-    # Build the TRUE producer→consumers DAG via LazyOp.input_producers.
-    # shares_allocation() is too permissive because temp buffers get
-    # reused across unrelated layers, which causes the walker to absorb
-    # the entire training step into one group. input_producers tracks
-    # the actual data-flow edges recorded at queue time.
+    # Build the producer→consumers DAG via LazyOp.input_producers.
+    # shares_allocation() is too permissive — temp buffers get reused across
+    # unrelated layers, so the walker would absorb the entire training step
+    # into one group. input_producers tracks the data-flow edges recorded at
+    # queue time.
     op_pos = {id(o): i for i, o in enumerate(ops)}
     consumers_of: dict[int, list[int]] = {i: [] for i in range(len(ops))}
     for i, o in enumerate(ops):
@@ -261,11 +251,9 @@ def grow_group(
     # like LN-bwd where two independent reduction branches share a common
     # downstream elementwise — forward BFS only captures one branch.
     #
-    # MAX_SPAN bounds growth on either side of the seed. The admittability
-    # check (role + shape classify) prevents cross-layer absorption; the
-    # span cap is a pathological-graph guard, not a correctness gate, and
-    # must allow ops BEFORE the seed so backward closure can pull in
-    # diamonds like `add → row_mean → sub`.
+    # MAX_SPAN bounds growth on either side of the seed (a pathological-graph
+    # guard), and must allow ops BEFORE the seed so backward closure can pull
+    # in diamonds like `add → row_mean → sub`.
     MAX_SPAN = 20
     window_lo = max(0, seed - MAX_SPAN)
     window_hi = seed + MAX_SPAN
@@ -303,20 +291,16 @@ def grow_group(
     sink_ops = _find_sinks(ops, group, roots or set())
     if not sink_ops:
         return None
-    # Multi-output is supported — each sink becomes a separate Store in
-    # the fused kernel (either a per-element tile Store for shape (M*N,)
-    # outputs or a per-row-scalar Store for shape (M,) outputs). Cap the
-    # fan-out to keep param counts manageable.
+    # Each sink becomes a separate Store in the fused kernel. Cap the fan-out
+    # to keep param counts manageable.
     if len(sink_ops) > 6:
         return None
 
     # Sort-order guard. dispatch_entries sorts fused groups by max(op_indices).
-    # If an external op inside [lo, hi] reads a sink's output buffer, it
-    # gets sorted BEFORE the fused dispatch and the dep-group builder then
-    # separates them — the external consumer lands in an earlier group and
-    # reads stale memory before the fused kernel writes. Reject in that case.
-    # Roots whose only consumers sit at positions > hi (typical for
-    # saved-for-bwd tensors) pass this check and fuse correctly.
+    # If an external op inside [lo, hi] reads a sink's output buffer, it gets
+    # sorted BEFORE the fused dispatch and the dep-group builder separates
+    # them — the external consumer lands in an earlier group and reads stale
+    # memory before the fused kernel writes. Reject in that case.
     if group:
         lo, hi = min(group), max(group)
         sink_out_keys: set = set()
@@ -354,10 +338,9 @@ def _find_sinks(
         register value flows to downstream in-group ops AND a Store emits
         the per-row-scalar to the root's output buffer).
 
-    Sort-order safety: grow_group rejects a group if any root has an
-    external in-batch consumer whose position falls inside
-    [min(group), max(group)], which would otherwise trigger the same
-    sort-by-max miscompile as task #41.
+    grow_group rejects a group if any root has an external in-batch consumer
+    inside [min(group), max(group)], which would otherwise trigger the
+    sort-by-max miscompile.
     """
     op_pos = {id(o): i for i, o in enumerate(ops)}
     sinks: set[int] = set()
@@ -379,11 +362,10 @@ def _find_sinks(
 
 
 # Constant is included so float literals consumed by the compute chain (e.g.
-# the eps in a scale-free RMSNorm's `add(mean, eps)` → `k_add_scalar`) are kept
-# in compute_ops and re-emitted in the fused kernel. Without it the backward
-# walk dropped the Constant, leaving its operand reference (`c9`) undeclared in
-# the emitted MSL (the v_norm fusion compile error). Int/bool constants used as
-# index math stay filtered out by the dtype guard below.
+# the eps in a scale-free RMSNorm's `add(mean, eps)`) are kept in compute_ops
+# and re-emitted in the fused kernel; otherwise the backward walk drops the
+# Constant and leaves its operand reference undeclared in the emitted MSL.
+# Int/bool constants used as index math stay filtered by the dtype guard below.
 _COMPUTE_TYPES = (BinOp, UnaryOp, Select, Compare, TernaryOp, Constant)
 
 
@@ -481,7 +463,6 @@ def _extract_elem(op: LazyOp, M: int, N: int) -> ExtractedOp | None:
     # Load result (e.g. strided_copy_4d's layout reshuffle) yield an empty
     # compute chain — the composer would replace their stride-specific Load
     # offsets with its canonical row-major offs_2d and produce wrong data.
-    # Rejecting here keeps those kernels out of ROW_PASS groups.
     if not compute_ops:
         return None
 
@@ -758,21 +739,16 @@ def compose(
             for old in ex.compute_ops:
                 new_op = _remap_operands(old, remap)
                 old_res = old.result
-                # Each LazyOp's compute was traced with BLOCK_SIZE=1024 (the
-                # default for _make_elementwise_*), so old_res.shape is
-                # (1024,). In the fused kernel the column width is
-                # _pick_block_size(N), which is tighter (e.g. 128 when
-                # N=100). Remap the result shape so per-element computes
-                # line up with the external Loads we emitted at shape
-                # (BLOCK_SIZE,); leave scalar/replicated results (from
-                # earlier Reduce outputs feeding BinOp as a broadcast
-                # operand) untouched.
+                # Each LazyOp's compute was traced with BLOCK_SIZE=1024, so
+                # old_res.shape is (1024,). In the fused kernel the column
+                # width is _pick_block_size(N), which is tighter (e.g. 128 when
+                # N=100). Remap the result shape so per-element computes line up
+                # with the external Loads emitted at shape (BLOCK_SIZE,); leave
+                # scalar/replicated results untouched.
                 #
-                # Scalar-chain ops (e.g. `add(row_mean_result, eps)` followed
-                # by `k_rsqrt`) have all operands remapped to scalar TileValues
-                # — their result must stay scalar, else a scalar Store at
-                # out[pid] would overflow an (M,) buffer by tile writes of
-                # size (BLOCK_SIZE,).
+                # Scalar-chain ops (all operands remapped to scalar TileValues)
+                # must keep a scalar result, else a scalar Store at out[pid]
+                # would overflow an (M,) buffer with (BLOCK_SIZE,) tile writes.
                 operand_shapes = [v.shape for v in new_op.operand_values()]
                 if operand_shapes and all(s == () for s in operand_shapes):
                     new_shape: tuple[int, ...] = ()

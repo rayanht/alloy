@@ -46,10 +46,6 @@ def trace_if(cond) -> IfScope:
 
 
 # ---------------------------------------------------------------------------
-# Traced for-loops — enter/exit hooks injected by AST rewrite
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # Traced flow control — break, continue, return
 # ---------------------------------------------------------------------------
 
@@ -215,10 +211,9 @@ class LoopCtx:
 
 def _flatten_carry(val):
     """Yield leaf carry values depth-first. A carry may be a scalar/TracedValue
-    (one leaf) or a (nested) list/tuple of them — so a loop can carry an array
-    of accumulators (`o = [0.0]*N; ... o[d] = o[d]*a + ...`) without the kernel
-    author flattening to o0..oN by hand. Enter and exit flatten identically, so
-    the per-leaf carry pairs line up as long as the structure is loop-invariant."""
+    (one leaf) or a (nested) list/tuple of them, so a loop can carry an array of
+    accumulators (`o = [0.0]*N; ... o[d] = o[d]*a + ...`). Enter and exit flatten
+    identically, so per-leaf carry pairs line up for loop-invariant structure."""
     if isinstance(val, (list, tuple)):
         for x in val:
             yield from _flatten_carry(x)
@@ -246,11 +241,9 @@ def _trace_loop_enter(carry_names, *carry_vals):
     ctx = _ctx()
 
     # De-alias each carried LEAF: Copy it BEFORE redirecting ops so the Copy
-    # lands in the outer scope (like the AST path); the Copy'd value becomes the
-    # carried init. Skip values that can't be scalar-copied: Zeros (emitter uses
-    # arrays), SimdMatrixOp (Metal simdgroup type). A carry may be a scalar (one
-    # leaf) or a (nested) list of accumulators — flatten to leaves, then rebuild
-    # the same structure with the fresh body copies so `o[d] = ...` carries work.
+    # lands in the outer scope; the Copy'd value becomes the carried init. Flatten
+    # nested-list carries to leaves, then rebuild the same structure with the fresh
+    # body copies so `o[d] = ...` carries work.
     def _process_leaf(leaf):
         if not isinstance(leaf, TracedValue):
             leaf = _ensure_traced(leaf)
@@ -259,12 +252,11 @@ def _trace_loop_enter(carry_names, *carry_vals):
         #   - Zeros: emitted as a register/local array, mutated in place.
         #   - SimdMatrixOp: a Metal simdgroup_matrix register type.
         #   - 2D tiles: carried in a persistent threadgroup buffer (the body reads
-        #     the tile as a GEMM operand — needs its "shared" location — and the
+        #     the tile as a GEMM operand, needing its "shared" location; the
         #     loop-tail writes the update back into the same buffer). A scalar
-        #     `float lc = <tile>` Copy would both mis-type it and strip the shared
-        #     buffer, so the matmul operand resolves to '???'. The loop-tail
-        #     cooperative copy in `_emit_for_loop` provides the cross-iteration
-        #     de-alias instead.
+        #     `float lc = <tile>` Copy would mis-type it and strip the shared
+        #     buffer. The loop-tail cooperative copy in `_emit_for_loop` provides
+        #     the cross-iteration de-alias instead.
         if isinstance(src_op, (Zeros, SimdMatrixOp)) or len(leaf._tv.shape) == 2:
             return leaf, leaf._tv
         fresh_tv = TileValue(

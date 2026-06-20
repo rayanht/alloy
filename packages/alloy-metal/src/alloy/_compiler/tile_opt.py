@@ -71,12 +71,8 @@ def _opt_persistent_mma(func: TileFunction):
     Handles nested ForLoops (e.g., chained GEMM where the inner loop's
     intermediate accumulator feeds the outer loop's Dot).
     """
-    # Dot is mutated in-place when we set acc (persistent rewrite). The Dot
-    # object can be shared across cached pipeline runs (e.g. when the same
-    # kernel is recompiled with different planner inputs), but the rest of
-    # the IR (op.body, op.carried, Store.value) is rebuilt fresh each time.
-    # Reset Dot.acc so the pass always starts from a known clean state and
-    # rewrites match what's actually in the body.
+    # The Dot object can be shared across cached pipeline runs, but the rest of
+    # the IR is rebuilt fresh each time. Reset Dot.acc so the pass starts clean.
     for op in walk_ops(func.ops):
         if isinstance(op, Dot):
             op.acc = None
@@ -89,11 +85,9 @@ def _opt_persistent_mma(func: TileFunction):
 def _absorb_post_loop_scale(scope_ops: list[TileOp]) -> None:
     """Absorb `ForLoop.carry_out → BinOp(mul, scalar) → Store` into Store.transform.
 
-    Runs after persistent_mma has updated outer ForLoop carries to point at
-    persistent Dot results. The trailing scalar Mul (e.g., the SDPA bwd
-    `dk = dk * SCALE` post-loop) gets folded into the Store epilogue so the
-    persistent acc is consumed directly by Store without an intermediate
-    materialization to shmem (which would defeat the persistent acc).
+    Runs after persistent_mma. The trailing scalar Mul (e.g. the SDPA bwd
+    `dk = dk * SCALE` post-loop) folds into the Store epilogue so the persistent
+    acc is consumed directly without an intermediate shmem materialization.
     """
     forloop_carry_finals: set[str] = set()
     persistent_acc_finals: set[str] = set()
@@ -199,11 +193,9 @@ def _apply_pmma(
     top_level: if True, require directly-stored check (top-level ForLoops
                can only be persistent MMA if the result goes straight to Store)
     ancestor_op_maps: op_maps from outer scopes, searched (innermost first)
-                     when the current scope doesn't define the carry init.
-                     SDPA bwd nests `for g in range(KV_GROUP)` around `for _ib`,
-                     and the dv/dk Zeros live at top scope — without this
-                     lookup, the inner BinOp(add, z67, dot) can't be matched
-                     back to its outer Zeros init.
+                     when the current scope doesn't define the carry init. SDPA
+                     bwd nests `for g` around `for _ib` with the dv/dk Zeros at
+                     top scope; without this the inner add can't match its init.
     """
     # Build op map from current scope (for Zeros lookup)
     op_map: dict[str, TileOp] = {}
@@ -315,20 +307,15 @@ def _apply_pmma(
                 new_carried.append((init_val, final_val))
                 continue
 
-            # Check: the carried-out value is used after the loop.
+            # The carried-out value must be used after the loop.
             # Top-level: must be directly stored (the emitter can't handle
             # elementwise ops on MMA-layout values; only Store.transform works).
-            # We also accept the pattern `Store(BinOp(mul, final_val, scalar))`
-            # — the post-loop scalar Mul gets absorbed into Store.transform as
-            # an epilogue, letting MMA accumulators with a final scale (SDPA
-            # bwd dq/dkdv: `acc * 1/sqrt(D)`) stay register-resident across
-            # the loop instead of materializing per-iter to shmem.
-            #
+            # Also accept `Store(BinOp(mul, final_val, scalar))` — the post-loop
+            # scalar Mul absorbs into Store.transform so MMA accumulators with a
+            # final scale stay register-resident instead of spilling per-iter.
             # Nested: any usage suffices (materialization handles MMA→shmem).
-            # The pass must be idempotent: a cached pipeline run may have
-            # already re-routed `final_val` to `dot_op.result` or folded
-            # the post-loop Mul into Store.transform / Store.acc_post_scale,
-            # so the is_used check looks up every equivalent name.
+            # Idempotent: a cached run may already have rewritten final_val, so
+            # the is_used check looks up every equivalent name.
             equiv_names = {final_val.name, dot_op.result.name}
 
             scale_store_info: tuple[BinOp, Store] | None = None
@@ -356,13 +343,9 @@ def _apply_pmma(
                             break
                 # Any other post-loop usage (e.g. SiLU epilogue in
                 # dot_q4_k_silu: `silu(acc_gate) * acc_up` before the Store).
-                # The planner sees `consumed_by_other` and allocates a shmem
-                # slot for the persistent dot result; the consumer-side
-                # auto-spill in _emit_op materializes the persistent acc once
-                # at first-use, after which the elementwise chain reads from
-                # shmem normally. Without this, the (Zeros, ForLoop carry,
-                # add) pattern stays non-persistent and each K iter spills
-                # the partial MMA via shmem — the worst case.
+                # The consumer-side auto-spill in _emit_op materializes the
+                # persistent acc once at first-use; without this the pattern
+                # stays non-persistent and each K iter spills the partial MMA.
                 if not is_used:
                     for nm in equiv_names:
                         if _value_used_after(nm, op, scope_ops):
@@ -493,15 +476,12 @@ def _replace_value_refs(ops: list[TileOp], old_name: str, new_val: TileValue):
 def _opt_fuse_row_loops(func: TileFunction):
     """Fuse consecutive elementwise 2D ops into FusedElementwise nodes.
 
-    Gated by the `_fuse_loops` constexpr flag (default 0 = off).
-    The tuner sweeps `_fuse_loops=[0, 1]` and picks the best per shape.
-
-    Scans ForLoop bodies for chains of BinOp/UnaryOp/Select/Compare/TernaryOp
-    that operate on the same shared-memory tile rows. Replaces them with a
-    single FusedElementwise op so the emitter can emit one column loop.
-
-    Determines which intermediate results need shmem writeback vs can stay
-    in registers by checking whether they're consumed after the chain.
+    Gated by the `fuse_loops` constexpr flag (default 0 = off); the tuner
+    sweeps it per shape. Scans ForLoop bodies for chains of
+    BinOp/UnaryOp/Select/Compare/TernaryOp on the same shared-memory tile rows
+    and replaces them with one FusedElementwise op (a single column loop).
+    Intermediate results that are consumed after the chain get shmem
+    writeback; the rest stay in registers.
     """
     if not func.options.get("fuse_loops", 0):
         return
@@ -592,12 +572,11 @@ def _opt_fuse_row_loops(func: TileFunction):
                 i += 1
                 continue
 
-            # Backward prepend: pull in fusable ops before chain[0] that
-            # are separated from it only by Barrier/Load. Lets a pre-load
-            # elementwise (e.g. SDPA bwd `s *= scale` between dot79 and the
-            # Mask Load) absorb into the chain — its writeback to shmem is
-            # elided, and the chain reads its source operand directly,
-            # killing one shmem round-trip + two barriers per inner iter.
+            # Backward prepend: pull in fusable ops before chain[0] separated
+            # from it only by Barrier/Load. A pre-load elementwise (e.g. SDPA
+            # bwd `s *= scale` before the Mask Load) absorbs into the chain,
+            # eliding its shmem writeback and killing a round-trip + two
+            # barriers per inner iter.
             prepend_ops: list[TileOp] = []
             scan_back = i - 1
             while scan_back >= 0:
@@ -609,10 +588,8 @@ def _opt_fuse_row_loops(func: TileFunction):
                     break
                 # Skippable: Barrier, Load (cooperative, stays out of chain),
                 # and any op whose result isn't consumed by the chain head
-                # (e.g. index math `t127 = add(...)`, bound-check bools
-                # `t132 = bitand(...)` — these emit per-thread or as
-                # constants, don't touch the chain's shmem buffers, and
-                # are independent of the prepend candidate's data flow).
+                # (index math, bound-check bools — these don't touch the
+                # chain's shmem buffers).
                 if isinstance(cand, (Barrier, Load)):
                     scan_back -= 1
                     continue
@@ -706,18 +683,16 @@ def _opt_fuse_row_loops(func: TileFunction):
 
 def _chain_is_flat_safe(chain: list[TileOp], in_shmem: set[str]) -> bool:
     """Decide whether a fused elementwise chain can use flat threading
-    (one thread per element, all 256 threads of the threadgroup) instead
-    of the row-iter `if (_row < rows) for (_c)` form (16 threads × 16
-    serial iters at BM=BN=16).
+    (one thread per element, all threads) instead of the row-iter
+    `if (_row < rows) for (_c)` form.
 
     Criteria:
       1. Tile produces a regular 2D result (M*N ≥ 16).
       2. Every operand of every chain op is one of:
            - in `in_shmem` (a 2D shmem tile read at [_row*S+_c]), OR
            - a chain-internal value, OR
-           - 1D / row-or-col-broadcast / scalar operand. The fused emit's
-             `_resolve` substitutes `tid → _row` for (M, 1) operands and
-             `tid → _c` for (1, N) operands under flat threading.
+           - 1D / row-or-col-broadcast / scalar operand (the fused emit's
+             `_resolve` substitutes `tid → _row`/`_c` under flat threading).
     """
     if not chain or chain[-1].result is None:
         return False
@@ -835,23 +810,16 @@ def _opt_absorb_load_scale(func: TileFunction):
     Rewrites to:
         ld' = Load(... transform=[Mul]) → consumers see ld' instead of scaled
 
-    The cooperative-load emitter already evaluates `Load.transform` per
-    element during the load loop, so the multiply happens in the same
-    register pass with no extra shmem buffer. Saves one BLOCK_M×D shmem
-    slot per absorbed pattern (the scaled tile no longer needs its own
-    buffer), which lets bigger BM configs fit in the 32 KB threadgroup
-    budget — concretely, the SDPA bwd dq kernel goes from needing two
-    K-sized slots (K, K_scaled) to one.
+    The cooperative-load emitter evaluates `Load.transform` per element during
+    the load loop, so the multiply happens in the same register pass with no
+    extra shmem buffer. Saves one BLOCK_M×D shmem slot per absorbed pattern,
+    which lets bigger BM configs fit the 32 KB threadgroup budget.
 
-    Critical contract: this pass must NOT mutate operand fields on
-    consumer ops. `shallow_clone_for_fusion` shares BinOp/Dot/Reduce
-    objects across cloned funcs, so in-place operand reassignment would
-    silently corrupt every other clone. Instead, when a
-    consumer needs its operand redirected from the BinOp's result back to
-    the Load's result, REPLACE the consumer in `scope_ops` with a fresh
-    `dataclasses.replace` clone — leaving the original (shared) op
-    untouched. Loads are cloned by `shallow_clone_for_fusion` so mutating
-    `ld.transform` is safe.
+    Contract: `shallow_clone_for_fusion` shares BinOp/Dot/Reduce objects across
+    cloned funcs, so this pass must not mutate operand fields on consumer ops.
+    To redirect a consumer's operand from the BinOp result back to the Load
+    result, REPLACE the consumer with a `dataclasses.replace` clone. Loads are
+    cloned per-func, so mutating `ld.transform` is safe.
     """
     # Build per-scope op maps and a global use-count for tile values
     use_count: dict[str, int] = {}
@@ -906,9 +874,7 @@ def _opt_absorb_load_scale(func: TileFunction):
             if use_count.get(tile_val.name, 0) != 1:
                 continue
             # Absorb: append the Mul to Load.transform, redirect downstream
-            # references from the Mul's result to the Load's result. Loads are
-            # already cloned per-func by `shallow_clone_for_fusion`, so
-            # mutating `ld.transform` is safe.
+            # references from the Mul's result to the Load's result.
             ld.transform = list(ld.transform) + [op]
             replacements[op.result.name] = ld.result
             to_remove.append(op)
@@ -928,12 +894,10 @@ def _replace_value_refs_clone(
 ) -> None:
     """Replace tile-value references by cloning ops, not mutating shared ones.
 
-    `shallow_clone_for_fusion` shares non-Load/Store TileOps (BinOp, Dot,
-    Reduce, ...) across cloned `TileFunction`s. Mutating operand fields on
-    those shared objects would silently corrupt every other clone that holds
-    the same `op`. So instead of mutating, this walker REPLACES each op in
-    `scope_ops` with a `dataclasses.replace` clone whose operand fields are
-    rewritten to the mapped TileValues. Original op objects are left untouched.
+    `shallow_clone_for_fusion` shares non-Load/Store TileOps across cloned
+    `TileFunction`s, so mutating operand fields would corrupt every other clone.
+    This walker instead REPLACES each op with a `dataclasses.replace` clone whose
+    operand fields are rewritten to the mapped TileValues.
 
     Recurses into ForLoop/WhileLoop/IfElse bodies (also cloned). Leaves
     Load/Store `transform` chains alone — the absorb pass owns those.
@@ -1000,15 +964,12 @@ def _opt_fuse_acc_epilogue(func: TileFunction):
 
     dot_q4_k_silu computes two persistent MMA accumulators (gate, up), then a
     SiLU chain `silu(gate) * up`, then stores. Without this pass the chain reads
-    the accumulators as ordinary 2D tiles, which forces each to spill to shared
-    memory (the auto-spill in `compiler._emit_op`) — ~8KB of float staging that
-    roughly halves threadgroup occupancy. This pass runs after
-    `_opt_persistent_mma` (so the accumulators are register-resident), detects
-    `≥2 persistent accs → pure elementwise chain → one Store`, and folds the
-    chain into `Store.transform`. The non-source accumulators land in
-    `Store.acc_extras`; `_emit_persistent_mma_store` then evaluates the chain
-    per-lane on the simdgroup `thread_elements()` and writes straight to device,
-    with no shmem spill.
+    the accumulators as ordinary 2D tiles, spilling each to shared memory —
+    ~8KB of float staging that roughly halves threadgroup occupancy. Runs after
+    `_opt_persistent_mma`, detects `≥2 persistent accs → pure elementwise chain
+    → one Store`, and folds the chain into `Store.transform` (non-source
+    accumulators in `Store.acc_extras`); `_emit_persistent_mma_store` evaluates
+    it per-lane on the simdgroup `thread_elements()` with no shmem spill.
     """
     acc_dot: dict[str, Dot] = {}
     for op in walk_ops(func.ops):

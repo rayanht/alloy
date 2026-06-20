@@ -8,9 +8,8 @@ Contract rules every drafter must satisfy:
 
 - **Position-keyed, append-only state.** Per-position drafter state (DFlash
   context-KV rows, PLD's token ring) is keyed by absolute sequence position and
-  only ever appended or truncated from the tail. This makes it trie-safe under
-  conversation branches — exactly like the main KV cache, branches share their
-  head rows and only write past them.
+  only ever appended or truncated from the tail, so it's trie-safe under
+  conversation branches.
 - **Fixed shapes.** `observe()` always receives ALL forwarded rows of a verify
   pass (or prefill chunk); acceptance only moves the session's committed-length
   pointer. Overshoot rows are dead — overwritten by the next round, never read.
@@ -54,9 +53,8 @@ class TapBatch:
 
     `layers[i]` is (1, rows, H) for TargetTaps.layer_ids[i]; `post_norm` is
     (1, rows, H) when requested. Tensors are the verify/prefill plan's pinned
-    output buffers — VALID ONLY until the next target forward. A drafter that
-    needs them later must consume them in observe() (DFlash projects them into
-    its ctx-KV buffers; MTP stages its next draft inputs).
+    output buffers — VALID ONLY until the next target forward, so a drafter that
+    needs them later must consume them in observe().
     """
 
     start: int

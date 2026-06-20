@@ -33,17 +33,15 @@ def strided_copy_4d(
 ):
     """Copy from strided source to contiguous output (up to 4D).
 
-    Launched 2D: **axis-0 is the row index** over the leading dims (D0·D1·D2),
-    axis-1 tiles the innermost dim D3 by BLOCK_SIZE. Putting the row (which, for the
-    `(B, S, feat)` / `(B·S, feat)` layouts the DeltaNet + attention paths produce, is
-    the M = sequence-position dimension at B=1) on grid axis-0 lets the grid-shrink
-    prefill grid recipe shrink the copy to the real prompt length — the recipe only
-    ever shrinks axis-0. A flat 1D `ceil(N/BLOCK)` grid would bury
-    M inside `offs`, with grid[0] = ceil(M·feat/BLOCK) > M, so the recipe's divisible
-    M-tile model couldn't touch it and every layout copy would run at the padded M_MAX.
-    Copies whose row count does NOT scale with M (e.g. a `(B, C, S)` transpose, rows
-    = B·C) keep their full grid — axis-0 doesn't change with M, so the recipe leaves
-    them alone, which is correct (those have M innermost and aren't row-shrinkable).
+    Launched 2D: axis-0 is the row index over the leading dims (D0·D1·D2),
+    axis-1 tiles the innermost dim D3 by BLOCK_SIZE. Putting the row (the M =
+    sequence-position dim at B=1, for the `(B, S, feat)` / `(B·S, feat)` layouts
+    the DeltaNet + attention paths produce) on grid axis-0 lets the grid-shrink
+    prefill recipe shrink the copy to the real prompt length — the recipe only
+    shrinks axis-0. A flat 1D `ceil(N/BLOCK)` grid would bury M inside `offs`, so
+    every layout copy would run at the padded M_MAX. Copies whose row count
+    doesn't scale with M (e.g. a `(B, C, S)` transpose, rows = B·C) keep their
+    full grid.
     """
     row = al.program_id(0)
     cb = al.program_id(1)
@@ -78,10 +76,9 @@ def strided_copy_5d(
 ):
     """Copy from strided source to contiguous output (5D).
 
-    Used when a 5D ``.contiguous()`` call lands on a tensor whose strides
-    can't be merged into 4D without losing information (e.g. the
-    ``permute(1,3,0,2,4)`` output from QKV-split SDPA-backward plumbing at
-    batch > 1, where every adjacent-dim stride product disagrees).
+    Used when a 5D ``.contiguous()`` call lands on a tensor whose strides can't
+    be merged into 4D (e.g. the ``permute(1,3,0,2,4)`` output from QKV-split
+    SDPA-backward plumbing at batch > 1).
     """
     pid = al.program_id(0)
     offs = pid * BLOCK_SIZE + al.arange(0, BLOCK_SIZE)
@@ -186,9 +183,7 @@ def contiguify_lazy(lb: AlloyBuffer) -> AlloyBuffer:
             SRC_OFFSET=src_offset,
         )
     # 2D launch: axis-0 = rows over the leading dims, axis-1 = column tiles over
-    # the innermost dim (BLOCK_SIZE=1024, matching the kernel default). Axis-0 being
-    # the row index is what makes the grid-shrunk chunk prefill recipe able to shrink layout
-    # copies whose rows are the M dimension (B=1 → rows = S).
+    # the innermost dim (BLOCK_SIZE=1024, matching the kernel default).
     rows = d[0] * d[1] * d[2]
     col_tiles = (d[3] + 1023) // 1024
     return strided_copy_4d[(rows, col_tiles)](

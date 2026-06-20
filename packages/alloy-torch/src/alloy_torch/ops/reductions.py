@@ -272,7 +272,7 @@ def _any_dim(x: AlloyBuffer, dim: int, keepdim: bool = False) -> AlloyBuffer:
 
 
 def _log_softmax(x: AlloyBuffer, dim: int = -1, half_to_float: bool = False) -> AlloyBuffer:
-    """log_softmax = log(softmax(x)). Numerically: x - logsumexp(x, dim)."""
+    """log_softmax = log(softmax(x))."""
     return _softmax(x, dim=dim, half_to_float=half_to_float).log()
 
 

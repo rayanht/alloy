@@ -40,7 +40,7 @@ class PromptLookupDrafter:
         capacity: int = 1 << 18,
     ) -> None:
         # 7 keeps the verify at M=8, inside attention_kv_update_multi's
-        # _MAX_VERIFY_K fast path (block 16 is M-C1).
+        # _MAX_VERIFY_K fast path.
         self.max_draft_tokens = int(max_draft_tokens)
         self.ngram_max = int(ngram_max)
         self.ngram_min = int(ngram_min)

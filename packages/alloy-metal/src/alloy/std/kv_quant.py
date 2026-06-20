@@ -1,11 +1,10 @@
 """KV-cache q8_0 quantize/dequantize kernels (encode direction).
 
-The cache layout is the generation cache's: K or V as (KV_H, S_MAX, HEAD_DIM)
-fp16 (batch=1), quantized per token into int8 codes (same logical shape) plus
-one fp16 scale per 32-element block along head_dim — the same normalized
-symmetric layout the Q8_0 weight kernels consume (`quant.py:dot_q8_0`:
+K or V as (KV_H, S_MAX, HEAD_DIM) fp16 (batch=1), quantized per token into
+int8 codes (same logical shape) plus one fp16 scale per 32-element block along
+head_dim — the layout the Q8_0 weight kernels consume (`quant.py:dot_q8_0`:
 int8 payload + fp16 scales, zero_point 0), so attention reads reuse the
-existing `_dequant_scale` load descriptor.
+`_dequant_scale` load descriptor.
 
 The 32-element block is structural, not tunable: one Metal simdgroup (32
 lanes) handles exactly one block, so the per-block max-abs is a single
@@ -14,9 +13,9 @@ scale d = max|x|/127, q = round(x/d) (round half away from zero — MSL
 `round()` ≡ C `roundf`), d == 0 ⇒ q = 0.
 
 Both kernels take the token range as (START 1-elem int32 buffer, grid dim 1 =
-token count): runtime-positioned like the attention kernels' Q_START_POS, so
-compiled plans replay them at any cache offset without recompiling. Grid =
-(KV_H, n_tokens), HEAD_DIM threads per program (one simdgroup per block).
+token count): runtime-positioned, so compiled plans replay them at any cache
+offset without recompiling. Grid = (KV_H, n_tokens), HEAD_DIM threads per
+program (one simdgroup per block).
 """
 
 import alloy as al
@@ -29,21 +28,18 @@ def kv_quantize_q8_range(SRC, START, LAST_REAL, CODES: al.output, SCALES: al.out
                          SRC_HEAD_STRIDE: al.constexpr = 0,
                          SRC_SEQ_STRIDE: al.constexpr = 0,
                          SLIDING_WINDOW: al.constexpr = 0):
-    """Quantize grid-dim-1 tokens per head from a strided fp16 source (the
-    projection output / chunk rows, indexed chunk-locally by t) into the codes
-    cache at logical positions [START, START+grid1) — ring slot
-    pos % SLIDING_WINDOW when set. Decode is the grid (KV_H, 1) case; prefill
-    chunks use grid (KV_H, seq_len). Dispatched before the attention read,
-    ordered by the codes-buffer dependency.
+    """Quantize grid-dim-1 tokens per head from a strided fp16 source (indexed
+    chunk-locally by t) into the codes cache at logical positions
+    [START, START+grid1) — ring slot pos % SLIDING_WINDOW when set. Decode is
+    grid (KV_H, 1); prefill chunks use grid (KV_H, seq_len).
 
     `LAST_REAL` ((1,) runtime int, sliding-window only) is the chunk's last
     REAL row index (real end = START + LAST_REAL + 1) —
     `attention_kv_write`'s single-writer contract: when set (>= 0) only
     positions [end-SW, end) write, so a PADDED chunk longer than the window
-    can't race ring slots or clobber real rows with quantized pad garbage
-    (gemma4: 4096-row padded chunk into a 512-slot ring turned whole
-    transcripts into <pad>). Negative = "no bound"; unmanaged paths (decode's
-    single-token writes, handler tests) ride the no-bound default."""
+    can't race ring slots or clobber real rows with quantized pad garbage.
+    Negative = "no bound"; unmanaged paths (decode's single-token writes,
+    handler tests) ride the no-bound default."""
     h = al.program_id(0)
     t = al.program_id(1)
     start = al.load(START)
@@ -82,14 +78,12 @@ def kv_dequant_q8_range(CODES, SCALES, END, OUT: al.output,
                         TOKENS_PER_PROG: al.constexpr = 64):
     """Dequantize PHYSICAL cache slots [0, min(END+END_OFFSET, window)) into
     the fp16 scratch (same cache layout) — the materialize fallback for
-    prefill reads. Grid dim 1 spans the static slot count; rows
-    at or past the runtime end are masked off. END is the chunk's start
-    position; END_OFFSET (static chunk length) extends the range over the
-    chunk's own just-quantized rows, so the scratch is the SINGLE source the
-    read-only prefill attention needs — and prefill attends exactly the codes
-    decode will read later. Ring caches are slot-to-slot: physical slot j
-    holds logical token (j + k*window); the prefill attention's own ring
-    addressing resolves logical positions."""
+    prefill reads. Grid dim 1 spans the static slot count; rows at or past the
+    runtime end are masked off. END is the chunk's start position; END_OFFSET
+    (static chunk length) extends the range over the chunk's own just-quantized
+    rows. Ring caches are slot-to-slot: physical slot j holds logical token
+    (j + k*window); the prefill attention's own ring addressing resolves
+    logical positions."""
     h = al.program_id(0)
     base = al.program_id(1) * TOKENS_PER_PROG
     end = al.load(END) + END_OFFSET
@@ -99,11 +93,11 @@ def kv_dequant_q8_range(CODES, SCALES, END, OUT: al.output,
         phys_end = end
     d = al.arange(0, HEAD_DIM)
 
-    # TOKENS_PER_PROG rows per program (GPU loop, not unrolled): a grid of
-    # one program per slot at a 262k-native cache was ~262k mostly-masked
-    # threadgroup launches per layer per chunk — measured +1.4s/request on
-    # qwen3.5:4b prefill. Rows at/past the runtime end mask off their store;
-    # their loads clamp to the last slot (in-bounds garbage, never written).
+    # TOKENS_PER_PROG rows per program (GPU loop, not unrolled): one program
+    # per slot at a 262k-native cache is ~262k mostly-masked threadgroup
+    # launches per layer per chunk (+1.4s/request on qwen3.5:4b prefill). Rows
+    # at/past the runtime end mask off their store; their loads clamp to the
+    # last slot (in-bounds garbage, never written).
     for _t in range(0, TOKENS_PER_PROG, 1):
         tok = base + _t
         safe = al.minimum(al.cast(tok, al.int32), al.cast(S_MAX - 1, al.int32))
@@ -159,25 +153,25 @@ def attention_decode_vector_split_q8(
 
     Same M=1 flash-decoding structure (32-thread TG, lane owns
     PER_LANE=HEAD_DIM/32 consecutive dims, UNROLL-pipelined simd_reduce
-    scores, exp2-frame block softmax, identical (partial_O, partial_lse)
-    contract so the existing combine kernels are reused unchanged) — but K/V
-    come from int8 codes + per-32-block fp16 scales. A lane's PER_LANE dims
-    always sit inside ONE 32-block (PER_LANE divides 32), so dequant is one
-    scale load per (lane, position) factored out of the lane's partial dot.
+    scores, exp2-frame block softmax, same (partial_O, partial_lse) contract so
+    the combine kernels are reused) — but K/V come from int8 codes +
+    per-32-block fp16 scales. A lane's PER_LANE dims always sit inside ONE
+    32-block (PER_LANE divides 32), so dequant is one scale load per
+    (lane, position) factored out of the lane's partial dot.
 
-    WRITE_KV=1 fuses the new token's quantize-write, mirroring the fp16
-    kernel: lanes 0..D/32-1 each scan one 32-elem block of new_K/new_V
-    (scalar; runs once per dispatch, negligible vs the K-loop), write codes +
-    scale, then the loop reads position pos back. Every split writes identical
-    bytes — the same redundant-write-then-read safety the fp16 WRITE_KV path
-    uses. Standalone `kv_quantize_q8_range` dispatches cost ~2 extra
-    dispatches/layer/step in the chunked decode plan — the measured reason
-    decode tpot trailed fp16 (~10.0 vs 8.05 ms @16k) while the kernel itself
-    microbenched at near-parity. WRITE_KV=0 is the gemma4 KV-shared read.
+    WRITE_KV=1 fuses the new token's quantize-write: lanes 0..D/32-1 each scan
+    one 32-elem block of new_K/new_V (scalar; runs once per dispatch, negligible
+    vs the K-loop), write codes + scale, then the loop reads position pos back.
+    Every split writes identical bytes — there is no inter-TG visibility
+    guarantee, so each reader must be its own writer. Standalone
+    `kv_quantize_q8_range` dispatches instead cost ~2 extra dispatches/layer/step
+    in the chunked decode plan, the reason decode tpot trails fp16 (~10.0 vs
+    8.05 ms @16k) while the kernel itself microbenches at near-parity.
+    WRITE_KV=0 is the gemma4 KV-shared read.
 
     Codes load as char4 + dot4 (float4(char4) is one hardware convert) on the
-    PER_LANE%4==0 path — instruction-parity with the fp16 kernel; the original
-    per-byte bring-up loads were instruction-bound and 0.95x fp16 at depth.
+    PER_LANE%4==0 path — instruction-parity with the fp16 kernel; per-byte
+    loads are instruction-bound and 0.95x fp16 at depth.
     """
     D = HEAD_DIM
     SCALE = CUSTOM_SCALE if (CUSTOM_SCALE is not None and CUSTOM_SCALE > 0) else 1.0 / (D**0.5)
@@ -221,9 +215,8 @@ def attention_decode_vector_split_q8(
         # (b >= D/32) in bounds; their stores are masked off. Only the split
         # whose K-range contains the new position writes — it is the only one
         # that reads position pos back, and there is no inter-TG visibility
-        # guarantee, so each reader must be its own writer (and non-readers
-        # need no write at all). All BH×SPLITS TGs writing redundantly
-        # measured +255us/step fixed overhead at 36 layers.
+        # guarantee, so each reader must be its own writer. All BH×SPLITS TGs
+        # writing redundantly is +255us/step fixed overhead at 36 layers.
         pos_i32 = al.cast(cache_pos, al.int32)
         need = al.where((pos_i32 >= split_start) & (pos_i32 < split_end), 1, 0)
         if SLIDING_WINDOW > 0:
@@ -258,17 +251,15 @@ def attention_decode_vector_split_q8(
 
     T_MAIN = split_start + ((split_end - split_start) // UNROLL) * UNROLL
     if PER_LANE % 4 == 0:
-        # ---- vec4 path (D 128/256/512): instruction-parity with the fp16
-        # kernel's hot loop. One char4 load + one dot4 per 4 codes (dot4 wraps
-        # operands in float4() — float4(char4) is a single hardware convert),
-        # plus ONE scale fetch/mul per (lane, position): the per-byte bring-up
-        # loads made the kernel instruction-bound and 0.95x fp16 at depth.
+        # ---- vec4 path (D 128/256/512): one char4 load + one dot4 per 4 codes
+        # (dot4 wraps operands in float4() — float4(char4) is a single hardware
+        # convert), plus ONE scale fetch/mul per (lane, position).
         NVEC = PER_LANE // 4
         q = [al.load4_vec(Qh + lane_off + 4 * _c) for _c in range(NVEC)]
         # CODES_U32 (PER_LANE==16, D=512): a lane's 16 codes per position are
         # exactly one uint4 — ONE 16-byte load + 4 as_char4 reinterprets vs
-        # four char4 loads. The kernel is load-issue-bound; this quarters the
-        # K/V code load instructions. Strides derive from the int8 units.
+        # four char4 loads, quartering the load-issue-bound K/V code load
+        # instructions. Strides derive from the int8 units.
         KU32h = K_codes_u32 + kv_head * (KC_HEAD_STRIDE // 4)
         VU32h = V_codes_u32 + kv_head * (VC_HEAD_STRIDE // 4)
         for jb in range(split_start, T_MAIN, UNROLL):

@@ -151,11 +151,9 @@ def dot_transpose_lhs(
     materializing an (M, K) contiguous copy of a transposed view (e.g.
     d_W = x.T @ d_y in linear-layer backward).
 
-    No matvec/PACKED paths: matvec in dot_transpose_rhs relies on a
-    contiguous 4-wide load along K, which doesn't apply here (A_T accesses
-    at fixed m stride by M), and PACKED is specific to quantized weight
-    layouts irrelevant for LHS gradients. The tiled MMA path carries all
-    tune knobs matching dot_transpose_rhs.
+    No matvec/PACKED paths: matvec relies on a contiguous 4-wide load along K,
+    which doesn't apply here (A_T accesses at fixed m stride by M), and PACKED
+    is specific to quantized weight layouts.
     """
     K, M = A_T.shape
     N = B.shape[1]

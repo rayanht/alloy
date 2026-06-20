@@ -1,7 +1,4 @@
-"""Buffer utilities, allocation, and module-level state.
-
-Leaf module — no dependencies on other alloy._core submodules.
-"""
+"""Buffer utilities, allocation, and module-level state."""
 
 from __future__ import annotations
 from alloy._compiler.dtypes import float32, DType
@@ -113,16 +110,13 @@ _alloc_ptrs_this_run: set[int] = set()
 
 # --- Record-only compile mode ---
 #
-# A plan is built entirely from dispatch *metadata* (PSO handles, buffer
+# A plan is built entirely from dispatch metadata (PSO handles, buffer
 # ptrs/offsets/nbytes, grids) — `_compile_to_plan` never reads an intermediate's
-# *contents*. So `eager_compile_all` can record the plan WITHOUT executing the
-# GPU and WITHOUT allocating real Metal storage for kernel-produced
-# intermediates: it gives them "phantom" AlloyBuffers (real shape/dtype/nbytes,
-# a unique fake ptr, no MTLBuffer). Peak compile memory then drops from
-# O(M_MAX × layers) to weights + the bounded liveness pool — so M_MAX can scale
-# to the model's native context. The GPU dispatch is skipped (the phantom ptrs
-# can't be bound to an encoder anyway); the recorded plan is byte-identical to
-# the one a real run-0 would produce, and run-1+ (`_execute_plan`) is untouched.
+# contents — so `eager_compile_all` records the plan without executing the GPU
+# or allocating real Metal storage for kernel-produced intermediates: they get
+# "phantom" AlloyBuffers (real shape/dtype/nbytes, a unique fake ptr, no
+# MTLBuffer). Peak compile memory then drops from O(M_MAX × layers) to weights +
+# the bounded liveness pool, so M_MAX can scale to the model's native context.
 _record_only_mode = [False]
 # Fake ptrs live in a high reserved range that cannot collide with real heap
 # addresses (macOS arm64 user pointers are far lower) or 0 ("no ptr").
@@ -144,9 +138,9 @@ def _alloc_scratch(shape: tuple[int, ...], dtype: DType = float32) -> AlloyBuffe
 
     Like `_alloc_aligned` but (a) honours record-only mode (phantom, no Metal
     page) and (b) registers the ptr as an INTERMEDIATE so `_compile_to_plan`
-    pools it (and never transiently treats a phantom as a WeightSlot). Use for
-    buffers whose contents a kernel produces and that are never read on the CPU
-    during tracing — e.g. the MoE handler's gather/sort/expert scratch.
+    pools it. Use for buffers whose contents a kernel produces and that are
+    never read on the CPU during tracing — e.g. the MoE handler's
+    gather/sort/expert scratch.
     """
     buf = _alloc_phantom(shape, dtype) if _record_only_mode[0] else _alloc_aligned(shape, dtype)
     _alloc_ptrs_this_run.add(buf.base_ptr)
@@ -154,12 +148,11 @@ def _alloc_scratch(shape: tuple[int, ...], dtype: DType = float32) -> AlloyBuffe
 
 
 def _alloc_phantom(shape: tuple[int, ...], dtype: DType = float32) -> AlloyBuffer:
-    """Metadata-only buffer for record-only compile: NO Metal allocation.
+    """Metadata-only buffer for record-only compile: no Metal allocation.
 
     Carries the real shape/dtype/nbytes and a unique fake ptr so `_record_for_plan`
     and `_compile_to_plan` see a valid identity, but holds no GPU page. The fake
-    ptr must never be dereferenced — record-only skips the GPU dispatch, and no
-    handler reads an intermediate's contents during tracing.
+    ptr must never be dereferenced.
     """
     if not isinstance(dtype, DType):
         raise TypeError(f"dtype must be a DType, got {type(dtype)}")
@@ -170,7 +163,7 @@ def _alloc_phantom(shape: tuple[int, ...], dtype: DType = float32) -> AlloyBuffe
     nbytes = count * dtype.itemsize
     ptr = _phantom_ptr_counter[0]
     # Advance past this allocation's footprint so distinct phantoms get disjoint
-    # ptr ranges (keeps base/data-ptr identity unique, like real allocations).
+    # ptr ranges (unique base/data-ptr identity, like real allocations).
     _phantom_ptr_counter[0] += max(nbytes, 64)
     strides = _compute_contiguous_strides(shape, dtype.itemsize)
     buf = AlloyBuffer(-1, 0, shape, strides, dtype, raw_ptr=ptr, total_nbytes=nbytes)
@@ -182,9 +175,9 @@ def _free_aligned(buf: AlloyBuffer) -> None:
     """Release an `_alloc_aligned` buffer's Metal pages and drop the bookkeeping
     that pins its Python wrapper. For transient GPU scratch (e.g. the GGUF
     quant-repack buffers) that is copied to CPU and never used again — without
-    this the Metal pages live for the process lifetime (no pool, no GC for
-    Metal buffers), which at load was ~3.5 GB of leaked repack scratch on
-    qwen3.5:4b. No-op on phantom/raw buffers (no Metal handle)."""
+    this the Metal pages live for the process lifetime (no pool, no GC for Metal
+    buffers), ~3.5 GB of leaked repack scratch on qwen3.5:4b. No-op on
+    phantom/raw buffers (no Metal handle)."""
     handle = buf._parent_handle
     if handle < 0:
         return
@@ -198,9 +191,9 @@ def _free_aligned(buf: AlloyBuffer) -> None:
 def is_phantom_buffer(buf: AlloyBuffer) -> bool:
     """True if `buf` is a record-only phantom (metadata-only, no Metal page).
 
-    Its fake ptr lives in the reserved `_PHANTOM_PTR_BASE` range and must NEVER be
+    Its fake ptr lives in the reserved `_PHANTOM_PTR_BASE` range and must never be
     dereferenced — reading it (`.numpy`, `read_scalar`) is a raw memory access at
-    `0x7000…` and SEGFAULTS (not a catchable Python exception). Callers that read
+    `0x7000…` and segfaults (not a catchable Python exception). Callers that read
     buffer contents (e.g. the tuner's snapshot) must skip phantoms.
     """
     return buf._parent_handle < 0 and buf._raw_ptr >= _PHANTOM_PTR_BASE

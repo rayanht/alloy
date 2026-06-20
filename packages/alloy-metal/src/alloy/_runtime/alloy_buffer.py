@@ -5,7 +5,6 @@ shape/strides/dtype, and deferred computation chain. Materializes on first
 read access. View operations (reshape/transpose/slice) are zero-copy metadata
 changes that share the materialization chain.
 
-This file has NO dependency on _core.py. The materialization function
 materialize_many() imports _materialize_many lazily to break the circular import.
 """
 
@@ -84,8 +83,8 @@ def _reshape_strides(
             old_s[oi] = (old_elems // new_elems, innermost_stride * new_elems)
             ni -= 1
         else:
-            # Merging multiple source dims into one target dim.
-            # The result stride is the INNERMOST (rightmost) stride.
+            # Merging source dims into one target dim: result stride is the
+            # innermost (rightmost) stride.
             merge_stride = old_s[oi][1]
             while old_elems < new_elems and oi > 0:
                 if old_s[oi][1] * old_s[oi][0] != old_s[oi - 1][1]:
@@ -221,11 +220,11 @@ class AlloyBuffer:
         self._ext_ref = None
         self._backing_arr = None
         # Layout provenance: (extent, byte_stride) axes of the view this buffer
-        # was FLATTENED from (set by reshape when it loses rank). A contiguous
+        # was flattened from (set by reshape when it loses rank). A contiguous
         # flatten preserves storage order, so these axes still describe what a
-        # linear (1D-gridded) kernel walks — the compiled-plan recorder prefers
-        # them over an uninformative flat shape so the grid-shrink
-        # recipe can see whether M is the outermost axis of a written buffer.
+        # linear (1D-gridded) kernel walks — the compiled-plan recorder uses
+        # them so the grid-shrink recipe can see whether M is the outermost
+        # axis of a written buffer.
         self._pre_flatten_dims = None
 
     @staticmethod
@@ -369,8 +368,8 @@ class AlloyBuffer:
             return self
         # Rank-losing reshape (flatten): carry the source layout as provenance
         # so the plan recorder can still see which axis was outermost. Chained
-        # reshapes keep the EARLIEST shaped ancestor (storage order never
-        # changes across contiguous reshapes).
+        # reshapes keep the earliest shaped ancestor (storage order is preserved
+        # across contiguous reshapes).
         prov = self._pre_flatten_dims
         if prov is None and len(shape) < len(self._shape):
             prov = tuple(zip(self._shape, self._strides))
@@ -456,8 +455,7 @@ class AlloyBuffer:
         # f16/bf16 carry a c_uint16 ctype that surfaces the raw 2-byte bit pattern,
         # not the value (e.g. -8.0 f16 reads back as 51200). Decode the bits via the
         # real float layout (struct, no numpy). Without this, float()/clamp bounds on
-        # a 16-bit buffer are garbage — which silently forced every clipped-linear
-        # (gemma4 vision/audio) onto an f32 upcast.
+        # a 16-bit buffer are garbage.
         if self._dtype.ir == "f16":
             return struct.unpack("<e", struct.pack("<H", raw))[0]
         if self._dtype.ir == "bf16":
@@ -719,9 +717,9 @@ class AlloyBuffer:
         (M, concat) batched-projection result is a single contiguous row that only
         looks strided because it carries the parent's concat-width row stride.
 
-        NOT folded into `contiguous()`: a global view-instead-of-copy aliases the
-        source, which corrupts callers that mutate the result in place (gemma4's
-        f16 +=/*= paths). Used only where the consumer is known read-only."""
+        Not folded into `contiguous()`: a view-instead-of-copy aliases the source,
+        corrupting callers that mutate the result in place. Used only where the
+        consumer is known read-only."""
         expected = self._dtype.itemsize
         for size, stride in zip(reversed(self._shape), reversed(self._strides)):
             if size == 1:

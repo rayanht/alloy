@@ -9,47 +9,29 @@ from alloy_torch.interop import (
     tensor_to_buffer,
     tensor_to_numpy,
 )
-# Force static shape specialization. With Dynamo's default
-# `automatic_dynamic_shapes=True`, a tensor dim that changes between calls
-# (e.g., prompt_len across different requests) gets marked dynamic on the
-# 3rd recompile and Dynamo retraces with symbolic shapes. The alloy backend
-# does not yet handle the symbolic-shape graph correctly and silently emits
-# wrong output (first generated token is garbage, downstream tokens loop).
-# Static specialization recompiles per shape but produces correct results;
-# the bigger cache size limit avoids hitting the fallback path for HTTP
-# servers that legitimately see many distinct prompt lengths.
+# Static shape specialization. With `automatic_dynamic_shapes=True` a dim that
+# changes between calls (prompt_len) gets marked dynamic on the 3rd recompile and
+# Dynamo retraces with symbolic shapes, which the alloy backend mislowers to
+# silently-wrong output. Static specialization recompiles per shape but is correct.
 torch._dynamo.config.automatic_dynamic_shapes = False
-# gemma3 (and most decoder-stack models) put `self.layer_idx` on the
-# attention module — Dynamo treats nn.Module integer attributes as
-# static, so each of gemma3:1b's 26 layers becomes a distinct
-# specialisation. Without enough room in the recompile cache, late
-# layers fall back to eager → custom-op CPU-dispatch failures. Bump
-# the limit instead of unspec'ing — `allow_unspec_int_on_nn_module=True`
-# breaks `past_key_values.layers[self.layer_idx]` because Python list
-# indexing requires a concrete int.
+# Models put `self.layer_idx` on the attention module; Dynamo treats nn.Module int
+# attributes as static, so each layer is a distinct specialisation. Without room in
+# the recompile cache, late layers fall back to eager → custom-op CPU-dispatch
+# failures. (`allow_unspec_int_on_nn_module=True` breaks
+# `past_key_values.layers[self.layer_idx]` — list indexing needs a concrete int.)
 torch._dynamo.config.cache_size_limit = 512
-# Bigger contexts (qwen3.5 ctx=4096 has 8 prefill buckets × 18 decoder layers
-# × HF's per-layer recompile guards) blow past dynamo's default 256
-# accumulated_recompile_limit. Once exceeded, dynamo silently falls back
-# to eager — and `gguf_q8_0_mm` only has MPS/Meta dispatch keys, so eager
-# tries the CPU backend and crashes with `Could not run alloy::gguf_q8_0_mm
-# with arguments from the 'CPU' backend`. Raise the limit to match
-# cache_size_limit so prefill compile completes.
+# Bigger contexts blow past dynamo's default accumulated_recompile_limit; once
+# exceeded dynamo silently falls back to eager, and `gguf_q8_0_mm` has only
+# MPS/Meta dispatch keys so the CPU backend crashes. Match cache_size_limit.
 torch._dynamo.config.accumulated_recompile_limit = 4096
-# Treat scalar-tensor values (e.g. cache.cumulative_length, which carries
-# the prefix length per warm-prefill request) as symbolic instead of
-# specialising on the literal int. Without this, every conversation's
-# first warm-prefill turn triggers a fresh Dynamo specialisation at that
-# request's specific Q_START_POS — even though every plan is functionally
-# identical and the alloy backend can rebind input storage per call.
+# Treat scalar-tensor values (cache.cumulative_length) as symbolic, not specialised
+# on the literal int — else every warm-prefill turn recompiles at its Q_START_POS
+# even though the alloy backend rebinds input storage per call.
 torch._dynamo.config.specialize_int = False
 
-# capture_scalar_outputs=True bakes scalar tensor reads (e.g.
-# cumulative_length.item()) into the graph as the specific int seen on
-# the first call, which causes per-Q_START_POS recompiles on multi-turn
-# warm prefill. False lets Dynamo treat those scalars as symbolic; the
-# alloy backend lowers them as runtime values, and they only appear in
-# offset arithmetic.
+# capture_scalar_outputs=True bakes scalar tensor reads (cumulative_length.item())
+# into the graph as the first call's int → per-Q_START_POS recompiles. False lets
+# the alloy backend lower them as runtime values in offset arithmetic.
 torch._dynamo.config.capture_scalar_outputs = False
 
 if "alloy" not in _backend_registry._COMPILER_FNS:

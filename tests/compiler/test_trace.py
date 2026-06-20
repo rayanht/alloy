@@ -64,7 +64,6 @@ class TestTraceBasic:
                             output_params={"out"})
         loads = [op for op in walk_ops(func.ops) if isinstance(op, Load)]
         assert len(loads) >= 1
-        # Semantic 2D addressing should be detected
         ld = loads[0]
         assert ld.row_indices is not None or ld.offsets is not None
 

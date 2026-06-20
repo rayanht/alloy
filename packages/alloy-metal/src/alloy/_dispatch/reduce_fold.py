@@ -1,31 +1,29 @@
 """Reduction-fold fusion: fold a row-reduction producer into a streaming matvec
 anchor by riding the anchor's own K-loop and simd-reduce.
 
-The new primitive. No existing mechanism folds a reduction-bearing producer
-(rms_norm) into a consumer — the engine only attaches per-element transforms or
-builds a fresh kernel. But a decode quant-GEMV (dot_q4_k_v2 / dot_q4_k_silu_v2)
-already streams the full activation row through a ForLoop with simd-reduced
-per-column accumulators. So this composer threads the producer's reduction
-through that SAME loop as an added carry and reduces it with the SAME
-simd_reduce — authoring no loop and no reduce, only the carry plumbing.
+Folds a reduction-bearing producer (rms_norm) into a consumer. A decode
+quant-GEMV (dot_q4_k_v2 / dot_q4_k_silu_v2) already streams the full activation
+row through a ForLoop with simd-reduced per-column accumulators, so this composer
+threads the producer's reduction through that SAME loop as an added carry and
+reduces it with the SAME simd_reduce — authoring no loop and no reduce, only the
+carry plumbing.
 
 All compute is LIFTED from rms_norm's TileFunction (its square, its
-mean/eps/rsqrt tail, its weight multiply) and re-emitted via copy+remap, exactly
-as RowPass/MultiRoot lift their compute. The per-row scalar rrms factors out of
-the matvec — out[c] = rrms · Σ_k (w[k]·x[k])·W[c,k] — so the whole fold is one
-pass: x² accumulates in a carry, w·x folds into each load, rrms scales each
-column result before the (silu/)store.
+mean/eps/rsqrt tail, its weight multiply) and re-emitted via copy+remap. The
+per-row scalar rrms factors out of the matvec — out[c] = rrms · Σ_k
+(w[k]·x[k])·W[c,k] — so the whole fold is one pass: x² accumulates in a carry,
+w·x folds into each load, rrms scales each column result before the (silu/)store.
 
-Scope (measured): single-consumer, small-N only. The folded reduce is recomputed
-by every output-column threadgroup, so its redundant cost scales with N — a win
-only at small N (<=4096: qwen3:0.6b's qkv/gate_up), sharply net-negative above it
-(Llama-3.2-3B's qkv 5120 / gate_up 8192 fold to -43% decode), so N_OUT_FOLD_LIMIT
-gates it hard. Fan-out>=2 (an attn norm feeding QK+V) was also measured
-net-negative — the reduce runs in both — so the pass claims single-consumer
-norms only. Gated to M==1 decode + the no-remainder superblock layout.
+Scope: single-consumer, small-N only. The folded reduce is recomputed by every
+output-column threadgroup, so its redundant cost scales with N — net-positive for
+N<=4096 (qwen3:0.6b's qkv/gate_up), net-negative above it (Llama-3.2-3B's qkv
+5120 / gate_up 8192: -43% decode), so N_OUT_FOLD_LIMIT gates it. Fan-out>=2 (an
+attn norm feeding QK+V) is net-negative — the reduce runs in both — so the pass
+claims single-consumer norms only. Gated to M==1 decode + the no-remainder
+superblock layout.
 
 The reduce uses simdgroup-order summation vs rms_norm's tile reduce — equal up
-to f32 ULPs; validated by greedy-token match on qwen3.5:4b + gemma4.
+to f32 ULPs.
 """
 
 from __future__ import annotations
@@ -61,10 +59,9 @@ FUSIBLE_GEMVS = frozenset(
     {"dot_q4_k_v2", "dot_q4_k_silu_v2", "dot_mlx_q4_v2", "dot_mlx_q4_silu_v2"}
 )
 # Above this output-column count the redundant per-threadgroup reduce outweighs
-# the saved norm dispatch/barrier. The crossover is sharp and low: measured
-# net-positive for N<=4096 (qwen3:0.6b qkv 4096 / gate_up 3072), catastrophic at
-# N>=5120 (Llama-3.2-3B qkv 5120 / gate_up 8192 -> -43% decode). 4096 keeps the
-# small-model win and excludes every larger projection.
+# the saved norm dispatch/barrier: net-positive for N<=4096 (qwen3:0.6b qkv 4096
+# / gate_up 3072), net-negative at N>=5120 (Llama-3.2-3B qkv 5120 / gate_up 8192:
+# -43% decode).
 N_OUT_FOLD_LIMIT = 4096
 
 

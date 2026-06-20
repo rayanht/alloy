@@ -39,14 +39,12 @@ if TYPE_CHECKING:
 
 
 class VerifySpecLogits(torch.nn.Module):
-    """Multi-token verify for the speculative session:
-    returns per-position LOGITS — sampling happens outside the plan,
-    position-keyed per row, so spec output is bit-identical to plain decode at
-    the same seed — plus the drafter's tap hidden states.
+    """Multi-token verify for the speculative session: returns per-position
+    LOGITS (sampling happens outside the plan, position-keyed per row) plus the
+    drafter's tap hidden states.
 
-    Tap layer outputs ride HF's `output_hidden_states`
-    (hidden_states[i+1] == output of decoder layer i); layers nobody returns
-    are dead lazy buffers, so the flag costs nothing on the GPU."""
+    Tap layer outputs ride HF's `output_hidden_states` (hidden_states[i+1] ==
+    output of decoder layer i); layers nobody returns are dead lazy buffers."""
 
     model: transformers.PreTrainedModel
 
@@ -113,21 +111,19 @@ def prealloc_dn_scratch(cache: StaticCache, m: int) -> None:
 
 def attach_spec_session(gen: AlloyGenerator, drafter) -> SpecSession:
     """Bind a contract drafter to the generator and create the SpecSession
-    that owns its round loop. One drafter per generator; `eager_compile_all`
-    warms the session's plans."""
+    that owns its round loop. `eager_compile_all` warms the session's plans."""
     from alloy_server.speculative.session import SpecSession  # scoped: avoid import cycle (speculative imports generation types)
 
     drafter.bind(gen)
     if drafter.taps.layer_ids:
         install_taps(gen.model, drafter.taps.layer_ids)
     session = SpecSession(gen, drafter)
-    # DeltaNet recurrent slot bank. Must run before any cache is
-    # constructed — attach precedes eager_compile_all in every flow.
-    # Chunk-aligned verify widths (DFlash block 16, PLD block 8) dispatch
-    # the dvblock+reconstruct path, which never writes past slot 0 — one
-    # slot suffices (16 → 1 ≈ −400MB resident on qwen3.5:4b). Non-aligned
-    # widths (MTP) fill the per-row bank via the serial SAVE_STEPS kernel
-    # and need one slot per verify row.
+    # DeltaNet recurrent slot bank. Must run before any cache is constructed.
+    # Chunk-aligned verify widths (DFlash block 16, PLD block 8) dispatch the
+    # dvblock+reconstruct path, which writes only slot 0 — one slot
+    # suffices (16 → 1 ≈ −400MB resident on qwen3.5:4b). Non-aligned widths
+    # (MTP) fill the per-row bank via the serial SAVE_STEPS kernel and need one
+    # slot per verify row.
     text = gen.model.config
     if hasattr(text, "get_text_config"):
         text = text.get_text_config(decoder=True)
@@ -146,8 +142,7 @@ def attach_spec_session(gen: AlloyGenerator, drafter) -> SpecSession:
 def pin_verify_plan(gen: AlloyGenerator, m: int, taps):
     """Compile + pin the M-row spec-verify plan (logits + tap hiddens,
     SAVE_STEPS per-token DeltaNet state slots) against the persistent
-    max-cache. The session replays it via `_execute_plan` each round —
-    zero Dynamo."""
+    max-cache. The session replays it via `_execute_plan` each round."""
     from alloy_server.speculative.session import VerifyState  # scoped: avoid import cycle (speculative imports generation types)
 
     device = next(gen.model.parameters()).device
@@ -197,9 +192,8 @@ def pin_verify_plan(gen: AlloyGenerator, m: int, taps):
             f"spec verify plan capture failed at M={m} (graph break?) — "
             "speculative decoding needs the pinned-plan fast path"
         )
-    # Outputs follow the module's return order (logits, *taps, post_norm?):
-    # _build_output_mapping preserves FX output order. Identify by ordered
-    # shape-walk over the OutputSlot entries.
+    # Outputs follow the module's return order (logits, *taps, post_norm?);
+    # identify by ordered shape-walk over the OutputSlot entries.
     hidden_size = gen.model.config.hidden_size
     vocab = gen.model.config.vocab_size
     logits_idx = -1

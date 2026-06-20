@@ -37,18 +37,15 @@ def test_broadcast_add_after_scaled_matmul_eager_vs_alloy() -> None:
     compiled = torch.compile(_matmul_scale_mask, backend="alloy", dynamic=False)
     alloy_out = compiled(query, key, mask).to(torch.float32)
 
-    # At the masked positions, the score must be the fp16 min sentinel
-    # (-65504). Eager gets it right; alloy used to silently drop the
-    # mask add when it was absorbed into the GEMM epilogue. After the
-    # ScatterTransform fix, the result lands within fp16 rounding noise
-    # of the sentinel (the saturated value's representable neighbors).
+    # At the masked positions the score must be the fp16 min sentinel (-65504);
+    # the epilogue-fused mask add must not be dropped. Tolerance is loose because
+    # the saturated value lands within fp16 rounding noise of the sentinel.
     max_diff = (eager_out - alloy_out).abs().max().item()
     assert max_diff < 10.0, (
         f"alloy compile diverges from eager — max abs diff {max_diff:.4f}"
     )
-    # Sanity: at the masked positions, magnitude must be near the fp16
-    # min sentinel (this is what proves the mask is applied, not just
-    # that the unmasked numerics happen to be small).
+    # At the masked positions, magnitude must be near the fp16 min sentinel —
+    # this proves the mask is applied, not just that unmasked numerics are small.
     masked = alloy_out[1, 0, 0, 4:7]
     assert (masked < -60000.0).all(), (
         f"alloy fails to apply broadcast mask: got {masked.tolist()}"

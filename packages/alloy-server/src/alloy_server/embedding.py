@@ -11,9 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-# A model's token counter (`text -> token count`). Lives here (the model layer)
-# rather than in `server/` so the embed/transcription loaders don't pull the
-# server package (a models<->server cycle).
+# A model's token counter (`text -> token count`).
 TextTokenCounter = Callable[[str], int]
 
 EmbedFn = Callable[[list[str]], list[list[float]]]

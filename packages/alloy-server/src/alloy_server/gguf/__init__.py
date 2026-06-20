@@ -1,11 +1,5 @@
 """GGUF loading infrastructure: resolution, metadata cache, quantized modules,
-tokenizer/SPM, and the causal-LM tensor-load orchestrator.
-
-This package owns the loading mechanics; the per-architecture handlers live in
-the sibling ``models/`` package, which depends on this one (never the reverse).
-The public surface below is the package API consumers import from
-``alloy_server.gguf``. resolve / arch / meta / tokenizer / quant are submodules;
-loader.py is the orchestrator.
+tokenizer/SPM, and the causal-LM tensor-load orchestrator (`loader.py`).
 """
 
 from __future__ import annotations

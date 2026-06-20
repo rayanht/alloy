@@ -7,9 +7,9 @@ registering its GGUF `general.architecture` string.
 
 The one exception is lfm2's tokenizer converter (transformers has no
 `GGUF_TO_FAST_CONVERTERS['lfm2']`): its byte-level BPE matches llama3's, so the
-handler points lfm2 at the llama converter (ported from the former
-`_lfm2_compat.py`). Their attention forwards run through the alloy cache ops via
-`models.attention.install_multi_token_attention`, installed by the generator.
+handler points lfm2 at the llama converter. Their attention forwards run through
+the alloy cache ops via `models.attention.install_multi_token_attention`,
+installed by the generator.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ class Lfm2Handler(CausalLMHandler):
     """LiquidAI LFM2. transformers bridges lfm2 end-to-end EXCEPT the tokenizer
     converter: its GGUF tokenizer is `gpt2`-model + `lfm2` pre-type, which
     llama.cpp maps to the llama3 byte-level BPE — so the llama converter is the
-    correct one (the same lossless byte-level path llama3.2 uses)."""
+    correct one."""
 
     arch = ("lfm2",)
 

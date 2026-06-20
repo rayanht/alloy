@@ -95,7 +95,7 @@ def test_stream_buffers_tool_call_yielding_no_text():
 def test_stream_detects_tool_call_after_prose():
     # qwen3.5 routinely emits prose before the call. The prose must stream as
     # content; the call (from the opener on) parses into tool_calls instead of
-    # leaking as raw XML (this was Claude Code's "tool calls render as text").
+    # leaking as raw XML.
     gen = Generation(_tools_req(_stream_model([
         "I'll check that for you. ",
         "<tool_call><function=f><parameter=x>\n1\n</parameter>",
@@ -313,10 +313,9 @@ class FakeTokenizer:
 
 def test_warm_reconstruct_matches_post_reasoning_content():
     # Reasoning models stream the chain-of-thought separately, so clients echo
-    # back ONLY the post-`</think>` content. The reconstruction must match
-    # that form — comparing against the full decoded text (reasoning included)
-    # bailed every text turn of a thinking model and forced a full cold
-    # re-prefill (Claude Code's 30s-per-turn symptom).
+    # back ONLY the post-`</think>` content. The reconstruction must match that
+    # form; comparing against the full decoded text (reasoning included) bails
+    # every text turn of a thinking model and forces a full cold re-prefill.
     tok = FakeTokenizer()
     saved_messages = (
         ChatMessage(role="system", content="sys"),
@@ -339,8 +338,8 @@ def test_warm_reconstruct_matches_post_reasoning_content():
         saved_input_ids + saved_decoded
     )
 
-    # Without the reasoning protocol the old behavior bailed — pin that the
-    # protocol is what makes the match work, so it isn't dropped by accident.
+    # Without the reasoning protocol the match bails — pin that the protocol is
+    # what makes it work, so it isn't dropped by accident.
     cold = reconstruct_warm_input_ids(
         tok, messages, saved_messages, saved_input_ids, saved_decoded,
         frozenset({0}), None, None,
@@ -351,9 +350,9 @@ def test_warm_reconstruct_matches_post_reasoning_content():
 def test_branching_side_call_does_not_evict_warm_state():
     # Claude Code follows each real turn with a +2-shaped side call (same
     # history + a synthetic user message). Both the side call AND the real
-    # next turn extend the SAME assistant boundary — a branch. With a single
-    # saved state the side call claimed it and the real turn went cold; with
-    # the state deque, reconstruction finds the shared base for both.
+    # next turn extend the SAME assistant boundary — a branch. The side call
+    # must not claim the saved state and force the real turn cold; the state
+    # deque lets reconstruction find the shared base for both.
     encodes: list[int] = []
 
     def encode(messages, tools=(), enable_thinking=None):

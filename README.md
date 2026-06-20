@@ -10,6 +10,28 @@ tiled GEMM with simdgroup MMA and automatic operator fusion for multi-kernel pip
 **Status**: technical preview. Requires Apple Silicon (M1+) and macOS 13+. The
 Python packages need Python 3.10–3.12.
 
+## Contents
+
+- [Install](#install)
+- [Inference server - Quickstart](#inference-server---quickstart)
+  - [Features](#features)
+- [torch.compile backend](#torchcompile-backend)
+  - [Training preview](#training-preview)
+- [Benchmarks](#benchmarks)
+  - [Causal LM Inference](#causal-lm-inference)
+  - [Multimodal Inference](#multimodal-inference)
+  - [Embeddings Inference](#embeddings-inference)
+- [Writing kernels](#writing-kernels)
+  - [Tiled GEMM](#tiled-gemm)
+  - [Built-in ops](#built-in-ops)
+  - [Kernel primitives](#kernel-primitives)
+  - [Automatic fusion](#automatic-fusion)
+  - [Framework interop](#framework-interop)
+  - [Inspect generated code](#inspect-generated-code)
+- [Why Alloy](#why-alloy)
+- [Contributing](#contributing)
+- [License](#license)
+
 ## Install
 
 **Python (pip / uv)**
@@ -19,7 +41,7 @@ pip install 'alloy-kit[serve]'   # local LLM server + CLI + torch.compile backen
 pip install alloy-kit            # lean: just the GPU kernel compiler (no torch)
 pip install 'alloy-kit[all]'     # + training / vision / audio research extras
 
-import alloy as al
+# import alloy as al
 ```
 
 The PyPI distribution is **`alloy-kit`**. The brackets are optional
@@ -137,7 +159,7 @@ output = compiled(input_ids=input_ids)
 
 The backend handles: FX graph decomposition, operator fusion (RMSNorm, RoPE, GELU,
 batched QKV, GEMM+LayerNorm, scalar broadcast), GQA-native attention, compiled
-dispatch plans, and autotuning.
+dispatch plans, and tuning.
 
 Runnable model examples live in [`examples/torch/`](examples/torch/):
 
@@ -268,7 +290,7 @@ Per-regime encoder tok/s from `alloy bench nomic-embed-text --dataset embeddings
 | b8_short | 8 |  10 | 14142 |
 | b8_long  | 8 | 128 | 11840 |
 
-## Write a kernel
+## Writing kernels
 
 ```python
 import numpy as np
@@ -317,7 +339,7 @@ More runnable examples live in [`examples/kernel/`](examples/kernel/):
 - [`mandelbrot.py`](examples/kernel/mandelbrot.py) — divergent per-thread iteration
 - [`flash_attention.py`](examples/kernel/flash_attention.py) — online-softmax attention
 
-## Tiled GEMM
+### Tiled GEMM
 
 ```python
 @al.kernel
@@ -344,23 +366,10 @@ def matmul(A, B_T, C: al.output,
 
 This compiles to Metal with simdgroup matrix multiply-accumulate (MMA), cooperative tile loads, threadgroup shared memory staging, and optional double buffering all generated automatically from the tile IR.
 
-## Why Alloy
 
-**The problem.** Metal compute is powerful but painful to program. You write MSL in a C++ dialect, manually manage buffer bindings, compile pipeline state objects, and set up command encoders. There's no equivalent of Triton, Numba, or CuPy for Metal.
+### Built-in ops
 
-**What Alloy does.** Python → tile IR → MSL, with a runtime that handles dispatch, caching, and optimization:
-
-- **Shared-memory execution** — Apple Silicon CPU and GPU share physical memory. Alloy
-  binds caller buffers directly where the storage layout supports it, and uses
-  Alloy-owned shared buffers when plan safety or alignment requires it.
-- **Tile IR compiler** — Python kernel source → AST → tile IR (loads, stores, reductions, MMA, barriers) → Metal Shading Language. Handles threadgroup sizing, shared memory allocation, simdgroup decomposition, and barrier placement automatically.
-- **Automatic dispatch** — builtins return lazy buffers that queue GPU work automatically. Reading results triggers a single fused Metal command buffer commit. No manual batch management needed.
-- **Operator fusion** — adjacent elementwise kernels fuse automatically, eliminating intermediate buffers. Elementwise ops fuse as prologues and epilogues into reductions, GEMM, softmax, and layernorm. Transposes fuse via stride absorption.
-- **Autotuning** — exhaustive search over tile sizes, loop unrolling, double buffering, and matvec strategies.
-
-## Built-in ops
-
-High-performance implementations of common operations, written in the Alloy DSL and compiled through the tile IR pipeline:
+High-performance implementations of common operations.
 
 ```python
 C = al.dot_transpose_rhs(A, B)               # tiled GEMM with autotuning
@@ -372,17 +381,17 @@ L = al.cross_entropy(logits, labels)         # fused cross-entropy loss kernel
 
 Builtins infer output shapes and constexpr values from input arrays. They compose with fusion. e.g. `al.dot` followed by an elementwise kernel automatically fuses the elementwise op as an epilogue.
 
-## Kernel primitives
+### Kernel primitives
 
 ```python
 # Grid and thread indexing
-pid = al.program_id(0)        # threadgroup position (block index)
-tid = al.thread_id()          # thread position within threadgroup
+pid = al.program_id(0)                  # threadgroup position (block index)
+tid = al.thread_id()                    # thread position within threadgroup
 offs = pid * 1024 + al.arange(0, 1024)  # block-level offsets
 
 # Memory
-x = al.load(ptr + offs, mask=mask)      # masked global load
-al.store(ptr + offs, val, mask=mask)    # masked global store
+x = al.load(ptr + offs, mask=mask)       # masked global load
+al.store(ptr + offs, val, mask=mask)     # masked global store
 buf = al.shared(256)                     # threadgroup shared memory
 loc = al.local(8)                        # per-thread register array
 al.barrier()                             # threadgroup memory barrier
@@ -392,7 +401,7 @@ al.copy4(dst, offset, src_ptr)           # vectorized 4-element load
 # Tile operations (2D blocks for GEMM, attention, etc.)
 acc = al.zeros((BLOCK_M, BLOCK_N), dtype=al.float32)
 acc += al.tile_dot(a, b, transpose_rhs=True)  # simdgroup MMA
-reduced = al.simd_reduce(val)                  # cross-lane reduction
+reduced = al.simd_reduce(val)                 # cross-lane reduction
 
 # Simdgroup (warp-level)
 al.simd_shuffle_xor(val, offset)         # butterfly shuffle
@@ -402,7 +411,7 @@ al.simd_load(src, offset, stride)        # load into simd matrix
 al.simd_mma(acc, a, b)                   # matrix multiply-accumulate
 
 # Atomics
-al.atomic_add(ptr, idx, val)             # atomic fetch-and-add (int32)
+al.atomic_add(ptr, idx, val)                # atomic fetch-and-add (int32)
 al.atomic_max(ptr, idx, val)
 al.atomic_cas(ptr, idx, expected, desired)  # compare-and-swap
 
@@ -412,7 +421,7 @@ for i in range(N): ...
 while cond: ...
 ```
 
-## Automatic fusion
+### Automatic fusion
 
 ```python
 # These three kernels fuse into one — no intermediate buffers allocated.
@@ -425,25 +434,39 @@ result = activate[grid](t2, N=N)  # result = relu(t2)
 print(result[0])
 ```
 
-## Framework interop
+### Framework interop
 
 Pass PyTorch tensors or MLX arrays directly when their storage layout is supported:
 
 ```python
 import torch
-x = torch.randn(32, 128)    # CPU tensor, lives in unified memory
+x = torch.randn(32, 128)                  # CPU tensor, lives in unified memory
 result = my_kernel[grid](x, M=32, N=128)  # x bound directly; result returned as an AlloyBuffer
 ```
 
 Alloy's compiled plans may convert PyTorch input storage to Alloy-owned shared
 memory on first execution so subsequent dispatches can resolve Metal buffers by handle. That keeps subsequent dispatches free of per-call input copies for stable storage.
 
-## Inspect generated code
+### Inspect generated code
 
 ```python
 al.inspect(my_kernel, N=8192)                      # prints MSL source
 al.inspect(my_kernel, level="tile-ir", N=8192)     # prints tile IR
 ```
+
+## Why Alloy
+
+**The problem.** Metal compute is powerful but painful to program. You write MSL in a C++ dialect, manually manage buffer bindings, compile pipeline state objects, and set up command encoders. There's no equivalent of Triton, Numba, or CuPy for Metal.
+
+**What Alloy does.** Python → tile IR → MSL, with a runtime that handles dispatch, caching, and optimization:
+
+- **Shared-memory execution** — Apple Silicon CPU and GPU share physical memory. Alloy
+  binds caller buffers directly where the storage layout supports it, and uses
+  Alloy-owned shared buffers when plan safety or alignment requires it.
+- **Tile IR compiler** — Python kernel source → AST → tile IR (loads, stores, reductions, MMA, barriers) → Metal Shading Language. Handles threadgroup sizing, shared memory allocation, simdgroup decomposition, and barrier placement automatically.
+- **Automatic dispatch** — builtins return lazy buffers that queue GPU work automatically. Reading results triggers a single fused Metal command buffer commit. No manual batch management needed.
+- **Operator fusion** — adjacent elementwise kernels fuse automatically, eliminating intermediate buffers. Elementwise ops fuse as prologues and epilogues into reductions, GEMM, softmax, and layernorm. Transposes fuse via stride absorption.
+- **Tuning** — exhaustive search over tile sizes, loop unrolling, double buffering, and matvec strategies.
 
 ## Contributing
 

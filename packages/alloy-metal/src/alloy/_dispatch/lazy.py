@@ -459,10 +459,8 @@ class Materializer:
         (e.g. a multi-layer conformer once `constant_pad_nd`/`unfold` stay lazy)
         chains thousands of ops deep and overflows Python's recursion limit, so
         an explicit stack replaces the call stack. `_done` is set on first
-        encounter (pre-order) to dedup shared sub-DAGs, exactly as the recursive
-        form did; `out.append` happens on the post-visit so every input lands
-        ahead of its consumer. `synced` is de-duped by the caller, so the
-        order it accumulates buffers in is irrelevant."""
+        encounter (pre-order) to dedup shared sub-DAGs; `out.append` happens on
+        the post-visit so every input lands ahead of its consumer."""
         stack: list[tuple[Materializer, bool]] = [(self, False)]
         while stack:
             node, post = stack.pop()

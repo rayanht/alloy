@@ -32,9 +32,9 @@ class ControlEmitterMixin:
             if loc.kind not in ("local_array", "shared"):
                 init_expr = self._get(init_val)
                 if init_expr != init_val.name:
-                    # Init is an alias to another variable — declare a fresh copy
-                    # to avoid aliasing (e.g. `acc = x; for: acc = acc + x`
-                    # would modify x without this).
+                    # Init aliases another variable — declare a fresh copy to
+                    # avoid aliasing (e.g. `acc = x; for: acc = acc + x` would
+                    # otherwise modify x).
                     self._emit(f"{self._acc_dtype} {init_val.name} = {init_expr};")
                     self._exprs[init_val.name] = init_val.name
 
@@ -173,7 +173,7 @@ class ControlEmitterMixin:
 
         self._emit_ops(op.body)
 
-        # Carried updates — simultaneous via temporaries to avoid order-dependent bugs
+        # Carried updates — simultaneous via temporaries to avoid order dependence
         temps = []
         for init_val, final_val in op.carried:
             if init_val.name in self._scalar_pmma_acc_names:
@@ -211,9 +211,7 @@ class ControlEmitterMixin:
         # Back-edge race: if the body leaves shmem "dirty" (row-guarded scalar op
         # writes/reads) or has a deferred cooperative-load barrier, iter N's tail
         # can collide with iter N+1's prologue (e.g. a coop load that overwrites
-        # the tile being read). The linear emission order hides this — the body's
-        # first op was emitted before the flag was set by the body's last op.
-        # Fire a barrier at the end of each iteration to sync the boundary.
+        # the tile being read). Fire a barrier at each iteration's end.
         if self._scalar_shmem_dirty or self._pending_tg_barrier:
             self._emit("threadgroup_barrier(mem_flags::mem_threadgroup);")
             self._scalar_shmem_dirty = False

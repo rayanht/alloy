@@ -1,5 +1,5 @@
 """`alloy show <model>` — metadata for one model, read straight from disk
-(Ollama store / HuggingFace cache / local path). GGUF and MLX. No server."""
+(Ollama store / HuggingFace cache / local path). GGUF and MLX."""
 
 from __future__ import annotations
 

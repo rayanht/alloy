@@ -1,11 +1,11 @@
 """Extern-KV write registry: liveness roots for side-effect cache writes.
 
-The lazy collector only keeps ops reachable from the graph outputs, so a
-cache write whose value is never read in-plan is silently dead-code-
-eliminated — the sliding-window cold prefill hits this when chunk > window
-(the attend reads the linear temp copy, not the ring). Handlers register the
-written cache buffers here; the backend drains the list at graph OUTPUT and
-materializes them alongside the outputs so the write lands in the plan.
+The lazy collector only keeps ops reachable from the graph outputs, so a cache
+write whose value is never read in-plan is dead-code-eliminated (the
+sliding-window cold prefill hits this when chunk > window: the attend reads the
+linear temp copy, not the ring). Handlers register the written cache buffers
+here; the backend drains the list at graph OUTPUT and materializes them so the
+write lands in the plan.
 """
 
 from __future__ import annotations

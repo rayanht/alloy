@@ -1,16 +1,14 @@
 """Port-collision detection (spec §7.4) + clean-error regression.
 
-Two server launch regressions:
+Pins two failure modes:
 
   1. When the bind port is already taken, `socketserver` calls
-     `self.server_close()` on the half-constructed instance — any
-     attribute that cleanup path touches must exist before
-     `super().__init__()`, or the port collision surfaces as an
-     unhelpful AttributeError. This test pins clean failure.
+     `self.server_close()` on the half-constructed instance — any attribute
+     that cleanup path touches must exist before `super().__init__()`, or the
+     collision surfaces as an unhelpful AttributeError instead of a clean error.
 
-  2. We weren't detecting an Ollama squatter at all — launchd just
-     crash-looped on `OSError: Address already in use`. Spec §7.4
-     requires us to probe `/api/version` and emit a clear error.
+  2. A squatter on the port is probed at `/api/version` so the error names what
+     it is (Ollama / another alloy / non-HTTP) and the right remediation.
 """
 
 from __future__ import annotations
@@ -119,10 +117,9 @@ def test_ollama_on_port_raises_with_actionable_message(
 def test_alloy_squatter_reports_alloy_self_collision(
     alloy_squatter: int,
 ) -> None:
-    """Another alloy server answers `/api/version` with `*-alloy` —
-    we must NOT call this Ollama OR "another process (not Ollama)";
-    those messages confused users who hit a stale server. The
-    alloy-self branch points them at the right remediation."""
+    """Another alloy server answers `/api/version` with `*-alloy` — the error
+    must NOT call this Ollama or a generic "another process (not Ollama)"; the
+    alloy-self branch points at the right remediation."""
     with pytest.raises(PortCollisionError) as info:
         check_port_collision("127.0.0.1", alloy_squatter)
     message = str(info.value)

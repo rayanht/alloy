@@ -2,8 +2,8 @@
 table. The rotate_half layout makes emb = cat(freqs, freqs), so the cos/sin
 table's two halves are equal; the self-cat strip rewrite drops the duplication
 and runs the kernel with HALF_COS=1 (half-width table, stride HALF_ROT, second
-half re-reads the first). This proves that path matches the full table exactly,
-for both full rotary (ROTARY_DIM==0) and partial rotary (ROTARY_DIM>0)."""
+half re-reads the first). Covers both full rotary (ROTARY_DIM==0) and partial
+rotary (ROTARY_DIM>0)."""
 
 import numpy as np
 import pytest

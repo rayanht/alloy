@@ -1,11 +1,10 @@
-"""GGUF causal-LM load orchestrator + the Qwen3.5-MoE expert install.
+"""GGUF causal-LM load orchestrator.
 
 `load_causal_lm(source, hooks)` walks the GGUF tensor table, swaps quantized
 Linear/Embedding modules in (`gguf.quant`), attaches the tokenizer
 (`gguf.tokenizer`), and runs the arch-specific steps through the `CausalLMHooks`
-the caller injects (the `models/` ModelHandler) — config fixup, tensor-map fixup,
-expert install (`post_load`), chat template, vision/audio adapters,
-allowed-missing-keys. No arch dispatch lives here; the loader is pure mechanics.
+the caller injects: config fixup, tensor-map fixup, expert install (`post_load`),
+chat template, vision/audio adapters, allowed-missing-keys.
 """
 
 from __future__ import annotations
@@ -52,10 +51,9 @@ logger = get_logger("alloy_server.gguf")
 
 
 class CausalLMHooks(Protocol):
-    """The arch-specific steps the loader delegates. Implemented by the `models/`
-    ModelHandler and injected into `load_causal_lm`; the loader itself has no arch
-    dispatch. `config_fixup` runs at metadata-build time (it needs the GGUFReader
-    and its result is cached); the rest run per load."""
+    """The arch-specific steps the loader delegates. `config_fixup` runs at
+    metadata-build time (it needs the GGUFReader and its result is cached); the
+    rest run per load."""
 
     def config_fixup(self, config_dict: dict, reader: gguf.GGUFReader) -> None: ...
 
@@ -89,12 +87,10 @@ class LoadedGGUFCausalLM:
     model: PreTrainedModel
     tokenizer: PreTrainedTokenizerBase | None
     report: GGUFLoadReport
-    # The dense vision front-end for multimodal GGUFs (gemma4), else None. Built by
-    # the handler's `build_vision` hook so the serving layer never special-cases a
-    # model. Typed `object` because `ModalityEncoder` lives in `models/` (which
-    # this package must not import); it is a `models.modality.ModalityEncoder`.
+    # The dense vision front-end for multimodal GGUFs (gemma4), else None. Typed
+    # `object` because `ModalityEncoder` lives in `models/`.
     vision: object | None = None
-    # The dense audio front-end (gemma4 Conformer), else None — same protocol shape.
+    # The dense audio front-end (gemma4 Conformer), else None.
     audio: object | None = None
 
 
@@ -130,22 +126,19 @@ def load_gguf_causal_lm(
         raise TypeError(f"GGUF config model_type must be a string, got {model_type_value!r}")
 
     config = AutoConfig.for_model(model_type_value, **config_dict)
-    # Multimodal GGUFs (gemma4: text + vision + audio) map to a COMPOSITE config
-    # (text_config + vision_config + audio_config), but the GGUF metadata is a FLAT
-    # dict describing only the text decoder. Rebuild the decoder directly from the
-    # flat dict via the text sub-config's own model_type so every GGUF dim lands on
-    # the text config. Text-only GGUFs parse to a flat config with no text_config,
-    # so this is a no-op for them.
+    # Multimodal GGUFs (gemma4) map to a COMPOSITE config (text + vision + audio),
+    # but the GGUF metadata is a FLAT dict describing only the text decoder. Rebuild
+    # the decoder from the flat dict via the text sub-config's model_type so every
+    # GGUF dim lands on the text config. Text-only GGUFs have no text_config (no-op).
     if hasattr(config, "text_config"):
         text_model_type = config.text_config.model_type
         config = AutoConfig.for_model(text_model_type, **config_dict)
-    # GGUF tensors overwrite every weight a moment later, so allocating the
-    # full-precision skeleton is pure waste — and at scale catastrophic (a 35B
-    # f32/f16 skeleton is 70-140 GB held until each tensor is replaced).
-    # `init_empty_weights(include_buffers=False)` puts every PARAMETER on meta
-    # (no storage) while leaving BUFFERS real and computed — so rotary `inv_freq`
-    # and friends, which the GGUF doesn't carry, are still correct. The quant
-    # replacement loop + `load_state_dict(assign=True)` attach the real storage.
+    # GGUF tensors overwrite every weight, so allocating the full-precision
+    # skeleton is waste — at scale catastrophic (a 35B f32/f16 skeleton is
+    # 70-140 GB). `init_empty_weights(include_buffers=False)` puts every PARAMETER
+    # on meta (no storage) while leaving BUFFERS real and computed — so rotary
+    # `inv_freq` and friends, which the GGUF doesn't carry, are still correct. The
+    # quant replacement loop + `load_state_dict(assign=True)` attach real storage.
     with no_init_weights(), init_empty_weights(include_buffers=False):
         model = cast(PreTrainedModel, AutoModelForCausalLM.from_config(config))
 
@@ -207,16 +200,13 @@ def load_gguf_causal_lm(
     if tokenizer_pool is not None:
         tokenizer_pool.shutdown(wait=False)
 
-    # Some GGUFs carry no chat_template (gemma4: ollama renders it with a built-in
-    # Go renderer). The handler supplies the bundled template; attach it only if
-    # the tokenizer didn't already carry one.
+    # Some GGUFs carry no chat_template (gemma4). The handler supplies a bundled
+    # template; attach it only if the tokenizer didn't already carry one.
     chat_template = hooks.chat_template()
     if chat_template is not None and tokenizer is not None and not tokenizer.chat_template:
         tokenizer.chat_template = chat_template
 
-    # Multimodal GGUFs carry dense vision/audio towers alongside the text decoder.
-    # The handler builds the adapters (returns None for text-only / non-mm archs)
-    # so the serving layer consumes them generically.
+    # The handler builds the vision/audio adapters (None for text-only archs).
     vision = hooks.build_vision(tensors, parsed.get("vision_metadata", {}), model, tokenizer)
     audio = hooks.build_audio(tensors, parsed.get("audio_metadata", {}), model)
 

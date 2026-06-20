@@ -95,9 +95,8 @@ def _attention_cache_q8_handler(
 
     # --- durable write (prefill only): bulk-quantize the chunk's K/V rows.
     # Decode fuses the single-token quantize into the attention kernel
-    # (WRITE_KV) — two standalone dispatches per layer per step measurably
-    # dragged tpot below fp16 while the kernel itself was at parity.
-    # write_kv=False is the gemma4 KV-shared read: the source layer already
+    # (WRITE_KV) — two standalone dispatches per layer per step drag tpot below
+    # fp16. write_kv=False is the gemma4 KV-shared read: the source layer already
     # quantize-wrote this step; new_k/new_v are throwaway views, never read.
     if write_kv and seq_len > 1:
         for new, codes_root, scales_root in (
@@ -127,13 +126,12 @@ def _attention_cache_q8_handler(
                 note_extern_kv_write(root)
         # Materialize fallback: history + the just-quantized chunk
         # ([0, chunk_start + seq_len)) dequantize into fp16 scratch in cache
-        # layout; the stock cache-attention path runs READ-ONLY against it.
-        # Single writer per scratch by design: a write_kv=True delegation
-        # would queue attention_kv_write as a second writer through its own
-        # root views, shadowing the dequant's materializer on the shared
-        # storage — the lazy collector follows buffers' CURRENT materializers,
-        # not the queue-time input_producers snapshot, and silently drops the
-        # dequant.
+        # layout; the stock cache-attention path runs read-only against it.
+        # Single writer per scratch: a write_kv=True delegation would queue
+        # attention_kv_write as a second writer through its own root views,
+        # shadowing the dequant's materializer on the shared storage — the lazy
+        # collector follows buffers' current materializers, not the queue-time
+        # input_producers snapshot, and silently drops the dequant.
         k_scratch = _alloc_scratch((1, kv_heads, s_max, head_dim), float16)
         v_scratch = _alloc_scratch((1, kv_heads, s_max, head_dim), float16)
         for codes_root, scales_root, scratch in (
@@ -175,9 +173,9 @@ def _attention_cache_q8_handler(
         custom_scale = float(scale)
 
     # Mirror the fp16 path's _q_to_cache_dtype contract: Q (and with it the
-    # partials and the attention OUTPUT) goes fp16, so downstream o_proj GEMVs
+    # partials and the attention output) goes fp16, so downstream o_proj GEMVs
     # see the same activation dtype/configs as the fp16 path. Leaving Q fp32
-    # propagated f32 activations into 36 tuned-for-fp16 GEMVs per step.
+    # propagates f32 activations into the tuned-for-fp16 GEMVs.
     if q._dtype.itemsize == 4:
         q = _to_copy(q, dtype=torch.float16)
     q_strides, q_offset = _strides_elems(q)

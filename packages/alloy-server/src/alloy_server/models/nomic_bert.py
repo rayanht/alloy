@@ -14,7 +14,7 @@ This module is just a GGUF→HF state_dict adapter:
   5. Wrap forward with mean-pool + L2 normalize → `EmbeddingModel`.
 
 Tokenizer: rebuild a BERT WordPiece tokenizer from the GGUF token list
-via `tokenizers.WordPiece` — no HF download.
+via `tokenizers.WordPiece`.
 """
 
 from __future__ import annotations
@@ -39,20 +39,12 @@ from alloy_server.models.registry import register
 
 SPACE_MARKER = "▁"  # SPM ▁ — word-start marker used by nomic-bert's GGUF vocab
 
-# Bucketed (batch, seq) shapes the loader pre-compiles at startup. Embedding is
-# single-shot (no chunked prefill like the chat path), so it pads to a fixed set
-# of seq buckets: every alloy.compile is shape-specific (`dynamic=False`), so
-# unique sequence lengths each pay the FX/MSL compile cost on first sight; padding
-# `embed()` up to
-# the nearest seq bucket means every real request hits a hot kernel.
-#
-# Two regimes covered:
-#   batch=1: full seq range up to the model's 2048 ceiling — dominates
-#            single-shot retrieval / agentic / RAG-query usage.
-#   batch=8: short-to-medium seq only — bulk indexing of short
-#            passages. Larger (batch, seq) combos OOM under fp16
-#            attention scores; bigger batches drop to the slow path
-#            (alloy compile on first sight per shape, then cached).
+# Bucketed (batch, seq) shapes the loader pre-compiles at startup. Every
+# alloy.compile is shape-specific (`dynamic=False`), so padding `embed()` up to the
+# nearest bucket means real requests hit a hot kernel. batch=1 covers the full seq
+# range to the 2048 ceiling (single-shot retrieval / RAG-query); batch=8 covers
+# short-to-medium seq (bulk indexing) — larger (batch, seq) combos OOM under fp16
+# attention scores and drop to the compile-on-first-sight slow path.
 EMBED_PRECOMPILE_SHAPES: tuple[tuple[int, int], ...] = (
     (1, 32),
     (1, 128),
@@ -146,13 +138,9 @@ class NomicTokenizer:
 
 
 class LastHiddenStateOnly(torch.nn.Module):
-    """Thin wrapper: NomicBertModel returns a BaseModelOutputWithPooling
-    dataclass; after AOT autograd the flat output tuple has multiple
-    entries (last_hidden_state, possibly pooler_output, attention biases).
-    Wrapping to single-tensor output keeps the compiled-plan output index
-    trivial — `_execute_plan` returns the tensor directly when the FX
-    graph has one output, no need to track which slot is the embedding.
-    """
+    """Wraps NomicBertModel to a single-tensor output (last_hidden_state). After
+    AOT autograd the flat output tuple has multiple entries; a single output keeps
+    the compiled-plan output index trivial (`_execute_plan` returns it directly)."""
 
     def __init__(self, base: torch.nn.Module) -> None:
         super().__init__()
@@ -164,14 +152,10 @@ class LastHiddenStateOnly(torch.nn.Module):
 
 @dataclass(slots=True)
 class PinnedBucket:
-    """Per-(batch, seq) pinned plan + reusable input storage.
-
-    The chat path's analog is `AlloyGenerator.plans.prefill_plans`: at
-    request time we copy real inputs INTO the pinned tensors and call
-    `_execute_plan(plan, args)` directly, never crossing the torch.compile
-    wrapper, dynamo guards, or AOT autograd. The C++ extension dispatches
-    one Metal command buffer per request.
-    """
+    """Per-(batch, seq) pinned plan + reusable input storage. Request time copies
+    real inputs into the pinned tensors and calls `_execute_plan(plan, args)`
+    directly, never crossing the torch.compile wrapper, dynamo guards, or AOT
+    autograd."""
 
     batch: int
     seq: int
@@ -197,11 +181,10 @@ class NomicMeta:
 class NomicForward:
     """The compiled (or eager) nomic-bert forward plus its tokenizer/meta.
 
-    Shared seam between production (`load_ollama_gguf_embedder`, which pins
-    request buckets and adds mean-pool/normalize) and the capture path
-    (`alloy profile` / `alloy inspect`, which profiles a chosen shape). Both
-    drive this identical compiled `forward`, so captured plans / MSL match
-    exactly what the server dispatches — never an idealized re-derivation.
+    Shared between production (`load_ollama_gguf_embedder`, which pins request
+    buckets and adds mean-pool/normalize) and the capture path (`alloy profile` /
+    `alloy inspect`, which profiles a chosen shape). Both drive this identical
+    compiled `forward`, so captured plans / MSL match what the server dispatches.
 
     `forward` is the `torch.compile(..., backend='alloy', dynamic=False)`
     wrapper (or the raw `wrapped` module when `compile_backend is None`).
@@ -308,10 +291,9 @@ def load_ollama_gguf_embedder(
     tokenizer = nf.tokenizer
     pad_id = nf.pad_id
 
-    # The hot path. For every shape we'll see at request time we pre-
-    # allocate stable input storage + bind a CompiledPlan, then dispatch
-    # via `_execute_plan` — no torch.compile, no dynamo, no FX walk in
-    # the request thread. Mirrors `AlloyGenerator.plans.prefill_plans`.
+    # For every request-time shape, pre-allocate stable input storage + bind a
+    # CompiledPlan, then dispatch via `_execute_plan` — no torch.compile, no dynamo,
+    # no FX walk in the request thread.
     pinned_buckets: dict[tuple[int, int], PinnedBucket] = {}
     embed_lock = threading.Lock()
 
@@ -360,10 +342,8 @@ def load_ollama_gguf_embedder(
                         input_ids=ids_tensor, attention_mask=mask_tensor,
                     )
 
-        # `last_hidden` shape is (bucket_batch, seq, hidden) — slice to
-        # the real batch BEFORE pooling so padded rows don't dilute
-        # token statistics (they wouldn't, because their mask is 0, but
-        # the slice also saves a few FLOPs).
+        # `last_hidden` is (bucket_batch, seq, hidden) — slice to the real batch
+        # before pooling (padded rows have mask 0; the slice saves a few FLOPs).
         if last_hidden.shape[0] != real_batch:
             last_hidden = last_hidden[:real_batch]
             mask_for_pool = mask_tensor
@@ -471,12 +451,8 @@ def eager_compile_embed_with_pinning(
     """For every (batch, seq) bucket: allocate stable input storage,
     run the compiled wrapper TWICE (first call builds the plan; second
     routes through `_execute_plan` and captures the args tuple), then
-    pin (plan, args) into `pinned_buckets`.
-
-    This matches `AlloyGenerator.eager_compile_all` + `pin_prefill_plan`
-    on the chat path. Request time hits the pinned plan via
-    `_execute_plan(plan, args)` directly — zero PyTorch, zero Dynamo.
-    """
+    pin (plan, args) into `pinned_buckets`. Request time then hits the pinned
+    plan via `_execute_plan(plan, args)` directly."""
     started = time.monotonic()
     pinned_shapes: list[tuple[int, int]] = []
     skipped_shapes: list[tuple[int, int]] = []

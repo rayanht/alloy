@@ -39,8 +39,7 @@ from alloy._runtime.metal import default_dispatcher
 
 logger = get_logger("alloy.dispatch")
 
-# Zero-cost timing returned when a dispatch is recorded but not executed
-# (record-only compile). Never mutated.
+# Timing returned when a dispatch is recorded but not executed (record-only compile).
 _EMPTY_TIMING: dict[str, float] = {"gpu": 0.0, "encode": 0.0, "wait": 0.0, "copy": 0.0}
 
 if TYPE_CHECKING:
@@ -180,8 +179,8 @@ class DispatchEngine:
 
             self._record_for_plan(dispatches)
             fusion_ms = (time.perf_counter_ns() - _t) / 1e6 if _p else 0.0
-            # Record-only compile: the plan is already recorded; skip the GPU
-            # dispatch (phantom intermediates have no MTLBuffer to bind).
+            # Record-only compile: plan already recorded; skip GPU dispatch
+            # (phantom intermediates have no MTLBuffer to bind).
             timing = (
                 _EMPTY_TIMING if is_record_only()
                 else _group_and_dispatch(dispatches, ops, op_indices_list)
@@ -271,8 +270,6 @@ class DispatchEngine:
         """Record dispatches for the compiled plan (C++ dispatch_plan)."""
         if self._plan_record is None or self._plan_record_paused:
             return
-        # Local import keeps _dispatch.py independent of the runtime layer
-        # until plan recording is actually engaged.  # scoped: avoid cycle
         from alloy._runtime.metal import CompiledKernel, pso_source  # scoped: leaf util
 
         for dispatch in dispatches:

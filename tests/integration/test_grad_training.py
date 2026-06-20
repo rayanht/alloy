@@ -118,10 +118,9 @@ class TestTrainingLoop:
             assert got[i] != got[i - 1], f"loss frozen at step {i}: {got}"
 
     def test_embedding_lm_trajectory(self):
-        # Embedding + linear head + cross-entropy: the embedding backward
-        # scatter-adds via an atomic store (sum order non-deterministic at
-        # f32-ULP), so the loss tracks eager within a loose band rather than
-        # bit-exactly.
+        # The embedding backward scatter-adds via an atomic store (sum order
+        # non-deterministic at f32-ULP), so the loss tracks eager within a
+        # loose band rather than bit-exactly.
         ref = _train_ce(_lm, _lm_data, backend="cpu", steps=10, lr=0.1)
         got = _train_ce(_lm, _lm_data, backend="alloy", steps=10, lr=0.1)
         assert all(v == v for v in got), f"alloy LM training produced NaN: {got}"

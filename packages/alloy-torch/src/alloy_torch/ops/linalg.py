@@ -307,10 +307,9 @@ def _alloy_dot_silu_handler(
         # GEMV regime: the fused kernel's shared activation load wins.
         return _dot_transpose_rhs_silu(x, gate_base, up_base, out, N_GATE=gate_cols)
     # Tiled: two singles + silu_mul beat the fused dual-accumulator kernel
-    # (measured 1.05-1.07x fused/2×single at M=512/4096 — same 3-shmem-tile +
-    # 2× acc-register occupancy cost as the quant families). The explicit
-    # silu_mul out keeps the handler's output dtype (f16 in; auto-alloc
-    # would promote to f32).
+    # (1.05-1.07x at M=512/4096 — 3-shmem-tile + 2× acc-register occupancy cost).
+    # The explicit silu_mul out keeps the handler's output dtype (auto-alloc
+    # would promote f16 to f32).
     gate_out = _alloc_scratch((rows, gate_cols), x.dtype)
     silu_out = _alloc_scratch((rows, gate_cols), x.dtype)
     g = _dot_transpose_rhs(x, gate_base, gate_out)
@@ -356,8 +355,8 @@ def _alloy_gguf_q8_0_mm_handler(
         nr0 = 4 if N % 4 == 0 else (2 if N % 2 == 0 else 1)
         return _dot_q8_0_v2[(N // nr0,)](activations, qweight, scales, out, NR0=nr0)
     if M <= 4 and qweight.shape[1] % 256 == 0:
-        # Small-M (MTP propose): dequant once, read weights once, all rows.
-        # At M >= 8 the tiled GEMM wins (rows is issue-bound: one program per
+        # Small-M (MTP propose): dequant once, read weights once, all rows. At
+        # M >= 8 the tiled GEMM wins (rows is issue-bound: one program per
         # output column).
         return _dot_q8_0_v2_rows[(N,)](activations, qweight, scales, out)
     return _dot_q8_0(activations, qweight, scales, out)
@@ -391,12 +390,11 @@ def _alloy_gguf_q8_0_silu_handler(
             out,
         )
     # Tiled prefill path: two SINGLE GEMMs + silu-mul beat the fused
-    # dual-accumulator kernel by ~9% (measured M=512: 2×1349 vs 2955µs;
-    # M=4096: 2×10192 vs 22826µs, 13.5 vs 12.0 TFLOPS) — the fused form
-    # holds 3 shmem tiles + 2× the acc registers, costing more in occupancy
-    # than the shared A pass saves. The GEMV paths above keep the fusion
-    # (the shared activation load dominates at M ≤ 8). silu_mul's expression
-    # matches the fused epilogue exactly, so the output is bit-identical.
+    # dual-accumulator kernel by ~9% (M=512: 2×1349 vs 2955µs; M=4096:
+    # 2×10192 vs 22826µs, 13.5 vs 12.0 TFLOPS) — the fused form holds 3 shmem
+    # tiles + 2× the acc registers, costing more in occupancy than the shared A
+    # pass saves. The GEMV paths above keep the fusion (the shared activation
+    # load dominates at M ≤ 8).
     gate_out = _alloc_scratch((M, N), activations.dtype)
     g = _dot_q8_0(activations, gate_qweight, gate_scales, gate_out)
     u = _dot_q8_0(activations, up_qweight, up_scales, out)
@@ -436,8 +434,8 @@ def _alloy_gguf_q5_0_mm_handler(
             activations, qweight, qhigh, scales, out, NR0=nr0,
         )
     # Prefill chunks (M>1): tiled GEMM so the dequantized weight tile is read
-    # once and reused across all BLOCK_M rows. The matvec above reloads the
-    # full weight matrix per row, which dominated prefill GPU time at M=128.
+    # once and reused across all BLOCK_M rows (the matvec reloads the full
+    # weight matrix per row).
     return _dot_q5_0(activations, qweight, qhigh, scales, out)
 
 
@@ -463,7 +461,7 @@ def _alloy_gguf_q5_0_embedding_handler(
 
 def _q4k_matvec_cfg(N: int) -> tuple[int, int]:
     """(NSG, NR0) for the native Q4_K decode matvec — N % (NSG*NR0) must be 0.
-    Validated defaults (kernel_bench, M4 Max): NR0=2/NSG=2 for the plain matvec."""
+    Default NR0=2/NSG=2 (M4 Max)."""
     if N % 4 == 0:
         return 2, 2
     if N % 2 == 0:
@@ -473,7 +471,7 @@ def _q4k_matvec_cfg(N: int) -> tuple[int, int]:
 
 def _q4k_fused_cfg(N: int) -> tuple[int, int]:
     """(NSG, NR0) for the native Q4_K gate+up fused matvec (silu/gelu) —
-    validated default NR0=1/NSG=2."""
+    default NR0=1/NSG=2."""
     if N % 2 == 0:
         return 2, 1
     return 1, 1
@@ -494,7 +492,7 @@ def _alloy_gguf_q4_k_mm_handler(
     if M <= 4:
         # Small-M only: the rows GEMV is issue-bound (one program per output
         # column); at the DFlash verify width (M >= 8) the tiled GEMM is
-        # 1.3-2.4x faster at identical fidelity vs the M=1 decode reference.
+        # 1.3-2.4x faster.
         return _dot_q4_k_v2_rows[(N,)](activations, blocks, out)
     return _dot_q4_k(activations, blocks, out)
 
@@ -772,8 +770,8 @@ def _alloy_gguf_q4_k_silu_handler(
         # Small-M only — see the q4_k mm route note above.
         return _dot_q4_k_silu_v2_rows[(N,)](activations, gate_blocks, up_blocks, out)
     # Tiled prefill path: two single GEMMs + silu_mul beat the fused
-    # dual-accumulator kernel (measured 1.06-1.09x fused/2×single at
-    # M=512/4096) — same occupancy mechanism as the q8_0 unfuse above.
+    # dual-accumulator kernel (1.06-1.09x at M=512/4096) — same occupancy
+    # mechanism as the q8_0 unfuse above.
     gate_out = _alloc_scratch((M, N), activations.dtype)
     g = _dot_q4_k(activations, gate_blocks, gate_out)
     u = _dot_q4_k(activations, up_blocks, out)
@@ -822,12 +820,11 @@ def _pack_weight(w: AlloyBuffer, block_n: int, block_k: int) -> AlloyBuffer:
 
 # Only pad large M. The bounds-checked partial-M-tile path corrupts only for a
 # large M inside a deep f16 graph (gemma4 vision: 2520-patch encoder, 280-token
-# pooler); a small M is correct on the bounds path (verified against the eager
-# reference for gpt2 / tiny models), so padding it is both unnecessary and
-# harmful — the un-padded residual/elementwise that consumes the GEMM output
-# then shape-mismatches the padded rows under epilogue fusion. Text never has a
-# large non-aligned M (prefill chunks at 128, decodes at 1), so this is
-# vision-only in practice.
+# pooler); a small M is correct on the bounds path, so padding it is both
+# unnecessary and harmful — the un-padded residual/elementwise that consumes the
+# GEMM output then shape-mismatches the padded rows under epilogue fusion. Text
+# never has a large non-aligned M (prefill chunks at 128, decodes at 1), so this
+# is vision-only in practice.
 _PAD_M_MIN = 256
 
 
@@ -839,13 +836,11 @@ def _pad_m_to_tile(buf: AlloyBuffer, m_axis: int) -> tuple[AlloyBuffer, int]:
     non-bounds-checked GEMM path. The masked partial-last-M-tile codegen
     corrupts f16 output inside a large dispatch graph (gemma4 vision
     o_proj/MLP at M=2520, the pooler at M=280): the kernel is correct in
-    isolation and at M % 64 == 0, the input is finite, there is no buffer
-    aliasing and the barriers are right, yet the full encoder forward emits
+    isolation and at M % 64 == 0, yet the full encoder forward emits
     all-NaN/all-zero — a memory-layout-dependent hazard in the divergent
-    partial-tile path that only the fast path avoids (a CPU touch of the input
-    buffer also masked it). 64 is the largest BLOCK_M, so every resolved
-    config tiles the padded M exactly. No-op for already-aligned M and for
-    M < `_PAD_M_MIN` (see that constant for why small M is left alone).
+    partial-tile path that only the fast path avoids. 64 is the largest
+    BLOCK_M, so every resolved config tiles the padded M exactly. No-op for
+    already-aligned M and for M < `_PAD_M_MIN`.
     """
     m = buf.shape[m_axis]
     m_pad = (-m) % 64
@@ -902,8 +897,7 @@ def _mm(lhs: AlloyBuffer, rhs: AlloyBuffer) -> AlloyBuffer:
             block_k = config.constexprs.get("BLOCK_K", 16)
             # Never pack under a matvec config: the kernel branches on _matvec
             # BEFORE _PACKED, so the matvec body would read the (BN,BK)-tiled
-            # packed weight as row-major — silent garbage. (Found via DFlash:
-            # the tuned M=8 matvec entry passed the 512-footprint gate.)
+            # packed weight as row-major — silent garbage.
             if (
                 not config.constexprs.get("_matvec")
                 and cols % block_n == 0

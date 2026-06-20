@@ -5,8 +5,7 @@
 Fires the dialect corpus at the current server with stub models and writes the
 normalized records to `wire_golden.json`. `test_wire_golden.py` replays the same
 corpus and asserts equality. Re-run this ONLY when a wire-format change is
-intended (and explain why in the commit) — an accidental rerun would bless a
-regression.
+intended.
 """
 
 from __future__ import annotations

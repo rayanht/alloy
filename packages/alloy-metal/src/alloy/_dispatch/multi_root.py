@@ -165,7 +165,7 @@ def _grow_island(
                 stack.append(pi)
             # Siblings sharing this producer are reachable even when the producer
             # itself is non-fusable (e.g. cos & sin both read the `cat`/emb
-            # output — their only common node is the non-fusable concat). The
+            # output, whose only common node is the non-fusable concat). The
             # loop-top fusability/grid guards drop the non-fusable consumers.
             for sib in consumed_by.get(pi, []):
                 if sib not in island:
@@ -312,9 +312,9 @@ def find_islands(
         if not wb:
             continue  # nothing observable — dead island
         # min_size leaves small LINEAR chains (1 writeback) to ELEM_CHAIN, but a
-        # multi-OUTPUT fan-out (>=2 writebacks) is the multi-root mandate even at
-        # size 2 — e.g. sincos: cos+sin sharing one emb load, which ELEM_CHAIN's
-        # single-output linear model can't express. Admit those below min_size.
+        # multi-OUTPUT fan-out (>=2 writebacks) — e.g. sincos sharing one emb
+        # load — can't be expressed by ELEM_CHAIN's single-output linear model,
+        # so admit those below min_size.
         if len(island) < min_size and len(wb) < 2:
             continue
         order = _topo_sort(ops, island, op_idx)
@@ -331,10 +331,9 @@ def find_islands(
         # Sort-order guard: dispatch_entries are sorted by max(island_indices)
         # for fused groups. If any external op inside [min(island), max(island)]
         # reads a writeback's output buffer, it gets sorted BEFORE the fused
-        # dispatch and the dep-group builder then separates them — the external
+        # dispatch and the dep-group builder separates them — the external
         # consumer would land in an earlier group and read stale memory before
-        # the fused kernel writes. AdamW-like islands whose writebacks all sit
-        # near max(island) with consumers strictly after max(island) pass.
+        # the fused kernel writes.
         lo, hi = order[0], order[-1]
         wb_out_keys: set = set()
         for wb_idx in wb:
@@ -559,9 +558,9 @@ def compile_multi_root(
     offsets, mask = _find_preamble_values(func)
     tile_shape = offsets.shape
 
-    # Seed's Store: extract value, then drop. We re-emit stores for every
-    # writeback at the tail. The matcher guarantees the seed is not itself
-    # a writeback (see find_islands), so dropping here is always safe.
+    # Seed's Store: extract value, then drop. Stores are re-emitted for every
+    # writeback at the tail; the matcher ensures the seed is not itself a
+    # writeback, so dropping here is safe.
     seed_store = _find_ir_store(func)
     if seed_store is None or seed_store.value is None:
         raise FusionUnsupported("multi-root: seed op has no Store")

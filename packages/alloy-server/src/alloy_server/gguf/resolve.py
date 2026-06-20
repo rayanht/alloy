@@ -1,5 +1,5 @@
 """Model-reference resolution: local path / HuggingFace cache / Ollama store ->
-a concrete `.gguf` file on disk. Serving never downloads."""
+a concrete `.gguf` file on disk."""
 
 from __future__ import annotations
 

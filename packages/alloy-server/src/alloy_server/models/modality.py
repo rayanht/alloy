@@ -22,8 +22,7 @@ class CaptureTarget:
     `inputs` are fixed-shape representative kwargs (the shape is what tuning keys on,
     so dummy values are fine). `setup` warms any prerequisite state before the
     capture (e.g. a prefill before decode); the stateless vision stages leave it
-    None. This is the seam: each modality adapter yields its targets, and both CLIs
-    iterate them uniformly, so adding a modality needs no CLI changes."""
+    None."""
 
     name: str  # filename-safe slug, e.g. "vision_encode"
     label: str  # human label, e.g. "vision encode (patch + 16-layer ViT)"
@@ -53,9 +52,7 @@ class ModalityEncoder(Protocol):
         ...
 
     def eager_compile_all(self) -> None:
-        """Compile this modality's alloy plans ahead of the first real request —
-        the same verb as the text decoder's `AlloyGenerator.eager_compile_all`, so
-        every alloy-compiled component precompiles through one mental model."""
+        """Compile this modality's alloy plans ahead of the first real request."""
         ...
 
     def capture_targets(self) -> list[CaptureTarget]:

@@ -5,17 +5,15 @@ Conv3d-as-linear patch embed, interpolated learned 2D position embeddings,
 2D-RoPE bidirectional blocks, a 2×2 spatial merger) that the text-only loader
 dropped (see `models/qwen3_5.py:apply_qwen35_post_load_config_fixup`). This module
 loads those weights into transformers' native `Qwen3_5VisionModel` and runs the
-whole tensor compute through alloy's Metal dispatch — exactly like the gemma4
-ViT, reusing the same blockers it cleared (rope layout permute, additive masks,
-two-stage fusion split, compiled-plan bool rebind).
+whole tensor compute through alloy's Metal dispatch.
 
 The position-derived bookkeeping (the interpolated pos-embed, the 2D-RoPE
 cos/sin, the padding key-mask) is precomputed on CPU — the parts HF expresses as
 `linspace`/`tolist`/`cumsum` index math, which don't belong in a fixed-shape GPU
 plan — so the alloy graph is pure tensor compute (matmuls, attention, norms,
-the merger). Dynamic resolution is handled gemma4-style: pad the variable patch
-count to a fixed bucket and mask the padding keys; the merger's padding outputs
-are gathered off at the end.
+the merger). Dynamic resolution: pad the variable patch count to a fixed bucket
+and mask the padding keys; the merger's padding outputs are gathered off at the
+end.
 """
 
 from __future__ import annotations
@@ -76,8 +74,7 @@ def qwen35_vision_state_dict(
     Two structural transforms: the GGUF carries *separate* `attn_q/k/v` but HF
     wants a *combined* `qkv` (concat along the output dim), and the patch embed
     is a Conv3d whose flattened weight `(out, in, kT, kH, kW)` loads from the
-    GGUF's `(out, in·kT·kH·kW)` blob. Verified 1:1 against `Qwen3_5VisionModel`
-    (0 missing / 0 unexpected / 0 shape mismatches)."""
+    GGUF's `(out, in·kT·kH·kW)` blob."""
     data: dict[str, np.ndarray] = {}
     for t in tensors:
         if t.name.startswith("v."):
@@ -130,8 +127,7 @@ class Qwen35VitPatch(torch.nn.Module):
     so it's a per-patch projection). A separate alloy plan from the encoder: the
     patch GEMM's output feeds both `norm1→qkv` and the block residual, and fusing
     that reconvergence into the first block corrupts the encode — materializing
-    the patch+pos output between them keeps both exact (the same barrier the
-    encoder→merger split needs)."""
+    the patch+pos output between them keeps both correct."""
 
     def __init__(self, vision: Qwen3_5VisionModel) -> None:
         super().__init__()
@@ -147,13 +143,12 @@ class Qwen35VitEncode(torch.nn.Module):
     """Fixed-shape (bucketed) qwen3.5 ViT encoder: 24 bidirectional 2D-RoPE blocks
     over the patch+pos embeddings -> (1, bucket, hidden). The position bookkeeping
     (RoPE cos/sin, padding key-mask) is precomputed on CPU and passed in, so the
-    graph is pure tensor compute — one alloy plan, like the text decoder.
+    graph is pure tensor compute — one alloy plan.
 
     Attention uses F.scaled_dot_product_attention (alloy's fused kernel) with an
-    fp16-safe additive key-mask (see `MASK_NEG`). The fused kernel runs fp16, so
-    the encode is ~cosine-0.99 vs an fp32 reference rather than bit-exact — fine
-    for vision features (the text model is robust to it), and it avoids
-    materializing the (S×S) scores matrix per block."""
+    fp16-safe additive key-mask (see `MASK_NEG`). The fused kernel runs fp16
+    (~cosine-0.99 vs an fp32 reference) and avoids materializing the (S×S) scores
+    matrix per block."""
 
     def __init__(self, vision: Qwen3_5VisionModel) -> None:
         super().__init__()
@@ -193,8 +188,7 @@ class Qwen35VitMerge(torch.nn.Module):
     """Fixed-shape 2×2 spatial merger: encoder output (1, bucket, hidden) ->
     (bucket/merge_unit, out_hidden) language-model-space soft tokens. A separate
     alloy plan from the encoder so the encoder output materializes between them
-    — fusing the merger across the encoder boundary corrupts it (the same
-    two-stage split gemma4's pooler needed)."""
+    — fusing the merger across the encoder boundary corrupts it."""
 
     def __init__(self, vision: Qwen3_5VisionModel) -> None:
         super().__init__()
@@ -207,9 +201,8 @@ class Qwen35VitMerge(torch.nn.Module):
 class Qwen35VisionAdapter(ModalityAdapter):
     """Turns image bytes into qwen3.5 language-model-space vision features, and
     encodes qwen3.5's image-placeholder expansion. Implements the `ModalityEncoder`
-    protocol the served model consumes (model-agnostic server). Mirrors
-    `Gemma4VisionAdapter`: owns the dense ViT (loaded from the GGUF `v.*`
-    tensors, compiled through alloy) + the HF image processor.
+    protocol the served model consumes. Owns the dense ViT (loaded from the GGUF
+    `v.*` tensors, compiled through alloy) + the HF image processor.
 
     The chat template wraps each image as `<|vision_start|><|image_pad|>
     <|vision_end|>`; the inherited `expand_text` blows the single `<|image_pad|>`
@@ -224,9 +217,9 @@ class Qwen35VisionAdapter(ModalityAdapter):
         dtype: torch.dtype = torch.float32,
     ) -> None:
         config = build_qwen35_vision_config(vision_kv)
-        # Skip HF's random weight init: `load_state_dict(strict=True)` overwrites
-        # every parameter from the GGUF a moment later, so the normal_/uniform_
-        # fill (~2.5s for this tower) is pure waste.
+        # Skip HF's random weight init: load_state_dict overwrites every
+        # parameter from the GGUF, so the normal_/uniform_ fill (~2.5s for this
+        # tower) is pure waste.
         with no_init_weights():
             vision = Qwen3_5VisionModel(config).eval()
         vision.load_state_dict(
@@ -239,8 +232,7 @@ class Qwen35VisionAdapter(ModalityAdapter):
         self.merge = config.spatial_merge_size
         # Three compiled stages — patch+pos, encoder, merger — each materializing
         # between them. Both boundaries (patch→encoder and encoder→merger) corrupt
-        # if fused; in isolation every stage is bit-exact vs eager. The barriers
-        # are the same technique gemma4's encoder→pool split used.
+        # if fused.
         self.patch_mod = Qwen35VitPatch(vision)
         self.encode_mod = Qwen35VitEncode(vision)
         self.merge_mod = Qwen35VitMerge(vision)
@@ -272,8 +264,8 @@ class Qwen35VisionAdapter(ModalityAdapter):
         """Precompute (on CPU) the fixed-bucket inputs the alloy graph needs: the
         padded patch input, interpolated pos-embed, 2D-RoPE cos/sin, the padding
         key-mask, and the valid soft-token count. Uses the eager model's own
-        `fast_pos_embed_interpolate` / `rot_pos_emb` (pure index math) so the
-        bookkeeping is bit-identical to HF's."""
+        `fast_pos_embed_interpolate` / `rot_pos_emb` (pure index math) for the
+        bookkeeping."""
         s = int(pixel_values.shape[0])
         bucket = PATCH_BUCKET
         if s > bucket:
@@ -317,9 +309,8 @@ class Qwen35VisionAdapter(ModalityAdapter):
 
     def eager_compile_all(self) -> None:
         """Compile the three alloy vision plans (patch / encode / merge) ahead of
-        the first real request — the ViT input shape is the fixed bucket, so one
-        dummy image compiles them all. Same verb as the text decoder's
-        `AlloyGenerator.eager_compile_all`."""
+        the first request. The ViT input shape is the fixed bucket, so one dummy
+        image compiles them all."""
         self.encode(Image.new("RGB", (64, 64)))
 
     def capture_targets(self) -> list[CaptureTarget]:

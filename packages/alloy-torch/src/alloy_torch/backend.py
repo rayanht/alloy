@@ -47,37 +47,28 @@ logger = get_logger("alloy_torch.backend")
 
 _UNRESOLVED = object()
 
-_all_compiled_plans: list = []  # all plans compiled this session (for visualization)
+_all_compiled_plans: list = []  # for visualization
 
 
 @dataclass
 class CapturedPlan:
     """The (plan, args) a compiled module produced or executed inside a
-    `capture_plan()` scope.
-
-    `capture_plan()` binds a fresh slot for the duration of a `with` block;
-    every compiled-module call inside the block records ITS plan + args into
-    that slot (on both the compile and the replay path), so the caller gets
-    exactly the plan from the call(s) it just made."""
+    `capture_plan()` scope."""
 
     plan: "CompiledPlan | None" = None
     args: tuple | None = None
 
 
-# Stack of active capture slots. Compiled-module calls record into the innermost
-# (top-of-stack) slot only, so a nested capture (e.g. a verify warmup invoked
-# inside a broader scope) shadows cleanly without polluting the outer slot.
+# Compiled-module calls record into the innermost (top-of-stack) slot only.
 _capture_stack: list[CapturedPlan] = []
 
 
 @contextmanager
 def capture_plan() -> "Iterator[CapturedPlan]":
-    """Scope a (plan, args) capture. Any compiled-module invocation inside the
-    block records its executed plan + args into the yielded slot. The slot holds
-    the MOST RECENT such call's plan when the block exits — so wrap exactly the
-    warmup call(s) whose plan you want to pin (typically a run-0 build followed
-    by a run-1 execute, which leaves the slot holding the executed plan with its
-    `_cached_input_updates` populated)."""
+    """Scope a (plan, args) capture. The slot holds the MOST RECENT call's plan
+    when the block exits — wrap the warmup call(s) whose plan you want to pin
+    (typically a run-0 build then a run-1 execute, leaving the slot holding the
+    executed plan with `_cached_input_updates` populated)."""
     slot = CapturedPlan()
     _capture_stack.append(slot)
     try:
@@ -99,24 +90,21 @@ def _to_lazy_input(
 ) -> AlloyBuffer | tuple[AlloyBuffer, ...] | list[AlloyBuffer] | dict[str, AlloyBuffer]:
 
     if isinstance(value, torch.Tensor):
-        # Alloy represents bool as int32 internally, but a torch bool tensor is
-        # 1 byte/element. Binding its storage with an int32 dtype would read 4
-        # packed bool bytes as one int (0x01010101). Widen to a fresh int32 tensor
-        # (kept alive via _ext_ref below) so the storage matches the buffer dtype.
+        # Alloy bool is int32 internally; a torch bool tensor is 1 byte/element.
+        # Binding its storage with int32 would read 4 packed bool bytes as one int
+        # (0x01010101). Widen to int32 (kept alive via _ext_ref below).
         if value.dtype == torch.bool:
             value = value.to(torch.int32)
         # Use storage base ptr (not view data_ptr) so views of the same storage
-        # (e.g. Q/K/V from split QKV) share a single Metal buffer and the kernel
-        # can stride across the full allocation.
+        # (Q/K/V from split QKV) share a Metal buffer and the kernel can stride
+        # across the full allocation.
         storage = value.untyped_storage()
         ptr = storage.data_ptr()
         offset_bytes = value.storage_offset() * value.element_size()
         shape = tuple(value.shape)
         strides = tuple(s * value.element_size() for s in value.stride())
-        # Use from_torch_dtype (canonical) instead of the _interop numpy map,
-        # which silently falls back to float32 for types it doesn't list
-        # (bfloat16, uint16/32) and reinterprets the raw bytes at the wrong
-        # itemsize. AlloyBuffer.from_raw_ptr accepts a DType directly.
+        # from_torch_dtype handles bfloat16/uint16/32 that the numpy map would
+        # silently coerce to float32 at the wrong itemsize.
         dtype = from_torch_dtype(value.dtype)
         nbytes = storage.nbytes()
         lb = AlloyBuffer.from_raw_ptr(ptr, shape, strides, dtype, nbytes)
@@ -144,25 +132,21 @@ def _abv_to_torch(abv: AlloyBuffer) -> torch.Tensor:
         nbytes = elems * itemsize
         raw = (ctypes.c_uint8 * nbytes).from_address(abv.data_ptr)
         flat = torch.frombuffer(raw, dtype=torch_dt, count=elems)
-        # Keep the AlloyBuffer alive on the STORAGE so that alias/view ops
-        # (which share storage) also keep the Metal buffer from being freed.
+        # Keep the AlloyBuffer alive on the STORAGE so alias/view ops (sharing
+        # storage) also keep the Metal buffer from being freed.
         flat.untyped_storage()._alloy_ref = (abv, raw)
         if abv._shape != (elems,):
             return flat.reshape(abv._shape)
         return flat
 
-    # Non-contiguous.
+    # Non-contiguous. Default path is a numpy view + torch.from_numpy (numpy's
+    # as_strided tolerates strides that read past the backing storage, e.g. GQA
+    # K/V caches with a larger max-seq footprint).
     #
-    # Default path: numpy view + torch.from_numpy. Numpy's as_strided is
-    # lax about bounds — it'll happily return a view whose stride pattern
-    # "reads past" the backing storage (e.g. GQA K/V caches pre-allocated
-    # with a larger max-seq footprint). torch.from_numpy accepts that.
-    #
-    # bf16-only fallback: torch.from_numpy rejects ml_dtypes.bfloat16
-    # arrays, so for bf16 we build the view directly from the storage via
-    # torch.frombuffer + torch.as_strided. This path is strict about
-    # storage bounds, so we must size `flat` large enough to cover the
-    # furthest element the strides reach.
+    # bf16 fallback: torch.from_numpy rejects ml_dtypes.bfloat16, so build the
+    # view from storage via torch.frombuffer + torch.as_strided. That path is
+    # strict about bounds, so `flat` must cover the furthest element the strides
+    # reach.
     if torch_dt is torch.bfloat16:
         if abv._parent_handle >= 0:
             total_nbytes = _metal_ext.buf_nbytes(abv._parent_handle)
@@ -170,9 +154,8 @@ def _abv_to_torch(abv: AlloyBuffer) -> torch.Tensor:
         else:
             total_nbytes = abv._total_nbytes
             base_ptr = abv._raw_ptr
-        # Span required by the strided view in bytes: last addressable
-        # element + one more element. Plus abv._offset. Cap against the
-        # backing allocation so we never read past the buffer.
+        # Span the strided view reaches: last addressable element + one more,
+        # plus abv._offset, capped against the backing allocation.
         max_idx_bytes = abv._offset + sum(
             max(0, s - 1) * st for s, st in zip(abv._shape, abv._strides)
         ) + itemsize
@@ -482,10 +465,8 @@ def _extract_mutation_map(gm: torch.fx.GraphModule) -> dict[int, int]:
             continue
         desc = node.meta.get("desc")
         if desc is not None:
-            # AOT tags each placeholder with a description of its origin
-            # (ParamAOTInput, BufferAOTInput, PlainAOTInput). Use repr() as
-            # a stable key — the same description object identifies the
-            # same source in the output-mutation annotations below.
+            # AOT tags each placeholder with an origin description; repr() is a
+            # stable key matching the output-mutation annotations.
             source_to_arg_idx[repr(desc)] = arg_idx
         arg_idx += 1
 
@@ -504,9 +485,9 @@ def _extract_mutation_map(gm: torch.fx.GraphModule) -> dict[int, int]:
                 src_key = repr(mutated)
                 if src_key in source_to_arg_idx:
                     mutation_map[out_idx] = source_to_arg_idx[src_key]
-        # auto_functionalize.unwrap stamps a {out_idx → arg_idx} sidecar
-        # dict here when it unwraps HOPs (since AOT's `mutated_input`
-        # annotations are hidden inside the HOP and won't appear above).
+        # auto_functionalize.unwrap stamps a {out_idx → arg_idx} sidecar dict
+        # when it unwraps HOPs, since AOT's `mutated_input` annotations hide
+        # inside the HOP and won't appear above.
         sidecar = node.meta.get("alloy_auto_functionalized_mutations")
         if isinstance(sidecar, dict):
             for k, v in sidecar.items():
@@ -518,25 +499,13 @@ def _extract_mutation_map(gm: torch.fx.GraphModule) -> dict[int, int]:
 def _has_host_reachable_output(gm: torch.fx.GraphModule) -> bool:
     """True if the plan's tail gpu_sync is necessary.
 
-    AOT tags each output as InputMutation / SavedForBackwards / Grad /
-    None / Plain. A plan with ANY Plain output *might* feed a host
-    `.item()`, but in a training step the forward's Plain output
-    (logits, loss) is almost always consumed by the next compiled
-    region before any host read — the host reads only happen after
-    the last plan of the step (`opt.step()`). Syncing the intermediate
-    plans is pure waste.
-
-    Heuristic: sync only when there's no downstream compiled region
-    that will implicitly sync for us. We detect "no downstream" two
-    ways:
-      - Plain output WITHOUT any SavedForBackwardsAOTOutput: this is
-        a pure-forward exit (inference, or training with grad disabled)
-        — no bwd/opt will follow.
-      - All InputMutationAOTOutput: this is the optimizer-like tail of
-        a training step; user's `.item()` on the loss hits the wait
-        queue after this sync.
-    Mixed Plain+SavedForBackwards (the training fwd or loss subgraph)
-    defers to whoever runs next.
+    AOT tags each output as InputMutation / SavedForBackwards / Grad / None /
+    Plain. Sync only when no downstream compiled region will implicitly sync:
+      - Plain output WITHOUT any SavedForBackwards: a pure-forward exit
+        (inference, or training with grad disabled) — no bwd/opt follows.
+      - All InputMutation: the optimizer-like tail of a training step.
+    Mixed Plain+SavedForBackwards (training fwd or loss subgraph) defers to
+    whoever runs next.
     """
     for node in gm.graph.nodes:
         if node.op != "output":
@@ -564,17 +533,13 @@ def _has_host_reachable_output(gm: torch.fx.GraphModule) -> bool:
                 has_other = True  # unknown — be safe
         if has_other:
             return True
-        # Any Plain output: the user may read it on the host via .item() /
-        # .cpu() / .numpy() at any point. We can't distinguish "user will
-        # read" from "a downstream compiled region will consume it without
-        # host reads", so sync is the safe default. Skipping sync on
-        # training-fwd (Plain + SavedForBackwards) breaks fwd-only callers
-        # that read loss/logits on the host without a subsequent bwd.
+        # Any Plain output may be read on the host (.item()/.cpu()/.numpy()), so
+        # sync. Skipping sync on training-fwd (Plain + SavedForBackwards) breaks
+        # fwd-only callers that read loss/logits without a subsequent bwd.
         if has_plain:
             return True
-        # Optimizer-like tail: all mutations (after _apply_mutation_remap,
-        # these return the input tensor unchanged, but we still need the
-        # host read after the training step to see finalised data).
+        # Optimizer-like tail (all mutations): the host read after the training
+        # step must see finalised data.
         if has_mutation and not has_saved:
             return True
         return False
@@ -583,19 +548,15 @@ def _has_host_reachable_output(gm: torch.fx.GraphModule) -> bool:
 
 # --- FX-graph capture (dev-loop graph cache) ---------------------------------
 # The ATen graph _compile_fx receives is a function of the HF model code, the
-# custom-op registry, the AOT decompositions, and the generation wrapper
-# modules — it is INVARIANT to kernels/emitter/fusion/dispatch code (and even
-# to rewrites/ and ops/ handlers, which run inside _compile_fx). Capturing it
-# here (PRE-rewrite) lets _graph_cache replay a load without Dynamo+AOT: the
-# whole alloy pipeline still executes fresh on every run.
+# custom-op registry, the AOT decompositions, and the generation wrapper modules
+# — invariant to kernels/emitter/fusion/dispatch and the rewrites/ops handlers
+# (which run inside _compile_fx). Capturing it PRE-rewrite lets _graph_cache
+# replay a load without Dynamo+AOT.
 _graph_capture_stack: list = []
 
 
-# FX/Dynamo debug-provenance meta keys: source attribution for tracebacks and
-# the visualizer, never read by _compile_fx, the rewrite pipeline, or the
-# backend. They dominate the serialized cache (stack_trace alone is ~79% of a
-# 4MB graph), so drop them before pickling — shrinks the file ~5x and skips
-# pickling 3MB of stack strings on every capture.
+# FX/Dynamo debug-provenance meta keys. They dominate the serialized cache
+# (stack_trace alone is ~79% of a 4MB graph), so drop them before pickling.
 _DEBUG_META_KEYS = frozenset(
     ("stack_trace", "from_node", "nn_module_stack", "source_fn_stack", "seq_nr")
 )
@@ -603,13 +564,12 @@ _DEBUG_META_KEYS = frozenset(
 
 def _sanitize_meta(meta: dict) -> dict:
     """Best-effort picklable copy of a node's meta dict. Tensor values (incl.
-    FakeTensors, which cannot be pickled) become meta-device tensors that keep
-    shape/dtype/stride; debug-provenance keys are dropped; everything else is
-    kept iff it survives pickle — this preserves AOT's `desc` annotations
-    (ParamAOTInput / InputMutationAOTOutput dataclasses), which
-    `_extract_mutation_map` and `_has_host_reachable_output` depend on. Dropping
-    them silently breaks input-mutation handling (found as wrong DeltaNet
-    conv/recurrent state on replayed hybrid graphs)."""
+    unpicklable FakeTensors) become meta-device tensors keeping shape/dtype/
+    stride; debug-provenance keys are dropped; everything else is kept iff it
+    survives pickle. Preserves AOT's `desc` annotations, which
+    `_extract_mutation_map` and `_has_host_reachable_output` depend on — dropping
+    them breaks input-mutation handling (wrong DeltaNet state on replayed
+    hybrids)."""
     out: dict = {}
     for k, v in meta.items():
         if k in _DEBUG_META_KEYS:
@@ -651,12 +611,11 @@ def _compile_fx(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]):
     host_reachable_output = _has_host_reachable_output(gm)
     # Graph rewrites: collapse decomposed subgraphs into single custom op nodes.
     # Runs BEFORE the unsupported-op check so rewrites can introduce ops the
-    # check would otherwise reject (e.g. auto_functionalized_v2 → direct call).
+    # check would reject (auto_functionalized_v2 → direct call).
     gm = rewrite_fx_graph(gm)
-    # Harvest mutation metadata AFTER rewrites: auto_functionalized_v2 hides
-    # AOT's `entry.mutated_input` annotations behind the HOP wrapper, so we
-    # rely on the unwrap pass to stamp a sidecar dict on the output node's
-    # meta. `_extract_mutation_map` merges both sources.
+    # Harvest mutation metadata AFTER rewrites: auto_functionalized_v2 hides AOT's
+    # `entry.mutated_input` annotations behind the HOP, so the unwrap pass stamps
+    # a sidecar dict on the output node's meta. `_extract_mutation_map` merges both.
     mutation_map = _extract_mutation_map(gm)
 
     if os.environ.get("ALLOY_DEBUG_MUTMAP") == "1":
@@ -714,17 +673,15 @@ def _compile_fx(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]):
         nonlocal _compiled_plan
 
         # Dropout's keep mask is a per-forward draw from the torch generator;
-        # refresh the shared seed each call (handler or replay path) so masks
-        # vary per step and stay under torch.manual_seed.
+        # refresh the shared seed each call so masks vary per step and stay under
+        # torch.manual_seed.
         if _uses_dropout and is_training_mode_enabled():
             refresh_dropout_seed()
 
         # Record (plan, args) into the active capture slot, if any. Args are
-        # captured on EVERY call (lazy or fast path) — AOT specialisations that
-        # recompile on `is_initialized` flips take the lazy path on the
-        # recompile, and the slot must still hold a valid args tuple. The plan
-        # is recorded on both the replay (below) and compile (OUTPUT) paths so
-        # a warm replay captures the executed plan, not a stale one.
+        # captured on EVERY call so the slot always holds a valid args tuple even
+        # when an AOT specialisation recompiles. The plan is recorded on both the
+        # replay (below) and compile (OUTPUT) paths.
         _slot = _capture_stack[-1] if _capture_stack else None
         if _slot is not None:
             _slot.args = args
@@ -765,8 +722,8 @@ def _compile_fx(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]):
                 v = values[vi]
                 if isinstance(v, AlloyBuffer):
                     # Key by base_ptr so sliced-view inputs are recognised when
-                    # recorded dispatches reference the parent storage. Keeping
-                    # data_ptr too preserves existing output-aliasing lookups.
+                    # recorded dispatches reference the parent storage; keep
+                    # data_ptr too for output-aliasing.
                     bp = v.base_ptr
                     input_ptrs[bp] = InputPtrInfo(arg_idx, v._offset)
                     dp = v.data_ptr
@@ -806,8 +763,8 @@ def _compile_fx(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]):
                 out_value = out[0] if len(out) == 1 else out
                 # KV-cache writes nothing in-graph reads (sliding-window cold
                 # prefill attends a linear temp copy) are unreachable from the
-                # outputs — materialize the registered side-effect roots so
-                # those writes land in the recorded plan instead of being DCE'd.
+                # outputs — materialize the registered side-effect roots so those
+                # writes land in the recorded plan instead of being DCE'd.
                 extern_writes = drain_extern_kv_writes()
                 if extern_writes:
                     materialize_many(extern_writes)
@@ -843,10 +800,9 @@ def _compile_fx(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]):
 
         raise RuntimeError("Alloy backend: graph terminated without an output node")
 
-    # FX-graph capture: record the first real call's flat args + flat outputs
-    # so _graph_cache can serialize an input spec (which args are model
-    # params/buffers vs caller kwargs vs lifted constants) and the user-output
-    # index. The wrapper is inert once the capture scope pops.
+    # FX-graph capture: record the first real call's flat args + flat outputs so
+    # _graph_cache can serialize an input spec (params/buffers vs caller kwargs vs
+    # lifted constants) and the user-output index. Inert once the scope pops.
     final_fn = compiled
     if _graph_capture_stack:
         _cap = _graph_capture_stack[-1]
@@ -860,14 +816,12 @@ def _compile_fx(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]):
 
         final_fn = _capturing
 
-    # Mark the compiled function as "boxed" so AOT Autograd's runtime
-    # wrapper runs its input-mutation copyback against our outputs.
-    # Without this, mutations the compiled graph writes (e.g., optimiser
-    # state updates) never propagate back to the input tensors.
+    # Mark the compiled function as "boxed" so AOT Autograd's runtime wrapper
+    # runs its input-mutation copyback against our outputs — else mutations the
+    # graph writes (optimiser state) never propagate back to the input tensors.
     boxed_fn = make_boxed_func(final_fn)
-    # The FX-graph cache calls this boxed fn RAW (no AOT runtime wrapper), so
-    # it must apply the input-mutation copyback itself — expose the
-    # post-rewrite map (desc + auto_functionalized sidecar entries).
+    # The FX-graph cache calls this boxed fn RAW (no AOT runtime wrapper), so it
+    # must apply the input-mutation copyback itself — expose the post-rewrite map.
     boxed_fn._alloy_mutation_map = mutation_map
     return boxed_fn
 
@@ -924,16 +878,13 @@ class PlanDispatch:
     grid: tuple[int, int, int]
     tg: tuple[int, int, int]
     write_slot_indices: set[int] = field(default_factory=set)
-    # MSL source + entry-point name for L5 plan-cache serialisation.
-    # Empty when this dispatch's pso_handle wasn't routed through
-    # CompiledKernel.from_msl — in that case the plan is non-cacheable
-    # (see `is_cacheable` on CompiledPlan).
+    # MSL source + entry-point name for plan-cache serialisation. Empty when the
+    # pso_handle wasn't routed through CompiledKernel.from_msl (non-cacheable).
     msl_source: str = ""
     function_name: str = ""
-    # (extent, byte_stride) axes of every buffer this dispatch WRITES, from the
-    # recording-time AlloyBuffer views. The grid-shrink recipe uses
-    # this to refuse dispatches whose written M axis is not outermost (their
-    # shrunk threadgroup prefix would cover the wrong elements).
+    # (extent, byte_stride) axes of every buffer this dispatch WRITES. The
+    # grid-shrink recipe uses this to refuse dispatches whose written M axis is
+    # not outermost (their shrunk threadgroup prefix would cover wrong elements).
     write_dims: tuple[tuple[tuple[int, int], ...], ...] = ()
 
 
@@ -1003,10 +954,9 @@ class CompiledPlan:
     weight_bindings: dict[int, AlloyBuffer]
     plan_handle: int
     pending_buf_cleanup: list[AlloyBuffer] | None = None
-    # True if any output is a user/host-reachable tensor (PlainAOTOutput).
-    # When False, _execute_plan can defer the tail gpu_sync — nothing between
-    # this plan and the next is read on the CPU, and Metal enforces queue
-    # order without a host round-trip.
+    # True if any output is a user/host-reachable tensor (PlainAOTOutput). When
+    # False, _execute_plan defers the tail gpu_sync — nothing between this plan
+    # and the next is read on the CPU, and Metal enforces queue order.
     host_reachable_output: bool = True
     # Mutable runtime state — grows across _execute_plan calls
     _storage_handles: dict[int, int] = field(default_factory=dict)
@@ -1014,62 +964,56 @@ class CompiledPlan:
     # Cached input_updates: skip O(n_slots) scan+build on steady-state calls
     _cached_input_updates: list[tuple[int, int, int]] | None = None
     _cached_input_check: tuple[InputUpdateCacheCheck, ...] | None = None
-    # AOT mutation outputs that correspond to runtime InputSlots. Some cannot
-    # be remapped in-place because the original input is read later in the plan,
-    # but decode fast paths still need to know which input scalar advances.
+    # AOT mutation outputs that correspond to runtime InputSlots. Some can't be
+    # remapped in-place (the original input is read later in the plan), but decode
+    # fast paths still need to know which input scalar advances.
     mutation_input_slots: dict[int, int] = field(default_factory=dict)
-    # Grid-shrink recipe: {flat_dispatch_idx: [(axis, ext_max), ...]}.
-    # Identifies which dispatch grid axes scale (linearly) with the prompt length
-    # M, recording each such axis's max-length extent so the shrink dispatch can
-    # dispatch ceil(M_pad * ext_max / M_MAX) threadgroups against this max-length-
-    # compiled plan instead of the full grid. The linear rule covers both block-
-    # tiled axes (ext = ceil(M/block)) and 1D-flattened elementwise grids
-    # (ext = M * cols). None until the generator's two-point grid discovery fills
-    # it in. _grid_shrink_m_max is the M_MAX the plan compiled at (the recipe's base).
+    # Grid-shrink recipe: {flat_dispatch_idx: [(axis, ext_max), ...]}. Identifies
+    # which dispatch grid axes scale linearly with the prompt length M, recording
+    # each axis's max-length extent so the shrink dispatch launches
+    # ceil(M_pad * ext_max / M_MAX) threadgroups against this max-length-compiled
+    # plan instead of the full grid. Covers block-tiled axes (ext = ceil(M/block))
+    # and 1D-flattened elementwise grids (ext = M * cols). None until the
+    # generator's two-point grid discovery fills it in. _grid_shrink_m_max is the
+    # M_MAX the plan compiled at.
     _grid_shrink_recipe: dict[int, list[tuple[int, int, int]]] | None = None
     _grid_shrink_m_max: int = 0
-    # Request-bounded intermediate pool (shrink-capable plans only). Metal wires FULL
-    # buffer residency at first encoder use, so an M_MAX-sized pool wires ~its
-    # whole VA on the first call regardless of the shrunk grids (measured: +54GB
-    # on qwen3.5:0.8b at native, +0 on the second call). M-outer pool buffers
-    # are therefore allocated at a high-water prompt bound and grown on demand
-    # (_grow_plan_pool): _pool_trunc maps phys_idx -> bytes per M row, and the
-    # buffer's allocation is aligned(per_row * _pool_bound). 0/None = full-size
-    # pool (non-shrink plans, or no truncatable buffers).
+    # Request-bounded intermediate pool (shrink-capable plans only). Metal wires
+    # FULL buffer residency at first encoder use, so an M_MAX-sized pool wires ~its
+    # whole VA on the first call regardless of the shrunk grids (+54GB on
+    # qwen3.5:0.8b at native, +0 on the second call). M-outer pool buffers are
+    # allocated at a high-water prompt bound and grown on demand (_grow_plan_pool):
+    # _pool_trunc maps phys_idx -> bytes per M row, allocation is
+    # aligned(per_row * _pool_bound). 0/None = full-size pool.
     _pool_bound: int = 0
     _pool_m_max: int = 0
     _pool_trunc: dict[int, int] | None = None
-    # The grid overrides applied on the most recent grid-shrunk dispatch of this
-    # plan (flat_dispatch_idx, gx, gy, gz). Stashed by `PrefillEngine.chunk_step` so
-    # `alloy.visualize` can profile the plan at the SAME shrunk grid the run
-    # just dispatched (else the profiled pass would re-time the full max-length
-    # grid). None for non-shrink plans → profiling uses the registered grid.
+    # Grid overrides applied on the most recent grid-shrunk dispatch
+    # (flat_dispatch_idx, gx, gy, gz). Stashed by `PrefillEngine.chunk_step` so
+    # `alloy.visualize` profiles at the SAME shrunk grid the run dispatched.
+    # None for non-shrink plans → profiling uses the registered grid.
     _last_grid_shrink_updates: list[tuple[int, int, int, int]] | None = None
 
 
 # --- Request-bounded grid-shrink intermediate pool ---------------------------
 # Metal wires FULL buffer residency at first encoder use, so an M_MAX-compiled
-# shrink-capable plan's pool wires ~its entire VA on the first call no matter how far
-# the launch grids were shrunk (measured: ONE depth-256 call faults +54GB on
-# qwen3.5:0.8b at native, +0 on the second; qwen3.6:35b's 76GB pool cannot fit
-# 128GB at all). Fix: pool buffers whose every access is M-OUTERMOST row-major
-# (the access offset for a request of m rows is bounded by m * row_bytes from
-# the buffer start — the same invariant that makes grid-shrink correct) are
-# allocated at a high-water prompt bound instead of M_MAX, and grown on demand
-# when a longer prompt arrives (a rare, monotone event).
+# shrink-capable plan's pool wires ~its entire VA on the first call no matter how
+# far the launch grids were shrunk (+54GB on qwen3.5:0.8b at native; qwen3.6:35b's
+# 76GB pool cannot fit 128GB at all). Pool buffers whose every access is
+# M-OUTERMOST row-major (offset for m rows bounded by m * row_bytes from the
+# buffer start — the same invariant that makes grid-shrink correct) are allocated
+# at a high-water prompt bound and grown on demand for a longer prompt (rare,
+# monotone).
 #
-# M-outer-ness is decided per SLOT from the kernels touching it, deny-first:
-# a kernel whose name carries a known non-M-outer access pattern (head-major
-# rope/attention Q-K tiles, the heads-outer DeltaNet GDR scratch, arbitrary
-# strided copies/transposes) pins every slot it touches; otherwise the kernel
-# must be in the M-OUTER allowlist (GEMM/GEMV outputs (M, N) row-major, 2D
-# elementwise over (M, cols), the (B,S,C) conv pipeline, (B*S, heads) norms,
-# the MoE grouped pipeline). Anything unknown pins — worst case is a full-size
-# buffer, never corruption. Additional hard gates: the slot must not back a
-# plan OUTPUT (user-visible tensor), its nbytes must be an exact multiple of
-# M_MAX (pure-linear M scaling; affine-sized buffers like the MoE h stay
-# full), and every static dispatch offset into it must sit in the first 64
-# rows (column-slice views pass, row-sliced views pin).
+# M-outer-ness is decided per SLOT from the kernels touching it, deny-first: a
+# kernel with a known non-M-outer access pattern (head-major rope/attention tiles,
+# the heads-outer DeltaNet GDR scratch, strided copies/transposes) pins every slot
+# it touches; otherwise the kernel must be in the M-OUTER allowlist (GEMM/GEMV
+# (M, N) outputs, 2D elementwise over (M, cols), the (B,S,C) conv pipeline,
+# (B*S, heads) norms, the MoE grouped pipeline). Unknown pins — worst case a
+# full-size buffer, never corruption. Hard gates: the slot must not back a plan
+# OUTPUT, its nbytes must be an exact multiple of M_MAX (pure-linear M scaling),
+# and every static dispatch offset must sit in the first 64 rows.
 _POOL_M_OUTER_PREFIXES = (
     "dot",
     "mul",
@@ -1095,30 +1039,26 @@ def _pool_access_m_outer(d: PlanDispatch, writes: bool, m_max: int) -> bool:
     rows*row_bytes from the buffer start)? Direction-aware where a kernel mixes
     layouts: the rope family READS its (M, hidden) input M-outer but WRITES
     head-major (heads*M, D) tiles; single-pass attention reads those head-major
-    tiles but writes its O M-outer (B*S*H, D — S outermost). M-outer strided
-    copies are the 2D-grid rework (rows on axis 0 == M exactly); 1D/flat copies
-    can be M-inner transposes and pin. The DeltaNet chunked-GDR scratch is
-    heads-outer — always pinned. Unknown kernels pin (full-size buffer, never
-    corruption)."""
+    tiles but writes its O M-outer (B*S*H, D). M-outer strided copies are
+    2D-gridded (rows on axis 0 == M); 1D/flat copies can be M-inner transposes and
+    pin. The DeltaNet chunked-GDR scratch is heads-outer — always pinned. Unknown
+    kernels pin."""
     name = d.debug_name
     if "transpose" in name:
         return False
     if "gdr_stage1" in name:
-        # stage1 READS the l2norm'd q/k and gate buffers M-outer ((B*S*heads, D),
-        # position outermost); its W/T/at/qg/kd scratch WRITES are heads-outer.
+        # stage1 READS the l2norm'd q/k and gate buffers M-outer ((B*S*heads, D));
+        # its W/T/at/qg/kd scratch WRITES are heads-outer.
         return not writes
     if "gdr_stage2" in name:
         # stage2's core_attn WRITE is M-outer ((B*S*NV, DV)); its scratch READS
-        # target slots already pinned by stage1's writes, so True is safe here.
+        # target slots already pinned by stage1's writes.
         return True
     if "gdr" in name:
         return False
     if "strided_copy" in name:
-        # The M-outer contiguify copies are 2D-gridded with rows == B*S == M on
-        # axis 0 (§3 rework); flat/transpose copies have grid[0] = ceil(N/block)
-        # != m_max in practice. (A (B,C,S) transpose with C exactly == the flat
-        # block size would collide — none exists today; the correctness ladder
-        # would catch it as real-text divergence.)
+        # M-outer contiguify copies are 2D-gridded with rows == B*S == M on axis 0;
+        # flat/transpose copies have grid[0] = ceil(N/block) != m_max.
         return d.grid[0] == m_max
     if "rope" in name:
         return not writes
@@ -1133,11 +1073,10 @@ def _classify_truncatable_slots(
     output_mapping: "list[OutputEntry]",
     m_max: int,
 ) -> dict[int, int]:
-    """Map truncatable INTERMEDIATE slot indices to their bytes-per-M-row
-    (the M-outer gates — see the module comment above). Runs BEFORE liveness so
-    the allocator can keep truncatable and pinned slots in separate pools (a
-    shared phys buffer would otherwise be pinned by its most conservative
-    slot)."""
+    """Map truncatable INTERMEDIATE slot indices to their bytes-per-M-row (the
+    M-outer gates — see the module comment above). Runs BEFORE liveness so the
+    allocator keeps truncatable and pinned slots in separate pools (a shared phys
+    buffer would be pinned by its most conservative slot)."""
     output_slot_set = {e.slot_idx for e in output_mapping if isinstance(e, OutputSlot)}
     slot_ok: dict[int, bool] = {}
     max_offset: dict[int, int] = {}
@@ -1170,9 +1109,8 @@ def _classify_truncatable_slots(
 def release_plan_intermediates(plan: "CompiledPlan") -> None:
     """Free a discarded plan's intermediate pool (its `phys_arrays`). Alloy has
     no Metal-buffer GC, so a plan compiled then thrown away during warmup (the
-    grid-shrink probe, traced only to diff grids) otherwise leaks its full
-    M-bounded pool for the process. Weight bindings are SHARED with the pinned
-    plans, so they are never touched — only the intermediate buffers go."""
+    grid-shrink probe) otherwise leaks its full M-bounded pool. Weight bindings
+    are SHARED with the pinned plans and never touched."""
     seen: set[int] = set()
     for arr in plan.phys_arrays:
         h = arr._parent_handle
@@ -1198,21 +1136,18 @@ def _grow_plan_pool(plan: "CompiledPlan", new_bound: int) -> None:
         _alloy_handle_map.pop(ptr, None)
         _alloy_buf_map.pop(ptr, None)
         DispatchEngine.default().untrack_alloc(ptr)
-        # Preserve the old contents (belt & braces — truncatable slots are all
-        # dispatch-written and recomputed every call, but copying the prefix is
-        # cheap and makes growth content-transparent).
+        # Preserve old contents (truncatable slots are dispatch-written and
+        # recomputed every call, but copying the prefix is cheap).
         old_arr = plan.phys_arrays[phys_idx]
         copied = min(old_arr.metal_nbytes, arr.metal_nbytes)
         ctypes.memmove(arr.base_ptr, old_arr.base_ptr, copied)
-        # Zero the fresh tail: Metal buffer contents start UNDEFINED, and pad
-        # rows beyond the request's m_pad are read by masked paths that assume
-        # finite values (0 * NaN = NaN — uninitialized memory there corrupted
-        # real outputs before the eager-compile warmup established the
-        # finite-pads invariant; growth must re-establish it).
+        # Zero the fresh tail: Metal buffer contents start UNDEFINED, and pad rows
+        # beyond the request's m_pad are read by masked paths assuming finite
+        # values (0 * NaN = NaN).
         if arr.metal_nbytes > copied:
             ctypes.memset(arr.base_ptr + copied, 0, arr.metal_nbytes - copied)
-        # Replace the Python-side owner; the old AlloyBuffer frees on GC after
-        # the C++ rebind below stops referencing its Metal buffer.
+        # Replace the Python-side owner; the old AlloyBuffer frees on GC after the
+        # C++ rebind below stops referencing its Metal buffer.
         plan.phys_arrays[phys_idx] = arr
         for si, s in enumerate(plan.slots):
             if isinstance(s, IntermediateSlot) and s.physical_idx == phys_idx:
@@ -1320,13 +1255,11 @@ def _compile_to_plan(
             )
         )
 
-    # Reclassify: slots written by dispatches MUST be INTERMEDIATE, not WEIGHT.
-    # Fused kernels can produce outputs at pointers not tracked by alloc_ptrs,
-    # causing them to be misclassified as WEIGHT. (The spec-verify conv tape
-    # bank dodges this on purpose: its kernel param carries no alloy.output
-    # annotation — nothing in-plan reads the bank — so it never enters a
-    # write set and keeps the stable WEIGHT binding its untracked allocation
-    # gets here.)
+    # Slots written by dispatches MUST be INTERMEDIATE, not WEIGHT. Fused kernels
+    # can produce outputs at pointers not tracked by alloc_ptrs, misclassifying
+    # them as WEIGHT. (The spec-verify conv tape bank dodges this deliberately:
+    # its kernel param carries no alloy.output annotation, so it never enters a
+    # write set and keeps the stable WEIGHT binding.)
     written_by_any = set()
     for d in dispatches:
         written_by_any.update(d.write_slot_indices)
@@ -1350,9 +1283,8 @@ def _compile_to_plan(
     folded_to_weight: set[int] = set()
     # Record-only compile never executes the GPU, so a constant-read dispatch's
     # output was NOT computed — folding it to a baked WeightSlot would carry
-    # garbage. Keep those dispatches live instead; run-1 executes them and writes
-    # the real (pooled) value. Costs a few constant dispatches per run (rare after
-    # `_build_constant_env`, negligible for a single plan compile).
+    # garbage. Keep those dispatches live; run-1 executes them and writes the real
+    # value.
     _allow_const_fold = not is_record_only()
     while changed:
         changed = False
@@ -1373,10 +1305,9 @@ def _compile_to_plan(
             else:
                 surviving.append(d)
         dispatches = surviving
-    # Reclassify folded-output slots as WeightSlot pointing at the
-    # run-0 buffer so register_plan captures its metal handle. Without
-    # this, `weight_bindings` lookup later won't include them and the
-    # consumer reads an uninitialised phys_array.
+    # Reclassify folded-output slots as WeightSlot pointing at the run-0 buffer so
+    # register_plan captures its metal handle — else `weight_bindings` lookup omits
+    # them and the consumer reads an uninitialised phys_array.
     for si in folded_to_weight:
         slot = slots[si]
         if isinstance(slot, IntermediateSlot):
@@ -1407,13 +1338,11 @@ def _compile_to_plan(
         return ("s", si)
 
     for di, d in enumerate(dispatches):
-        # Apply aliases accumulated from earlier dedup decisions — without
-        # this, two dispatches that would match AFTER an input gets aliased
-        # still key differently and miss the fold. Concrete case: each
-        # transformer block runs `cast_f32(causal_mask) → where(...)`;
-        # the 12 casts dedup to 1, but the 12 wheres each reference the
-        # original (pre-alias) cast output in their key, so all 12 wheres
-        # survive even though they're the same computation.
+        # Apply aliases accumulated from earlier dedup decisions — else two
+        # dispatches that match only AFTER an input gets aliased key differently
+        # and miss the fold. E.g. each block runs `cast_f32(causal_mask) →
+        # where(...)`; the casts dedup to 1, but the wheres each reference the
+        # pre-alias cast output and all survive.
         write_slots = {_slot_alias.get(si, si) for si in d.write_slot_indices}
         read_parts = sorted(
             (
@@ -1426,15 +1355,13 @@ def _compile_to_plan(
         if not read_parts or not d.write_slot_indices:
             continue
         # Never CSE a dispatch that writes an INPUT slot: that is an in-place
-        # mutation of a persistent buffer (a KV-cache write), a side effect that
-        # MUST run on its own buffer. The CSE key below is (pso, read slots)
-        # only — it ignores write slots because two pure dispatches with equal
-        # inputs produce equal outputs. That invariant breaks for cache writes:
-        # gemma4's cross-layer KV sharing has many shared layers write the SAME
-        # reused K/V (`shared_kv_states`) into DIFFERENT per-layer caches, so the
-        # writes share a pso + read slots yet are NOT redundant. Merging them
-        # aliases distinct cache buffers together and drops all-but-one write,
-        # leaving those layers' caches unwritten (decode then attends zeros).
+        # mutation of a persistent buffer (a KV-cache write) that MUST run on its
+        # own buffer. The CSE key is (pso, read slots) only — it ignores write
+        # slots, which breaks for cache writes: gemma4's cross-layer KV sharing has
+        # many shared layers write the SAME reused K/V into DIFFERENT per-layer
+        # caches, so the writes share a pso + read slots yet aren't redundant.
+        # Merging them aliases distinct cache buffers and drops all-but-one write,
+        # leaving those layers' caches unwritten (decode attends zeros).
         if any(
             isinstance(slots[_slot_alias.get(si, si)], InputSlot)
             for si in d.write_slot_indices
@@ -1466,11 +1393,10 @@ def _compile_to_plan(
     # --- Phase 4: Output mapping, liveness, dependency groups ---
     output_mapping = _build_output_mapping(output_values, ptr_to_slot, input_ptrs)
 
-    # Mutation remap: if AOT tagged output i as an in-place mutation of
-    # input arg j, route the dispatch that computes it straight to arg j's
-    # storage. This turns the AOT runtime's `input.copy_(output)` into a
-    # no-op (output tensor literally IS the input tensor) and also removes
-    # the final Intermediate → Input memmove that happens on CPU.
+    # Mutation remap: if AOT tagged output i as an in-place mutation of input arg
+    # j, route the dispatch computing it straight to arg j's storage. This turns
+    # AOT's `input.copy_(output)` into a no-op and removes the final
+    # Intermediate → Input memmove on CPU.
     mutation_input_slots: dict[int, int] = {}
     if mutation_map:
         mutation_input_slots = _apply_mutation_remap(
@@ -1511,10 +1437,9 @@ def _compile_to_plan(
         _alloy_handle_map.pop(ptr, None)
         _alloy_buf_map.pop(ptr, None)
         DispatchEngine.default().untrack_alloc(ptr)
-        # Metal buffer contents start UNDEFINED. Shrunk grids never
-        # write pad rows, and masked paths read them assuming finite values
-        # (0 * NaN = NaN) — zero the pool once so no request can ever observe
-        # uninitialized memory. One-time ~GB-scale memset at plan build.
+        # Metal buffer contents start UNDEFINED. Shrunk grids never write pad rows,
+        # and masked paths read them assuming finite values (0 * NaN = NaN) — zero
+        # the pool once so no request observes uninitialized memory.
         ctypes.memset(ptr, 0, arr.metal_nbytes)
         phys_arrays.append(arr)
     if pool_trunc:
@@ -1662,10 +1587,8 @@ def _apply_mutation_remap(
             continue
         new_slot_idx = arg_to_slot.get(arg_idx)
         if new_slot_idx is None:
-            # No dispatch in this plan currently uses the input arg as a
-            # buffer — create one on the fly so we can retarget the write.
-            # We need the arg's nbytes; the mutated-input shape matches
-            # the intermediate's nbytes.
+            # No dispatch uses the input arg as a buffer — create one to retarget
+            # the write. The mutated-input nbytes matches the intermediate's.
             inter = slots[old_slot_idx]
             root_ptr = None
             input_info = None
@@ -1997,11 +1920,10 @@ def _execute_plan(plan: CompiledPlan, args: tuple[torch.Tensor, ...],
         tuple of output torch.Tensors
     """
 
-    # The plan was compiled with bool inputs widened to int32 (alloy's internal
-    # bool representation; see _to_lazy_input). Run-1+ rebinds the CALLER's args,
-    # which are still 1-byte bool — binding them against the 4-byte int32 slot
-    # would read 0x01010101 garbage, so widen here too. Only graphs with bool
-    # inputs (vision's padding mask) pay this; text uses additive float masks.
+    # The plan was compiled with bool inputs widened to int32 (see
+    # _to_lazy_input). Run-1+ rebinds the CALLER's args, still 1-byte bool —
+    # binding against the 4-byte int32 slot reads 0x01010101 garbage, so widen
+    # here too. Only graphs with bool inputs (vision's padding mask) pay this.
     if any(isinstance(a, torch.Tensor) and a.dtype == torch.bool for a in args):
         args = tuple(
             a.to(torch.int32) if isinstance(a, torch.Tensor) and a.dtype == torch.bool else a
@@ -2103,16 +2025,14 @@ def _execute_plan(plan: CompiledPlan, args: tuple[torch.Tensor, ...],
         plan._cached_input_updates = input_updates
         plan._cached_input_check = tuple(seen_args.values())
 
-    # Dispatch async: commit the command buffer but don't wait.
-    # Output reconstruction below creates tensor wrappers (no data read).
-    # GPU runs in parallel. We sync before returning so the caller gets
-    # valid data when they access the tensors.
+    # Dispatch async: commit the command buffer but don't wait. Output
+    # reconstruction below creates tensor wrappers (no data read); sync before
+    # returning so the caller sees valid data.
     #
-    # Record-only (eager warmup): `_cached_input_updates` is now populated above —
-    # that was the ENTIRE reason the warmup runs this replay. The GPU forward
-    # produces nothing the plan-pinning needs (the output is discarded), so skip
-    # it. This is what makes a full-M_MAX warmup replay ~free instead of running a
-    # real M_MAX forward (catastrophic at native context).
+    # Record-only (eager warmup): `_cached_input_updates` is populated above —
+    # the reason the warmup runs this replay. The GPU forward's output is
+    # discarded, so skip it; this makes a full-M_MAX warmup replay ~free instead
+    # of a real M_MAX forward (catastrophic at native context).
     _skip_gpu = is_record_only()
     if not _skip_gpu:
         DispatchEngine.default().dispatch_plan(
@@ -2198,18 +2118,14 @@ def _execute_plan(plan: CompiledPlan, args: tuple[torch.Tensor, ...],
                     )
                 )
 
-    # Sync: only wait if the host can actually observe this plan's
-    # outputs. `host_reachable_output` is derived from AOT's output
-    # descriptors — True when any output is a PlainAOTOutput (returned
-    # to user code, likely read eagerly). False when every output is
-    # a saved-for-bwd tensor / gradient / input mutation: those are
-    # consumed by the next compiled plan's GPU dispatches, so Metal's
-    # queue-order handoff is sufficient and a host round-trip is pure
-    # overhead.
-    # Training: gradients/input-mutations are flagged not host-reachable (a
-    # following compiled plan would consume them GPU-side), but the eager
-    # optimizer reads param.grad on the HOST, so the async dispatch must be
-    # synced or opt.step() races it and reads the zero-initialised grad buffer.
+    # Sync only if the host can observe this plan's outputs.
+    # `host_reachable_output` is True when any output is a PlainAOTOutput
+    # (returned to user code); False when every output is saved-for-bwd / gradient
+    # / input mutation, consumed by the next plan's GPU dispatches under Metal's
+    # queue-order handoff.
+    # Training: gradients/input-mutations are flagged not host-reachable, but the
+    # eager optimizer reads param.grad on the HOST, so sync — else opt.step()
+    # races and reads the zero-initialised grad buffer.
     if (plan.host_reachable_output or is_training_mode_enabled()) and not _skip_gpu:
         DispatchEngine.gpu_sync()
 
@@ -2244,21 +2160,18 @@ def register_decode_chunk_plan(
     skip_dispatch_indices: frozenset[int] = frozenset(),
 ) -> int:
     """Register a synthetic plan that runs `chunk` decode iterations in ONE
-    command buffer: `plan`'s dispatch list repeated `chunk` times, with a
-    1-thread update dispatch between iterations doing the GPU-side feedback
-    (token_out → token_in, cache_position += 1, generated[i] = token).
-
-    This is the decode loop's amortization expressed as plan data — Python
-    dispatches one chunk per `dispatch_plan` call instead of one token, so
-    the per-command-buffer commit/wait cost spreads over `chunk` tokens.
+    command buffer: `plan`'s dispatch list repeated `chunk` times, with a 1-thread
+    update dispatch between iterations doing the GPU-side feedback (token_out →
+    token_in, cache_position += 1, generated[i] = token). Python dispatches one
+    chunk per `dispatch_plan` call instead of one token, so the commit/wait cost
+    spreads over `chunk` tokens.
 
     Slot indices are PRESERVED from `plan` (the generated buffer rides as one
-    extra stable slot at the end), so `plan._cached_input_updates` binds the
-    chunk plan unchanged. `prop_slot_pairs` are (src_slot, src_byte_offset,
+    extra stable slot at the end), so `plan._cached_input_updates` binds the chunk
+    plan unchanged. `prop_slot_pairs` are (src_slot, src_byte_offset,
     dst_input_slot) 8-byte scalar propagations for AOT input mutations not
-    remapped in-plan (per-layer cumulative_length) — applied GPU-side after
-    each iteration's update, mirroring what AOT's runtime epilogue does on
-    the module path.
+    remapped in-plan (per-layer cumulative_length) — applied GPU-side after each
+    iteration's update, mirroring AOT's runtime epilogue.
     """
     slots_data = []
     for si, slot in enumerate(plan.slots):
@@ -2273,10 +2186,9 @@ def register_decode_chunk_plan(
     gen_slot = len(slots_data)
     slots_data.append((_SLOT_WEIGHT, -1, generated_handle, generated_nbytes))
 
-    # Elide the producer dispatches of folded counter mutations (their output
-    # is consumed only by the mutation writeback, now handled by an incr8 in the
-    # feedback). Build the per-iteration base + dep-groups over the KEPT
-    # dispatches, remapping the original indices.
+    # Elide the producer dispatches of folded counter mutations (their output is
+    # consumed only by the mutation writeback, now an incr8 in the feedback).
+    # Build the per-iteration base + dep-groups over the KEPT dispatches.
     keep = [di for di in range(len(plan.dispatches)) if di not in skip_dispatch_indices]
     remap = {old: new for new, old in enumerate(keep)}
     base = [
@@ -2295,10 +2207,9 @@ def register_decode_chunk_plan(
         if g:
             base_dep_groups.append(g)
     one = (1, 1, 1)
-    # Fold the single counter increment into the update dispatch (the common
-    # decode shape: one shared cumulative_length). The feedback group then runs
-    # ONE dispatch instead of update+incr8, dropping a PSO switch + 1-thread
-    # launch per token. 0 or >=2 counters keep the separate-incr8 path.
+    # Fold the single counter increment into the update dispatch (common decode
+    # shape: one shared cumulative_length) so the feedback group runs ONE dispatch
+    # instead of update+incr8. 0 or >=2 counters keep the separate-incr8 path.
     fold_counter = (
         incr_slots[0] if (len(incr_slots) == 1 and update_incr1_pso >= 0) else None
     )
@@ -2325,14 +2236,10 @@ def register_decode_chunk_plan(
                 [token_out_byte_offset, 0, 0, 8 * i],
                 one, one,
             ))
-        # The update and the scalar copies touch mutually disjoint buffers
-        # (update: token_in/cache_position/generated; copies: distinct mutation
-        # in/out slots), so they share ONE dependency group — no barrier between
-        # them. The group is bracketed by the only real serial dependencies: the
-        # barrier after this iteration's sample (feeds token_out + the mutation
-        # outputs) and before the next iteration (consumes token_in/cache_pos).
-        # Dropping the inter-feedback barrier removes a per-token GPU pipeline
-        # drain (the ~10µs end-of-token bubble in the GPU trace).
+        # The update and the scalar copies touch disjoint buffers (update:
+        # token_in/cache_position/generated; copies: distinct mutation in/out
+        # slots), so they share ONE dependency group — no barrier between them,
+        # dropping a per-token GPU pipeline drain (~10µs end-of-token bubble).
         feedback_group = [update_idx]
         for src_slot, src_off, dst_slot in prop_slot_pairs:
             dispatches_data.append(
@@ -2341,7 +2248,7 @@ def register_decode_chunk_plan(
             feedback_group.append(len(dispatches_data) - 1)
         # Folded counter mutations: self-increment the destination in place
         # (dst += 1), replacing the elided producer add + its copy8. The single
-        # `fold_counter` is done inside update_incr1 above, so skip it here.
+        # `fold_counter` is done inside update_incr1 above.
         for dst_slot in incr_slots:
             if dst_slot == fold_counter:
                 continue
@@ -2361,15 +2268,14 @@ def register_decode_chunk_plan(
 def _bw_compiler_inference_path(gm, example_inputs):
     """Backward compiler for the inference AOT backend.
 
-    Reaching here means AOT decided backward is reachable — i.e. params
-    have requires_grad=True and we're not under no_grad. If the user
-    never called set_training_mode(True), warn loudly: they're either
-    training (should flip the flag) or forgot eval()/no_grad.
+    Reaching here means AOT decided backward is reachable (params have
+    requires_grad=True, not under no_grad). If the user never called
+    set_training_mode(True), warn: they're either training (should flip the flag)
+    or forgot eval()/no_grad.
     """
     if not is_training_mode_enabled():
-        # The training-preview boundary forbids loading `alloy_torch.training`
-        # at import time (see tests/architecture/test_training_boundary.py).
-        # Pull it in only when a backward actually fires without the flag.
+        # The training-preview boundary forbids loading `alloy_torch.training` at
+        # import time; pull it in only when a backward fires without the flag.
         from alloy_torch.training import warn_if_backward_without_mode  # scoped: training-boundary contract — keep `alloy_torch` import inference-only
 
         warn_if_backward_without_mode()

@@ -1,14 +1,10 @@
 // Alloy Metal runtime core — nanobind-free.
 //
 // The device, buffer table, pipeline cache, plan registry, and the plan
-// register/dispatch execution path. Shared SOURCE between two binaries that
-// never share runtime state: the Python nanobind extension (alloy_metal.mm
-// shims parse nb::list → these plain structs → call here) and the on-device
-// Swift engine (app/AlloyEngine wraps these in a C API). One implementation of
-// the dispatch core; each binary gets its own Metal state.
-//
-// Nothing here includes nanobind, so it compiles in Xcode without the Python
-// toolchain.
+// register/dispatch execution path. Shared SOURCE between the Python nanobind
+// extension (alloy_metal.mm shims parse nb::list → these plain structs → call
+// here) and the on-device Swift engine (app/AlloyEngine wraps these in a C API);
+// each binary gets its own Metal state.
 
 #pragma once
 
@@ -28,9 +24,9 @@ struct AllocatedBuffer {
   void *ptr;               // data pointer (== metal_buf.contents + mtl_offset)
   size_t nbytes;           // requested size (not rounded)
   size_t aligned_size;     // Metal buffer length (rounded to 16KB)
-  id<MTLBuffer> metal_buf; // Metal-allocated buffer — the source of truth
+  id<MTLBuffer> metal_buf;
   int64_t handle;
-  bool released;     // true = handle released, Metal backing dropped
+  bool released;
   size_t mtl_offset; // byte offset of ptr within metal_buf (pool slices)
   bool slice;        // true = view into a pool; release must not purge
   bool vm_owned;     // true = pool backed by our mach_vm reservation

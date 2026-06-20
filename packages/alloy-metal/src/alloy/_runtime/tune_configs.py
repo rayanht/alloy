@@ -24,22 +24,19 @@ logger = get_logger("alloy.tune")
 _PIPELINE_VERSION = 6
 
 # grid-shrunk chunk prefill compiles its plan at SEQ_LEN = M_MAX (the model's native
-# context), but kernel tile configs are M-SATURATED: past a few thousand rows the
+# context), but kernel tile configs are M-saturated: past a few thousand rows the
 # optimal (BLOCK_M, BLOCK_N, BLOCK_K) for a GEMM/attention stops changing (the grid
 # just gains more identical tiles). Measured on qwen3.5:0.8b, the M=16384 and
 # M=262144 grid-shrink configs are identical for 3/4 GEMM shapes (the 4th differs only
 # in BLOCK_N). So tuning at native M_MAX is wasted work — and intractable: the cold
 # single-pass attention is O(M^2), ~1hr+/shape at 262144.
 #
-# Instead we tune ONCE at this representative M — the production large-chunk prefill
-# size, where grid-shrink wins at every depth on every tracked model — and, when a plan
-# compiled at a LARGER M_MAX
-# resolves configs, its M-scaled key fields cap down to it (`set_grid_shrink_resolve_cap`
-# + `_apply_grid_shrink_cap`). A key field that is k*M_MAX (a position/sequence-scaled
-# dim or stride, so `v % m_max == 0 and v >= m_max`) maps to k*REP_M; weight /
-# reduction / output-width dims (all < M_MAX) are left untouched. So the native plan
-# resolves against the representative-M tune, and an O(M^2) native attention tune
-# never runs.
+# Instead tune ONCE at this representative M — the production large-chunk prefill
+# size — and, when a plan compiled at a larger M_MAX resolves configs, its M-scaled
+# key fields cap down to it (`set_grid_shrink_resolve_cap` + `_apply_grid_shrink_cap`).
+# A key field that is k*M_MAX (a position/sequence-scaled dim or stride, so
+# `v % m_max == 0 and v >= m_max`) maps to k*REP_M; weight / reduction / output-width
+# dims (all < M_MAX) are left untouched.
 GRID_SHRINK_REP_M = 4096
 _grid_shrink_cap = {"m_max": 0, "rep_m": 0}
 

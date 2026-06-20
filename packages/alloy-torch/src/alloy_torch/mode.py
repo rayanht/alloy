@@ -14,7 +14,6 @@ def set_training_mode_enabled(mode: bool) -> None:
     _training_mode_enabled = mode
 
 
-# The tuner toggles training mode around training-kernel sweeps; alloy can't
-# import this module to reach the flag (the base package must stay torch-free),
-# so we hand it the accessors at import time instead.
+# The base package stays torch-free and can't import this module, so hand it the
+# accessors at import time for the tuner's training-kernel sweeps.
 register_training_mode_hooks(is_training_mode_enabled, set_training_mode_enabled)

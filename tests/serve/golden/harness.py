@@ -7,17 +7,14 @@ body parsed into JSON / SSE-event-list / NDJSON-line-list with volatile fields
 (uuids, timestamps, durations) masked.
 
 The golden is STRUCTURAL, not literal bytes: streaming chunk boundaries may
-legitimately differ between transports (a thread-per-request stdlib server vs an
-async one), but the reconstructed event sequence, framing markers (`data: `, `[DONE]`,
-Anthropic `event:` names), field set, and ordering must stay identical. That is
-exactly the wire contract the dialect renderers own. Transport-injected headers
-(Server, Date, Connection, Transfer-Encoding) are dropped — they differ by
-transport by design; only content-type and CORS headers are kept. (An async
-transport would change chunking, not the decoded frames.)
+legitimately differ between transports, but the reconstructed event sequence,
+framing markers (`data: `, `[DONE]`, Anthropic `event:` names), field set, and
+ordering must stay identical — the wire contract the dialect renderers own.
+Transport-injected headers (Server, Date, Connection, Transfer-Encoding) are
+dropped (they differ by transport); only content-type and CORS headers are kept.
 
 Both `capture_wire_golden.py` (writes the golden) and `test_wire_golden.py`
-(replays + asserts) call `capture_all()`, so the capture and the gate can never
-drift.
+(replays + asserts) call `capture_all()`, so capture and gate can't drift.
 """
 
 from __future__ import annotations

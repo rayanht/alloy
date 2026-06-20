@@ -8,8 +8,7 @@
 #include <mach/mach.h>
 // mach/mach_vm.h is unsupported on the iOS SDK; vm_deallocate (mach/mach.h)
 // covers the only use here (returning a paged-pool reservation's VA) on both
-// platforms. The engine never creates vm_owned pool buffers, but the branch
-// must still compile for iOS.
+// platforms.
 
 namespace alloycore {
 
@@ -373,7 +372,7 @@ int64_t register_plan(const std::vector<DispatchSpec> &dispatches,
 
 void release_plan(int64_t plan_handle) {
   std::lock_guard<std::mutex> lock(g_plan_mutex);
-  g_plans.erase(plan_handle); // destroys the Plan → drops its slots' MTLBuffer refs
+  g_plans.erase(plan_handle);
 }
 
 static std::vector<PreCopy>
@@ -404,7 +403,7 @@ resolve_pre_copies(const std::vector<PreCopySpec> &specs) {
 }
 
 // g_pending_cb lifecycle is portable across ARC (app build) and MRC (the Python
-// extension's historical build flags): under ARC the strong global auto-manages.
+// extension): under ARC the strong global auto-manages.
 #if __has_feature(objc_arc)
 #define AE_CB_RETAIN(cb) (cb)
 #define AE_CB_RELEASE(p) ((p) = nil)

@@ -38,8 +38,8 @@ def rope_cos_sin(
 
     Collapses HF's `(arange + cache_position) -> cast -> ·inv_freq -> cos/sin`
     into one kernel: one threadgroup per position computes
-    `angle = float(m + cache_position) * inv_freq[j]` then cos/sin. Bit-for-bit
-    with the decomposed chain (integer position add, then the f32 multiply).
+    `angle = float(m + cache_position) * inv_freq[j]` then cos/sin (integer
+    position add, then the f32 multiply).
 
     cache_position: (1,) int — the chunk's start position.
     inv_freq:       (HALF_D,) f32.
@@ -189,13 +189,13 @@ def rms_norm_rope_strided(
     the RMS norm covers the full HEAD_DIM, rope rotates only the leading
     ROTARY_DIM dims (cos/sin are laid out (COS_ROWS, ROTARY_DIM)), and the
     trailing HEAD_DIM-ROTARY_DIM dims pass through normalized but un-rotated.
-    ROTARY_DIM == 0 means full rotary (ROT = HEAD_DIM), bit-identical to before.
+    ROTARY_DIM == 0 means full rotary (ROT = HEAD_DIM).
 
     HALF_COS != 0 means cos/sin are stored at HALF width (HALF_ROT per row): the
     rotate_half layout makes emb = cat(freqs, freqs), so the two halves of the
     table are identical. The self-cat strip rewrite drops the duplication and
     sets this flag, so the table stride is HALF_ROT and the "second half"
-    (c2/s2) re-reads the first (same value), bit-identical to the full table.
+    (c2/s2) re-reads the first (same value).
 
     Grid: (SEQ_LEN, BH). Each TG processes one (head, seq) row, reads
     head_dim values from strided input, computes rms, normalizes by weight,

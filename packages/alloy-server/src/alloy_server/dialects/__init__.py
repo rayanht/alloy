@@ -1,9 +1,8 @@
 """Wire-format dialects and the path -> Dialect routing.
 
-Each dialect implements the `Dialect` protocol by delegating to its module's
-parse/render functions. `chat_dialect_for_path` resolves a chat endpoint to its
-dialect; `error_dialect_for_path` resolves any path to the dialect whose error
-envelope it should answer with.
+`chat_dialect_for_path` resolves a chat endpoint to its dialect;
+`error_dialect_for_path` resolves any path to the dialect whose error envelope it
+answers with.
 """
 
 from __future__ import annotations

@@ -61,11 +61,9 @@ def _generate_tokens(
 
 def _decode_tokens(token_ids: torch.Tensor) -> str:
     # Prefix-coherent fake (BPE-style): decode([t1, t2]) starts with
-    # decode([t1]). Required for the per-token streaming path: the
-    # server computes deltas by stripping the previous-step decoded
-    # prefix from the current full decode. A fake that swung between
-    # unrelated outputs (e.g. "piece" → "decoded response") would
-    # corrupt the delta math.
+    # decode([t1]). The streaming path computes deltas by stripping the
+    # previous step's decoded prefix, so a fake that swung between
+    # unrelated outputs would corrupt the delta math.
     pieces = {21: "decoded", 22: " response"}
     if token_ids.ndim == 1:
         ids = token_ids.tolist()
@@ -256,10 +254,8 @@ def test_generation_served_model_decodes_only_new_tokens() -> None:
     )
 
     assert content == "decoded response"
-    # `stream()` now emits per-token deltas (BPE-style incremental
-    # decode), so the test asserts on the joined result rather than
-    # a single-chunk shape. Real clients concatenate the chunks the
-    # same way.
+    # `stream()` emits per-token deltas, so assert on the joined result
+    # rather than a single-chunk shape — clients concatenate the same way.
     chunks = list(
         model.stream(
             (
@@ -291,8 +287,7 @@ def test_parse_server_config_accepts_optional_hf_id() -> None:
     assert config.hf_id == "Qwen/Qwen3-0.6B"
     assert config.host == "127.0.0.1"
     assert config.port == 11435
-    # Context is not a config field: the cache is always native and the fill
-    # bound is derived from the machine's memory budget.
+    # Context is not a config field: the cache is always native.
     assert config.allow_downloads is False
 
 
@@ -313,8 +308,8 @@ def test_parse_server_config_does_not_require_hf_id() -> None:
 
 
 def test_unsupported_gguf_arch_rejected_unless_forced() -> None:
-    # The serve gate is metadata-driven: an architecture outside the supported
-    # set is refused, and `--force` is the documented escape hatch.
+    # The serve gate is metadata-driven: an arch outside the supported set is
+    # refused; `--force` is the escape hatch.
     with pytest.raises(ValueError, match="not in the supported set"):
         check_arch_supported("some-unknown-arch")
     check_arch_supported("some-unknown-arch", force=True)  # no raise
@@ -378,8 +373,8 @@ def test_native_served_model_loads_gguf_model_before_decode() -> None:
             yield 22
 
         def run(self, seq: object) -> Iterator[int]:
-            # Current native streaming path drives generator.run(Sequence) for the
-            # non-AlloyGenerator fallback (the `generate` path still uses .generate).
+            # Native streaming drives generator.run(Sequence) for the
+            # non-AlloyGenerator fallback; `generate` still uses .generate.
             assert seq.input_ids.tolist() == [[7, 8]]  # type: ignore[attr-defined]
             assert seq.max_new_tokens == 2  # type: ignore[attr-defined]
             yield 21

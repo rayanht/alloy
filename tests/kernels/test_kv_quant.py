@@ -34,8 +34,7 @@ def _quantize_ref(kv: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def _assert_codes(got, ref, kv):
     """Codes must match the numpy reference exactly EXCEPT at exact half-step
     ties (q_exact = n + 0.5), where Metal fast-math (rcp/fma contraction) may
-    legitimately round to the other side. Determinism only requires GPU-vs-GPU
-    stability — the kernel is the sole quantizer in production."""
+    legitimately round to the other side."""
     h, s, d = kv.shape
     x = kv.astype(np.float32).reshape(h, s, d // 32, 32)
     m = np.abs(x).max(axis=-1, keepdims=True)
@@ -115,8 +114,7 @@ def test_kv_quantize_q8_runtime_start_offset():
 
 def test_kv_q8_round_trip_error_bound():
     """quantize -> dequant reconstruction error bounded by scale/2 per element,
-    and dequant(quantize(x)) re-quantizes to identical codes (idempotence —
-    the warm-prefix determinism contract relies on this being stable)."""
+    and dequant(quantize(x)) re-quantizes to identical codes (idempotence)."""
     H, S, D, S_MAX = 2, 33, 256, 64
     rng = np.random.default_rng(2)
     kv = (rng.standard_normal((H, S, D)) * 5).astype(np.float16)
@@ -139,8 +137,7 @@ def test_kv_q8_round_trip_error_bound():
     scales = scales_buf.numpy.copy().reshape(H, S_MAX, D // 32)[:, :S].astype(np.float32)
     # err <= d*(1/2 + 127*2^-11) + output-fp16 rounding: the half quantization
     # step, plus the fp16 rounding of the stored scale amplified by |q| <= 127,
-    # plus ulp(q*d)/2 on the fp16 result. Verified tight: GPU dequant is
-    # bit-exactly fp16(q*d) (checked elementwise during bring-up).
+    # plus ulp(q*d)/2 on the fp16 result.
     bound = np.repeat(scales, 32, axis=-1) * (0.5 + 127 * 2.0**-11) + np.abs(ref) * 2.0**-10
     err = np.abs(got - ref)
     assert (err <= bound).all(), f"max err {err.max()} exceeds q8 bound"
@@ -342,11 +339,11 @@ def test_attention_cache_q8_handler_end_to_end():
         caches[name] = (codes.reshape((1, KV_H, S_MAX, D)),
                         scales.reshape((1, KV_H, S_MAX, D // 32)))
     # Materialize the history priming BEFORE the handler runs: lazy-op
-    # dependency tracking is per AlloyBuffer object, and the handler reads
-    # the caches through its own root views — without this barrier the
-    # attention op has no ordering edge against the bulk quantize above.
-    # (In production the backend maps each torch storage to ONE AlloyBuffer,
-    # so all cache readers/writers share an object and the hazard can't occur.)
+    # dependency tracking is per AlloyBuffer object, and the handler reads the
+    # caches through its own root views — without this barrier the attention op
+    # has no ordering edge against the bulk quantize above. (In production the
+    # backend maps each torch storage to ONE AlloyBuffer, so cache
+    # readers/writers share an object and the hazard can't occur.)
     materialize_many(prime)
     gpu_sync()
 

@@ -2,9 +2,6 @@
 
 Operates on TileFunction IR: extracts transforms from elementwise kernels,
 composes transform chains, and attaches them to anchor Load/Store ops.
-
-Key invariant: LazyOp.func is the traced TileFunction, set at queue time.
-Fusion uses deepcopy(op.func)
 """
 
 from __future__ import annotations
@@ -124,10 +121,8 @@ def extract_ir_transform(
     if store.value:
         _collect(store.value.name)
 
-    # Clone each extracted op into a fresh instance so downstream remaps
-    # (the extra-loads rewrite below and the anchor-attachment caller)
-    # mutate the copy rather than the shared IR we extracted them from.
-    # copy.copy is sufficient: these are all elementwise ops whose fields
+    # Clone each extracted op so downstream remaps mutate the copy, not the
+    # shared IR. copy.copy suffices: these are elementwise ops whose fields
     # are scalar TileValue refs — no shared list/dict state.
     transform_ops: list[TileOp] = [
         copy.copy(op) for op in elem_func.ops if op.result and op.result.name in compute_names
@@ -269,9 +264,8 @@ def _add_extra_param(
 ) -> None:
     """Add an extra buffer param to a TileFunction.
 
-    The IndexTransform (how to index this extra) is built separately by
-    _register_extra_params and attached to the IR node. No constexpr
-    metadata is written — all indexing info lives on the transform.
+    The IndexTransform is built separately by _register_extra_params and
+    attached to the IR node; all indexing info lives on the transform.
     """
     if ename in buffer_map:
         return
@@ -371,9 +365,8 @@ def _clone_stores_for_output(
     round_acc_for_eager: bool = False,
 ) -> None:
     def _clone_store(src: Store) -> Store:
-        # Shallow Store clone + fresh transform list of shallow-cloned ops.
-        # Store's other list/dict fields (transform_extras) get their own
-        # copy so downstream mutation doesn't leak to the original.
+        # transform_extras gets its own copy so downstream mutation doesn't
+        # leak to the original.
         new = copy.copy(src)
         new.ptr = TileValue(new_param, (), Layout.REPLICATED, src.ptr.dtype)
         new.transform = [copy.copy(t) for t in transform_ops]
@@ -442,9 +435,8 @@ def _unique_name(base: str, taken: set[str]) -> str:
 class IRSubstitution:
     """Maps old TileValue names to new TileValues.
 
-    Used to compose elem transforms into anchor kernels.
-    Build once from the chain's buffer bindings, then apply
-    to every op in the transform.
+    Build once from the chain's buffer bindings, then apply to every op in
+    the transform.
     """
 
     _map: dict[str, TileValue] = field(default_factory=dict)
@@ -461,10 +453,8 @@ class IRSubstitution:
         """Apply substitution to ops, creating new ops.
 
         If result_prefix is given, renames results for uniqueness. Prefix
-        mappings are LOCAL to this call — they don't leak into self._map
-        to avoid polluting subsequent steps.
+        mappings are LOCAL to this call so they don't pollute subsequent steps.
         """
-        # Copy the map so prefix renames don't leak across chain steps
         local_map = dict(self._map)
         new_ops: list[TileOp] = []
         for op in ops:
@@ -524,9 +514,9 @@ def _extract_and_lower(
 ) -> tuple[TileFunction, ExtractedTransform, dict[str, AlloyBuffer]]:
     """Extract transform from a LazyOp's stored TileFunction. No re-tracing.
 
-    Safe to shallow-clone now that extract_ir_transform copy.copies each
-    extracted op before any operand remap — shared BinOp/UnaryOp/Compare
-    instances stay immutable from fusion's perspective.
+    Shallow-clone is safe: extract_ir_transform copy.copies each extracted op
+    before any operand remap, so shared BinOp/UnaryOp/Compare instances stay
+    immutable from fusion's perspective.
     """
     func = shallow_clone_for_fusion(op.func)
     raw = extract_ir_transform(func)
@@ -563,17 +553,15 @@ def _identify_chain_input(
     read_arr = buf_map.get(xf.input_param_name)
     if read_arr is not None and read_arr.shares_allocation(prev_out_arr):
         # The epilogue's primary input must cover the WHOLE anchor output. A
-        # strict sub-slice (starts at a different offset, or covers fewer
-        # elements — e.g. the Q slice of a batched QKV dot, or the gate half of
-        # a batched gate_up) would narrow the fused dot to that slice's columns:
-        # the dot still computes the full weight's N columns but writes them into
-        # the slice-sized output buffer, so the sibling slices (K/V, up) are
-        # written out of bounds / read from never-materialized memory. Refuse so
-        # the dot compiles standalone (full output) and the epilogue runs unfused
-        # over the slices. This is the PRIMARY-input twin of the extra-input guard
-        # in _resolve_extra_alloc. Compare by element COUNT, not shape tuple: a reshape of the
-        # full output (same offset + numel, e.g. the K-rope output cast to f16 for
-        # the KV cache) covers everything and must stay fusable.
+        # strict sub-slice (different offset, or fewer elements — e.g. the Q
+        # slice of a batched QKV dot) would narrow the fused dot to that slice's
+        # columns: the dot computes the full weight's N columns but writes them
+        # into the slice-sized buffer, so sibling slices are written out of
+        # bounds / read from never-materialized memory. Refuse so the dot
+        # compiles standalone and the epilogue runs unfused over the slices.
+        # Compare by element COUNT, not shape tuple: a reshape of the full output
+        # (same offset + numel, e.g. K-rope cast to f16 for the KV cache) covers
+        # everything and must stay fusable.
         if read_arr._offset != prev_out_arr._offset or read_arr.size != prev_out_arr.size:
             raise FusionUnsupported(
                 f"elem op {step_idx} primary reads a sub-slice of the anchor "
@@ -622,23 +610,17 @@ def _resolve_extra_alloc(
         return resolved
 
     if anchor_out_arr is not None and earr.shares_allocation(anchor_out_arr):
-        # Sharing the allocation only means the in-register anchor value can be
+        # Sharing the allocation only lets the in-register anchor value be
         # reused if the extra reads the SAME range. A different column slice
-        # (e.g. the `up` half of a batched gate_up sitting at offset != the
-        # anchor's gate half) is a sibling slice of the anchor dot's output —
-        # but a fused dot only materializes the anchor's own columns, so those
-        # other columns are never written. The fused kernel cannot read them;
-        # bail so the dot materializes fully and the epilogue runs unfused.
-        # (A `.contiguous()` copy sidestepped this by not sharing allocation; a
-        # zero-copy `as_dense_view` makes the case reachable.)
+        # (e.g. the `up` half of a batched gate_up at offset != the anchor's
+        # gate half) is a sibling slice the fused dot never materializes. Bail
+        # so the dot materializes fully and the epilogue runs unfused.
         if earr._offset == anchor_out_arr._offset and earr._shape == anchor_out_arr._shape:
             return f"_csrc_{step_idx}"
-        # A sibling column slice of the anchor (e.g. the `up` half of a batched
-        # gate_up at a different offset than the gelu'd gate half). Absorbing
-        # this epilogue would narrow the dot to the gate columns and read `up`
-        # from the never-materialized full output. Refuse: the batched dot then
-        # compiles standalone (full [gate|up] materialized) and the epilogue
-        # runs as a separate pass over the slices — batched, zero-copy.
+        # A sibling column slice of the anchor. Absorbing this epilogue would
+        # narrow the dot to the gate columns and read `up` from the
+        # never-materialized full output. Refuse: the batched dot compiles
+        # standalone and the epilogue runs as a separate pass over the slices.
         raise FusionUnsupported(
             f"epilogue extra at step {step_idx} reads a sibling column slice "
             "of the anchor output; keep the batched dot unfused",
@@ -657,8 +639,7 @@ def _compose_chain(
 
     For each elem op: extract its computation, build an IRSubstitution mapping
     its inputs to the previous chain result, and apply to produce new ops.
-    Extra buffers are resolved via allocation_id lookup instead of cascading
-    shares_allocation checks.
+    Extra buffers are resolved via allocation_id lookup.
     """
     sub = IRSubstitution()
     extra_params: dict[str, AlloyBuffer] = {}
@@ -681,13 +662,11 @@ def _compose_chain(
         effective_input_param = chain_input if is_swap else xf.input_param_name
         last_load_name = xf.input_value_name
 
-        # Handle primary/extra swap: primary becomes extra.
-        # Resolve the primary the same way as extras — it may be a chain
-        # intermediate (in registers), not an external buffer.
-        # Substitutions added here reference THIS op's local parameter names
-        # (e.g. "x", "y") which can collide with subsequent steps that have
-        # their own parameters with the same names. Track which keys we add
-        # so they can be removed after this step's apply_ops.
+        # Handle primary/extra swap: primary becomes extra. Resolve the primary
+        # like extras — it may be a chain intermediate (in registers), not an
+        # external buffer. Substitutions added here reference THIS op's local
+        # parameter names (e.g. "x", "y") which can collide with subsequent
+        # steps; track which keys we add so they can be removed after apply_ops.
         step_sub_keys: list[str] = []
         if is_swap:
             primary_arr = buf_map.get(xf.input_param_name)
@@ -725,20 +704,16 @@ def _compose_chain(
                     TileValue(xf.input_value_name, (), Layout.REPLICATED, "f32"),
                 )
                 step_sub_keys.append(chain_input)
-                # Record the chain source name — the composed IR uses
-                # xf.input_value_name as the placeholder for the chain source
-                # (via the substitution above). The emitter needs this
-                # explicit pointer instead of guessing.
+                # The composed IR uses xf.input_value_name as the chain-source
+                # placeholder (via the substitution above); the emitter needs
+                # this explicit pointer.
                 if chain_source_name is None:
                     chain_source_name = xf.input_value_name
 
         if i == 0:
-            # After the swap substitution above, the chain input appears in
-            # composed IR under xf.input_value_name (we substituted
-            # chain_input → TileValue(xf.input_value_name)). So the "origin
-            # name" that downstream fixup could rename is xf.input_value_name
-            # in both swap and non-swap cases — but it is also already the
-            # chain source name, so the fixup is a no-op.
+            # The chain input appears in composed IR under xf.input_value_name
+            # in both swap and non-swap cases, which is also the chain source
+            # name, so the downstream origin-name fixup is a no-op.
             chain_origin_name = xf.input_value_name
         elif composed_ops and composed_ops[-1].result is not None:
             target = chain_input if is_swap else xf.input_value_name
@@ -796,10 +771,9 @@ def _compose_chain(
         step_ops = sub.apply_ops(xf.ops, result_prefix=prefix)
         composed_ops.extend(step_ops)
 
-        # Discard substitutions keyed by THIS step's local parameter / load
-        # names — they don't apply to subsequent steps, and reusing them leads
-        # to accidental aliasing when later steps have parameters with the
-        # same local name (e.g. every elementwise kernel has x/y params).
+        # Discard substitutions keyed by THIS step's local names: reusing them
+        # aliases later steps that share a local name (every elementwise kernel
+        # has x/y params).
         for k in step_sub_keys:
             sub._map.pop(k, None)
 
@@ -816,8 +790,6 @@ def _compose_chain(
         and chain_origin_name is not None
         and chain_source_name != chain_origin_name
     ):
-        # Single substitution pass: replace chain_origin_name → chain_source_name
-        # in all composed_ops. Uses IRSubstitution.apply_ops (immutable).
         fixup = IRSubstitution()
         fixup.add(chain_origin_name, TileValue(chain_source_name, (), Layout.REPLICATED, "f32"))
         composed_ops = fixup.apply_ops(composed_ops)
@@ -856,15 +828,11 @@ def _build_broadcast_transform(
     inner_repeat = 1
     row_stride = 0
 
-    # A single-element extra is unconditionally a scalar broadcast: every
-    # output element reads index 0. This MUST be decided before the M/N
-    # disambiguation below — when esize == M (the canonical case being a
-    # single-token decode, M == 1, with a genuine scalar operand like gemma4's
-    # per-layer `layer_scalar` of shape (1,)), that path misclassifies it as a
-    # ColumnBroadcast (one value per row) whose flat() emits the full element
-    # index `y[m*N + col]` instead of `y[0]`, reading out of bounds of the
-    # 1-element buffer and corrupting every fused output. Scalar-broadcast is
-    # correct for any M/N, so short-circuit here.
+    # A single-element extra is unconditionally a scalar broadcast. Decide this
+    # before the M/N disambiguation: when esize == M (decode, M == 1, with a
+    # scalar operand like gemma4's per-layer `layer_scalar` of shape (1,)) that
+    # path misclassifies it as a ColumnBroadcast, emitting `y[m*N + col]`
+    # instead of `y[0]` and reading out of bounds of the 1-element buffer.
     if esize == 1:
         return ScalarBroadcastTransform()
 
@@ -1092,9 +1060,9 @@ def _epilogue_has_tile_consumer(chain_ops: list[LazyOp], anchor_size: int) -> bo
 
     Distinguishes residual-stream `add(gemm_out, residual_tile)` (2+ same-size
     inputs) from bias `add(gemm_out, bias_broadcast)` (1 same-size input).
-    Used to flag epilogues where eager would round the gemm acc to bf16 before
-    the binop — single-dispatch fusion otherwise keeps f32 acc through the add,
-    making alloy MORE precise but DIVERGENT from eager.
+    Flags epilogues where eager rounds the gemm acc to bf16 before the binop;
+    fused single-dispatch otherwise keeps f32 acc through the add, diverging
+    from eager.
     """
     if anchor_size <= 0:
         return False
@@ -1192,15 +1160,11 @@ def _apply_chain(
 
 def _build_anchor_context(anchor_op: LazyOp) -> AnchorFusionContext:
     output_idx = anchor_op.kernel._output_idx
-    # Use stored TileFunction — no re-tracing. Shallow-clone: fusion only
-    # mutates ops lists and Load/Store transform fields, so we share every
-    # other op node with the cached trace.
     func = shallow_clone_for_fusion(anchor_op.func)
     func.name = "_fused"
     cv = dict(anchor_op.constexpr_values)
-    # Inject M/N from the anchor's output buffer shape — needed by the
-    # emitter to disambiguate epilogue broadcast direction (row vs column).
-    # Works for any 2D anchor kernel, not just built-in GEMMs.
+    # Inject M/N from the anchor's output shape — the emitter needs them to
+    # disambiguate epilogue broadcast direction (row vs column).
     buffer_params = [p.name for p in func.params if not p.is_constexpr]
     _out_param = buffer_params[output_idx] if output_idx < len(buffer_params) else "out"
     out_shape = anchor_op.buffer_shapes.get(_out_param)
@@ -1242,7 +1206,6 @@ def _apply_anchor_prologue(
     anchor_input_param = _resolve_anchor_input_param(ctx, last_pro_out_arr)
 
     if len(pro_indices) == 1:
-        # Single prologue: inject directly
         if not inject_prologue_ir(ctx.func, last_pro_func, anchor_input_param):
             raise FusionUnsupported(f"Failed to inject prologue into load '{anchor_input_param}'")
         pro_src_arr = last_pro_buf_map.get(last_xf.input_param_name)

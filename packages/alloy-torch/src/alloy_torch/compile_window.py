@@ -21,16 +21,16 @@ class CompileWindow:
     # >0: the plan being compiled is shrink-capable at M=shrink_m. Forces
     # single-pass attention (a split-K plan's grids don't shrink per request),
     # caps M-scaled config resolution to the representative-M tune, and bounds
-    # the M-outer intermediate pool (read by backend at plan build).
+    # the M-outer intermediate pool.
     shrink_m: int = 0
     # Tuner-only: force single-pass attention WITHOUT the resolve-cap/pool
     # coupling, so the shrink-chunk tune benchmarks the kernels the
-    # shrink-capable plan actually runs.
+    # shrink-capable plan runs.
     single_pass_attention: bool = False
     # Warm-prefill start position. >0: the KV holds a populated prefix, so
     # the SDPA handler keeps the full K/V extent instead of the cold
-    # slice-to-q_len; the maskless `attention_strided` additionally bakes the
-    # value as its causal early-exit Q_START_POS constexpr.
+    # slice-to-q_len; the maskless `attention_strided` bakes the value as its
+    # causal early-exit Q_START_POS constexpr.
     q_start_pos: int = 0
     # DeltaNet bakes SAVE_STEPS=1 (+ conv tape) for the spec verify plan.
     spec_save_steps: bool = False

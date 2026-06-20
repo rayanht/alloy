@@ -204,9 +204,8 @@ class MemoryEmitterMixin:
         data-dependent predicate. The data-dependent form
         (`for (_idx = tid; _idx < n_total; _idx += threads)`) otherwise guards
         every global load with an `_idx < n_total` predicate — the compiler can't
-        prove `tid < threads` — which the GPU profiler attributes as a large
-        "Predication" cost on attention's K/V tile loads (~26% of the kernel at
-        deep cache offsets, where the loads dominate).
+        prove `tid < threads` — a predication cost ~26% of the kernel at deep
+        cache offsets, where the loads dominate.
         """
         threads = self._threads
         if n_total % threads == 0:
@@ -239,13 +238,13 @@ class MemoryEmitterMixin:
             _r  = _idx / c = tid/c + _it*(threads/c)    (only the +_it term varies)
         The Metal compiler does NOT strength-reduce the coupled `(tid+_it*threads)/c`
         form, so it keeps the divide/modulo on the load-address dependency chain every
-        iteration (~5% of a deep attention kernel measured on these two lines, since a
-        low-occupancy kernel can't hide that latency). Emitting the decoupled form lets
-        it hoist `tid/c`, `tid%c`. Indices are tile-local (< 2^16) so they live in
-        `ushort` — 16-bit register deps are ~1.56cyc vs i32's ~1.84cyc, which matters
-        precisely in this low-occupancy regime (philipturner/metal-benchmarks). The
-        device address (`_gr = global_row + _r`, then `*row_stride + base`) stays uint —
-        global rows and byte offsets exceed 16 bits.
+        iteration (~5% of a deep attention kernel, since a low-occupancy kernel can't
+        hide that latency). Emitting the decoupled form lets it hoist `tid/c`, `tid%c`.
+        Indices are tile-local (< 2^16) so they live in `ushort` — 16-bit register deps
+        are ~1.56cyc vs i32's ~1.84cyc, which matters in this low-occupancy regime
+        (philipturner/metal-benchmarks). The device address (`_gr = global_row + _r`,
+        then `*row_stride + base`) stays uint — global rows and byte offsets exceed 16
+        bits.
         """
         if self._coop_constant_trip and self._threads % c == 0:
             self._emit(f"ushort _r = ushort(tid / {c}u + _it * {self._threads // c}u);")
@@ -383,9 +382,9 @@ class MemoryEmitterMixin:
                 if db_off_expr:
                     db_off = f"{db_off_expr} + "
 
-            # Single SIMD group does the async copy — counterintuitively faster
-            # than distributing across multiple groups (integer instruction
-            # overhead for address computation eclipses parallel DMA benefit).
+            # Single SIMD group does the async copy — faster than distributing
+            # across multiple groups (integer instruction overhead for address
+            # computation eclipses the parallel DMA benefit).
             self._emit(f"thread _simdgroup_event_t* _ev_{name} = nullptr;")
             src_offset = (
                 f"{addr_base}uint({row_start}) * {row_stride}u + uint({col_start}){col_off}"
@@ -733,12 +732,11 @@ class MemoryEmitterMixin:
                 if guards:
                     self._indent -= 1
                     self._emit("}")
-                # Cast the per-element vec4 to whatever dtype the destination
-                # shmem buffer uses (float for the default plan, half when the
-                # buffer was promoted by _compute_per_value_shmem_dtype's
-                # half-paired Load downcast). Hardcoding float4 here would
-                # corrupt a half-dtype slot — a float4 write covers 16 bytes
-                # which spans 8 half slots and stores the wrong values.
+                # Cast the per-element vec4 to the destination shmem dtype (float
+                # for the default plan, half when promoted by the half-paired Load
+                # downcast). Hardcoding float4 corrupts a half-dtype slot — a
+                # float4 write covers 16 bytes, spanning 8 half slots, storing the
+                # wrong values.
                 sdt = self._buf_shmem_dtype(buf_name)
                 vec_t = f"{sdt}4"
                 cast_lo = "_val_lo" if sdt == "float" else f"{vec_t}(_val_lo)"
@@ -877,7 +875,7 @@ class MemoryEmitterMixin:
                 # the nibble loop: load them ONCE per uint instead of per nibble.
                 # Otherwise each of the 8 nibbles re-loads the same scale+bias
                 # from device, and that dependent load latency lands ~10% on the
-                # dequant `*scale` / `+bias` lines at depth (Xcode trace).
+                # dequant `*scale` / `+bias` lines at depth.
                 hoist_dequant = (
                     elems_per_uint <= group_size
                     and group_size % elems_per_uint == 0
@@ -894,13 +892,12 @@ class MemoryEmitterMixin:
             # End-to-end-f16 vectorized dequant decision (needed before the hoist
             # declaration so scale/bias get typed `half`). On Apple GPU `float4`
             # vectorization is a no-op for ALU throughput — the ALU is scalar
-            # regardless of SIMD width (metal-benchmarks), so the earlier
-            # float4(uint4) only moved the profiler attribution, not the cycles.
-            # The real lever is f16: half FMA is ~28% faster than f32, scale/bias
-            # are already f16 in device memory (no f16->f32 load convert), and
-            # storing half directly removes the float->half convert — one of two
-            # 4-cycle converts per weight. Same aligned / full-tile / unsigned-
-            # nibble gate as the predication elision; ~1 f16-ULP/weight vs float.
+            # regardless of SIMD width (metal-benchmarks). The lever is f16: half
+            # FMA is ~28% faster than f32, scale/bias are already f16 in device
+            # memory (no f16->f32 load convert), and storing half directly removes
+            # the float->half convert — one of two 4-cycle converts per weight.
+            # Same aligned / full-tile / unsigned-nibble gate as the predication
+            # elision; ~1 f16-ULP/weight vs float.
             _signed_byte = self._buffer_dtypes.get(ptr_name, self._shmem_dtype) == "char" and bits == 8
             out_dt = self._buf_shmem_dtype(buf_name)
             can_vectorize = (
@@ -1007,7 +1004,7 @@ class MemoryEmitterMixin:
                 # f16 scale/bias (half FMA, ~28% faster), store half4 directly.
                 # No float intermediate → no `float->half` convert, and the
                 # scale/bias loads above are native f16. ~1 f16-ULP/weight vs the
-                # scalar float path; precision validated against it.
+                # scalar float path.
                 self._emit(f"if (_r < {rows}u) {{")
                 self._indent += 1
                 # zero_point == 0 (q4_k, q8_0): the subtract is a no-op — elide it.
@@ -1021,9 +1018,9 @@ class MemoryEmitterMixin:
                         # complement biases via XOR: u' = u ^ 0x80 == v + 128
                         # for all v ∈ [-128,127], so the half BIT PATTERN
                         # 0x6400|u' == 1024.0 + u' and (that − 1152) == v —
-                        # every intermediate ≤ 1279 where the f16 ULP is 1.0,
-                        # so the path is EXACT (bit-identical to the convert).
-                        # Byte extract + XOR run as I16 vector ops.
+                        # every intermediate ≤ 1279 where the f16 ULP is 1.0, so
+                        # the path is exact. Byte extract + XOR run as I16 vector
+                        # ops.
                         # bits==8 → elems_per_uint==4, so _ck is 0.
                         self._emit("ushort2 _ps8 = as_type<ushort2>(_packed);")
                         self._emit(
@@ -1153,7 +1150,7 @@ class MemoryEmitterMixin:
         # GATHERED row index: the row index is itself a Load (an index buffer) — e.g. the
         # MoE grouped GEMM gathers token rows via ROW_TOKEN[rm]. Affine row indices are
         # NEVER a Load (they're ProgramId/MakeRange arithmetic), so this branch is gated to
-        # true gathers and the affine fast path (every other GEMM) is byte-identical. Each
+        # true gathers and the affine fast path (every other GEMM) is untouched. Each
         # loaded row `_r` reads its source row from the index buffer; the `_gr < row_bound`
         # check emitted below guards garbage pad-row indices (skips the load → fill).
         _gather = self._gather_index_load(op.row_indices)

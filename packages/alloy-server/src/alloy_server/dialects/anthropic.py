@@ -2,8 +2,7 @@
 
 Parses Anthropic-shaped requests (system field + content blocks: text, image,
 tool_use, tool_result) into ChatCompletionRequest and renders Anthropic-shaped
-responses (JSON, SSE stream). Shared parse primitives from dialects.common; the
-response assembler from result.
+responses (JSON, SSE stream).
 """
 
 from __future__ import annotations
@@ -35,16 +34,14 @@ from alloy_server.schema import (
 from alloy_server.result import Generation
 
 # Claude Code prepends a system block of billing telemetry whose `cch=` hash
-# CHANGES EVERY REQUEST: "x-anthropic-billing-header: cc_version=...; cch=..;".
-# It's transport metadata, not prompt content — and the per-request mutation
-# poisons warm prefill: `try_reconstruct_warm_input_ids` requires prior messages
-# byte-identical, so one volatile system block forces a full cold re-prefill of
-# the whole (huge) system+tools prompt on every single turn.
+# changes every request: "x-anthropic-billing-header: cc_version=...; cch=..;".
+# The per-request mutation poisons warm prefill: `try_reconstruct_warm_input_ids`
+# requires prior messages byte-identical, so one volatile system block forces a
+# full cold re-prefill of the whole system+tools prompt on every turn.
 VOLATILE_SYSTEM_BLOCK_PREFIXES = ("x-anthropic-billing-header:",)
 
-# Anthropic's error envelope uses a small fixed set of `type` strings. Map our
-# internal RequestError codes onto them so /v1/messages emits the shape the SDK
-# expects.
+# Map internal RequestError codes onto Anthropic's fixed `type` enum so
+# /v1/messages emits the shape the SDK expects.
 ERROR_TYPES: dict[str, str] = {
     "model_not_found": "not_found_error",
     "model_not_served": "not_found_error",
@@ -57,7 +54,7 @@ ERROR_TYPES: dict[str, str] = {
 
 def error_payload(status: HTTPStatus, code: str, message: str) -> JsonObject:
     """Anthropic-shaped error envelope: nested `error` with `type` from a fixed
-    enum and a top-level `request_id` (the SDK pattern-matches on the type)."""
+    enum plus a top-level `request_id`. The SDK pattern-matches on the type."""
     return {
         "type": "error",
         "error": {"type": ERROR_TYPES.get(code, "api_error"), "message": message},
@@ -107,15 +104,10 @@ def tools(value: JsonValue) -> tuple[dict, ...]:
 
 
 def flatten_content(content: JsonValue) -> str:
-    """Anthropic content is either a plain string or a list of content blocks.
-
-    Text-only flatten for content that must reduce to a string: the `system`
-    field, system-role messages, and tool_result content. Non-text blocks are
-    silently dropped (the one real gap: images nested inside a tool_result).
-    User/assistant messages do NOT come through here — `message_to_chat` handles
-    their image/tool_use/tool_result blocks. Concatenation matches what the model
-    would see if the blocks were laid out in order.
-    """
+    """Text-only flatten of Anthropic content (string or list of blocks) for
+    fields that must reduce to a string: the `system` field, system-role
+    messages, and tool_result content. Non-text blocks are dropped (images nested
+    inside a tool_result are unsupported)."""
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
@@ -197,9 +189,6 @@ def message_to_chat(role: str, content: JsonValue) -> list[ChatMessage]:
     for tuid, txt in tool_results:
         out.append(ChatMessage(role="tool", content=txt, tool_call_id=tuid))
     text = "".join(text_parts)
-    # Emit the text/tool_calls/image message only if it carries something. A pure
-    # tool_result turn produced only the tool-role messages above; a message
-    # with no text, tool_use, tool_result, or image yields [] (empty -> 400).
     if text or calls or images:
         out.append(ChatMessage(
             role=role, content=text, tool_calls=tuple(calls), images=tuple(images),
@@ -215,9 +204,9 @@ def messages_request(model: ServedModel, payload: JsonObject) -> ChatCompletionR
     blocks go through `message_to_chat` (text, image, tool_use, tool_result).
     System content — the `system` field plus any system-role messages in the
     array (Claude Code sends its skills list that way) — is flattened to text and
-    hoisted into ONE leading system message: chat templates only represent a
-    leading system turn (qwen3.5 raises "System message must be at the
-    beginning"), so an in-place mapping would 400 at encode time.
+    hoisted into one leading system message, since chat templates only represent
+    a leading system turn (qwen3.5 raises "System message must be at the
+    beginning").
     """
     max_tokens_value = payload.get("max_tokens")
     if max_tokens_value is None:
@@ -264,7 +253,6 @@ def messages_request(model: ServedModel, payload: JsonObject) -> ChatCompletionR
                 "message role must be 'user', 'assistant', or 'system'",
             )
         expanded = message_to_chat(cast(str, role), message.get("content"))
-        # A message must carry SOMETHING — text, a tool_use, or a tool_result.
         if not expanded:
             raise RequestError(
                 HTTPStatus.BAD_REQUEST, "invalid_request",
@@ -328,8 +316,8 @@ def render_messages_stream(request: ChatCompletionRequest) -> Iterator[bytes]:
     """Anthropic SSE event stream: message_start, lazily-opened content blocks
     (thinking / text / tool_use) with deltas, then message_delta + message_stop.
     `output_tokens` starts at the sentinel 1 (Anthropic convention). A mid-stream
-    generation error becomes an `event: error` frame — headers are already
-    committed, so a JSON error body is no longer possible."""
+    generation error becomes an `event: error` frame (headers are already
+    committed)."""
     msg_id = f"msg_alloy_{uuid.uuid4().hex[:24]}"
     prompt_tokens = sum(request.model.count_tokens(m.content) for m in request.messages)
     yield wire.sse_event("message_start", {

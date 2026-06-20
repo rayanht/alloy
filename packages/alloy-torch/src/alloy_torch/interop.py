@@ -1,13 +1,12 @@
 """Interop between PyTorch tensors and Alloy Metal buffers.
 
 On Apple Silicon, CPU tensors live in unified memory — the same physical pages
-are accessible by both CPU and GPU. For contiguous CPU tensors, this path can bind the
-tensor storage directly:
+are accessible by both CPU and GPU. Contiguous CPU tensors bind their storage
+directly:
 
   torch.Tensor (CPU) → .numpy() → MetalBuffer.from_numpy() → GPU kernel
 
-Non-contiguous tensors are made contiguous first, and MPS tensors require a copy to CPU.
-The typical Alloy workflow avoids MPS tensors because Alloy is the GPU backend.
+Non-contiguous tensors are made contiguous first; MPS tensors are copied to CPU.
 """
 
 from __future__ import annotations
@@ -49,10 +48,9 @@ def tensor_to_buffer(tensor: torch.Tensor, device: MetalDevice | None = None) ->
         torch.mps.synchronize()
         tensor = tensor.cpu()
 
-    # Alloy represents bool as int32 internally (comparison results, mask kernels),
-    # but a torch bool tensor is 1 byte/element. Binding its storage directly would
-    # make the int32-typed buffer read 4 packed bool bytes as one int (0x01010101).
-    # Widen to int32 here so the 1-byte data becomes the expected 4-byte 0/1.
+    # Alloy represents bool as int32 internally, but a torch bool tensor is 1
+    # byte/element; binding its storage directly would read 4 packed bool bytes
+    # as one int (0x01010101). Widen to int32 so each bool becomes a 4-byte 0/1.
     if tensor.dtype == torch.bool:
         tensor = tensor.to(torch.int32)
 

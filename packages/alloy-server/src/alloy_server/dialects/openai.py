@@ -1,8 +1,7 @@
 """OpenAI dialect: `/v1/chat/completions`, `/v1/models`, `/v1/embeddings`.
 
 Parses OpenAI-shaped requests into the dialect-agnostic ChatCompletionRequest and
-renders the responses (JSON, SSE stream). Shared parse primitives come from
-dialects.common; the response assembler from result.
+renders the responses (JSON, SSE stream).
 """
 
 from __future__ import annotations

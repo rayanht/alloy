@@ -378,9 +378,9 @@ def pack(
     interm_bytes = sum(pf_plan["phys_sizes"]) + sum(dc_plan["phys_sizes"])
     min_ram = weight_bytes + const_bytes + state_bytes + interm_bytes
 
-    # The full stop set the golden was generated with (config + generation_config
-    # eos, plus gemma's <end_of_turn>=106) — a single config eos misses the chat
-    # turn marker, so the model loops past it.
+    # Full stop set: config + generation_config eos, plus gemma's
+    # <end_of_turn>=106 — a single config eos misses the chat turn marker, so
+    # the model loops past it.
     eos_ids = list(resolve_eos_tokens(hf)) or [-1]
     manifest = {
         "format": "alloypack/1", "model": model, "arch": meta["arch"], "vocab": vocab,
@@ -434,7 +434,7 @@ def _validate_pack(pack_dir: Path, archive_path: Path, plats: list[str]) -> None
     reading weights + consts from the single-file `<id>.alloypack.bin`, and
     allocating KV zeroed on-device — and confirm it reproduces the golden tokens.
     This validates the metallib, plans, weights, slot roles, and decode feedback
-    end-to-end. iOS metallib parity is confirmed on-device (M1)."""
+    end-to-end."""
     if "macos" not in plats:
         typer.echo("  validation skipped (no macOS metallib built on this host)")
         return

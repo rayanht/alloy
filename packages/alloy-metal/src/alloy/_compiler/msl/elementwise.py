@@ -29,13 +29,10 @@ from alloy._compiler.tile_ir import (
 
 
 class ElementwiseEmitterMixin:
-    # --- Element access abstraction — collapses location-dependent combinatorics ---
-
     def _elem_access(self, val: TileValue, col_var: str) -> str:
         """Return MSL expression for one element of val at col_var.
 
         Handles all value locations: shared, local_array, per_thread, address.
-        Used by _emit_binop/_emit_unaryop to collapse 9 branches into 1.
         """
         # Deferred cast on a 2D shared/local input: recurse into the input's
         # element access and wrap with the cast helper. See _emit_cast.
@@ -121,8 +118,7 @@ class ElementwiseEmitterMixin:
         elif buf_dt in ("i8", "char"):
             vec_type, elem_type = "char4", "char"
         elif buf_dt in ("u32", "uint"):
-            # 16-byte load of 16 packed int8 codes; components reinterpret via
-            # as_char4. The quantized-KV decode path's load-issue saver.
+            # 16-byte load of 16 packed int8 codes; components reinterpret via as_char4.
             vec_type, elem_type = "uint4", "uint"
         else:
             vec_type, elem_type = "float4", "float"
@@ -241,14 +237,10 @@ class ElementwiseEmitterMixin:
                 return
 
         # Flush the deferred barrier only when this BinOp will actually read
-        # shmem. Per-thread / per-thread arithmetic (2D BLOCKED masks like
-        # `t26 = bitand(cmp22, cmp25)` between two coop loads, scalar address
-        # math, anything where neither operand is shared/local_array) emits
-        # straight-line thread-local expressions and doesn't need the prior
-        # cooperative writes to be visible. Without this guard, the mask
-        # computations sitting between Load A and Load B in a GEMM
-        # K-loop body materialize a barrier per K-tile that the MMA's own
-        # _check_flush_for would have absorbed for free.
+        # shmem. Per-thread arithmetic doesn't need prior cooperative writes
+        # visible; without this guard, mask computations between Load A and
+        # Load B in a GEMM K-loop body materialize a barrier per K-tile that
+        # the MMA's own _check_flush_for would have absorbed.
         if lhs_data or rhs_data or (
             result_shape and len(result_shape) == 2
             and self._shmem_plan.get(name) is not None
@@ -262,12 +254,10 @@ class ElementwiseEmitterMixin:
                 self._emit(f"float {name} = {expr};")
                 self._exprs[name] = name
             elif self._scalar_uses.get(name, 0) > 1 and name not in self._opaque_vec:
-                # CSE: a scalar referenced more than once (e.g. a lane index
-                # reused across many load addresses) is materialized into a
-                # named temp instead of re-inlining its whole expression tree at
-                # every use. Keeps the emitted MSL small and gives the Metal
-                # compiler clean input for CSE / loop induction-variable
-                # formation on addresses (matches hand-written `const int ix`).
+                # CSE: a scalar referenced more than once is materialized into a
+                # named temp instead of re-inlining its expression tree at every
+                # use. Gives the Metal compiler clean input for CSE / loop
+                # induction-variable formation on addresses.
                 self._emit(f"{msl_dtype_for_value(op.result, 'int')} {name} = {expr};")
                 self._exprs[name] = name
             else:
@@ -309,10 +299,10 @@ class ElementwiseEmitterMixin:
                 if need_row_guard:
                     self._indent -= 1
                     self._emit("}")
-                # Restore la_val's expr. The redirect above is per-op scratch so
-                # _elem_access reads the in-place target; leaving it set would
-                # permanently alias la_val to this op's result array (breaks a
-                # reused parent like `zeros` across loop iterations).
+                # Restore la_val's expr. The redirect above is per-op scratch;
+                # leaving it set would permanently alias la_val to this op's
+                # result array (breaks a reused parent like `zeros` across loop
+                # iterations).
                 if old_expr is not None:
                     self._exprs[la_val.name] = old_expr
                 else:
@@ -417,10 +407,9 @@ class ElementwiseEmitterMixin:
             out_stride = res_plan[3] if res_plan else inp_loc.stride
             # Copy-on-write: if the input shares the output buffer (in-place
             # mutation) and has live consumers downstream, save it to a local
-            # array first so subsequent reads see the pre-mutation value. The
-            # SiLU epilogue on a persistent MMA spill needs this: `neg(t57)`
-            # would otherwise clobber `_s3` before `mul(t57, sigmoid(t57))`
-            # reads it. BinOp has the same guard; UnaryOp was missing it.
+            # array first so subsequent reads see the pre-mutation value (a SiLU
+            # epilogue's `neg(t57)` would otherwise clobber the tile before
+            # `mul(t57, sigmoid(t57))` reads it).
             if (
                 inp_loc.name == out_buf
                 and self._has_future_use(inp.name, op)
@@ -504,14 +493,11 @@ class ElementwiseEmitterMixin:
 
             # Hoist a column-invariant condition operand out of the per-element
             # loop. A positional/causal mask `Compare(row_expr[:,None],
-            # col_expr[None,:])` has a left side that's constant across columns,
-            # but inlined into the ternary the compiler recomputes the whole
-            # predicate every column iteration — ~6-7% "Predication" at depth on
-            # the causal mask (the row side is also float, from the runtime
-            # Q_START_POS). Precompute it once per row into `_selL`; the
-            # per-element predicate collapses to one compare against the loop
-            # column. Only fires for the row-vs-col Compare shape (causal /
-            # plain sliding); compound BoolOp masks fall through unchanged.
+            # col_expr[None,:])` has a left side constant across columns; inlined
+            # into the ternary the compiler recomputes the whole predicate every
+            # column iteration (~6-7% "Predication" at depth on the causal mask).
+            # Precompute it once per row into `_selL`. Only fires for the
+            # row-vs-col Compare shape; compound BoolOp masks fall through.
             cond_op = self._op_map.get(op.cond.name)
             row_hoist = None
             if isinstance(cond_op, Compare):
@@ -532,12 +518,10 @@ class ElementwiseEmitterMixin:
             self._indent += 1
             if row_hoist is not None:
                 self._emit(f"auto _selL = {row_hoist[0]};")
-            # Stride columns across the row's tpr lanes (each lane owns
-            # {_lane, _lane+tpr, ...}) so the masked `where` parallelizes the
-            # same way the binop/unaryop/reduce row paths do — in constant-trip
-            # form so the compiler doesn't predicate the body (see
-            # _emit_col_loop_open). Without the striping the mask would be the
-            # lone serial pass in an otherwise lane-parallel softmax epilogue.
+            # Stride columns across the row's tpr lanes so the masked `where`
+            # parallelizes like the binop/unaryop/reduce row paths, in
+            # constant-trip form (see _emit_col_loop_open). Without striping the
+            # mask is the lone serial pass in a lane-parallel softmax epilogue.
             self._emit_col_loop_open("_c", cols)
             # Resolve both branches through the unified element accessor so
             # local_array (per-thread constant-row) and address-of-local_array

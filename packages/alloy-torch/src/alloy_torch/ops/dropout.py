@@ -2,8 +2,8 @@
 
 Inverted dropout on GPU. The keep mask is a counter-RNG hash of (seed, layer,
 index); `seed` is a 1-element buffer redrawn from the torch global generator
-once per forward (so `torch.manual_seed` controls the masks and they vary every
-step), written by `refresh_dropout_seed` from the compiled forward.
+once per forward (so `torch.manual_seed` controls the masks), written by
+`refresh_dropout_seed`.
 """
 
 from typing import cast
@@ -23,8 +23,7 @@ from alloy_torch.ops.creation import _full
 
 _dropout_kernel = cast(KernelFunction, dropout_mask_apply)
 
-# One shared seed buffer for every dropout site; the compiled forward overwrites
-# it with a fresh torch-drawn value each step (see refresh_dropout_seed).
+# One shared seed buffer for every dropout site, refreshed each forward.
 _DROPOUT_SEED: AlloyBuffer | None = None
 # Monotonic per-site offset so stacked dropout layers draw decorrelated masks
 # from the same per-forward seed.
@@ -36,20 +35,16 @@ def _dropout_seed_buffer() -> AlloyBuffer:
     if _DROPOUT_SEED is None:
         _DROPOUT_SEED = _alloc_aligned((1,), int32)
         _DROPOUT_SEED.write_scalar(0)
-        # Stable (read-only, refreshed in place each forward) — untrack it so the
-        # compiled plan binds it as a WEIGHT and reads its live value, not a
-        # recycled-intermediate snapshot frozen at trace time.
+        # Untrack so the compiled plan binds it as a WEIGHT and reads its live value.
         _engine.untrack_alloc(_DROPOUT_SEED.base_ptr)
     return _DROPOUT_SEED
 
 
 def refresh_dropout_seed() -> None:
-    """Draw a fresh seed from the torch global generator and publish it to the
-    shared buffer. Drawing through torch keeps dropout under `torch.manual_seed`
-    and advances the global stream by one int per forward. Runs once per forward,
-    ahead of the handlers, so it also rewinds the per-site offset — each trace
-    bakes the same offset for a given layer position (reproducible across
-    recompiles) instead of a monotonically-drifting global counter."""
+    """Draw a fresh seed from the torch global generator into the shared buffer.
+    Drawing through torch keeps dropout under `torch.manual_seed`. Rewinds the
+    per-site offset so each trace bakes the same offset for a given layer
+    position."""
     global _layer_offset
     _layer_offset = 0
     _dropout_seed_buffer().write_scalar(int(torch.randint(0, 2**31 - 1, (1,)).item()))

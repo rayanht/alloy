@@ -3,9 +3,7 @@
 When an observer is installed, the dispatch and fusion compile paths call
 `notify_compiled` with the resolved (name, constexprs, shapes, msl, tile_func)
 for every kernel they compile — letting `alloy inspect` capture the exact MSL/IR
-a real model forward executes. None by default (zero overhead in normal
-dispatch). Lives in its own module so both `_kernel` and `_fusion_compile` can
-import it without a circular dependency.
+a real model forward executes. None by default.
 """
 
 from __future__ import annotations

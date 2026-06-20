@@ -33,8 +33,7 @@ def _print_pso(name: str, variants: dict[str, dict]) -> None:
     `variants` is keyed by MSL source (so the source is available even under
     --level ir). maxTotalThreadsPerThreadgroup is a register-pressure proxy
     (1024 = registers light; lower = register-limited). The shmem-limited
-    residency (pool ÷ static threadgroup memory) is the occupancy ceiling — e.g.
-    a 17 KB tile against a 32 KB pool allows only one resident threadgroup.
+    residency (pool ÷ static threadgroup memory) is the occupancy ceiling.
     """
     pool = int(_metal_ext.device_info()["max_threadgroup_memory_length"])
     nvar = len(variants)

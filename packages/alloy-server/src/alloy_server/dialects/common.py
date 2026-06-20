@@ -1,7 +1,7 @@
 """Dialect-agnostic request-parsing primitives shared across OpenAI / Ollama /
 Anthropic: sampling, stop strings, tool/message/image parsing, the tool-call
 grammar constraint. Each dialect module composes these into its own request
-builder. No HTTP, no rendering."""
+builder."""
 
 from __future__ import annotations
 

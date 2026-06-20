@@ -79,17 +79,15 @@ def _decode_chunk_size(q_node: torch.fx.Node, pos_node: torch.fx.Node) -> int | 
     """Return K for a [1, _MAX_MULTI_TOKEN_DECODE] multi-token decode pattern,
     or None if the shape doesn't match a fast-path-able decode.
 
-    Specifically: Q is (B, H, K, D) and cache_position has exactly K entries.
-    K=1 is the single-token decode case; K > 1 is speculative-decode verify.
-    Large K (prefill, K > _MAX_MULTI_TOKEN_DECODE) falls back to the standard
-    SDPA path, since our multi-token kernel padding to BLOCK_M = ceil(K/8)*8
-    becomes inefficient at large K.
+    Q is (B, H, K, D) and cache_position has exactly K entries. K=1 is
+    single-token decode; K > 1 is speculative-decode verify. Large K (prefill,
+    K > _MAX_MULTI_TOKEN_DECODE) falls back to the standard SDPA path: the
+    multi-token kernel's BLOCK_M = ceil(K/8)*8 padding is inefficient at large K.
     """
     q_shape = _tensor_shape(q_node)
     pos_shape = _tensor_shape(pos_node)
     if q_shape is None:
-        # No shape metadata — fall through to the single-token check, which
-        # accepts shape-less nodes as single-token by default.
+        # No shape metadata — the single-token check accepts shape-less nodes.
         return 1 if _is_single_token_decode(q_node, pos_node) else None
     if len(q_shape) != 4:
         return None
@@ -343,18 +341,14 @@ def _is_scalar_node(node: torch.fx.Node, value: float) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
 # rewrite_eager_attention_to_sdpa — collapse the AOT-decomposed
 # matmul(Q, K^T) → softmax → matmul(attn, V) chain into one
 # aten.scaled_dot_product_attention node.
 #
-# Triggered by nomic-bert (and any model whose attention head is the textbook
-# `eager_attention_forward`): AOT lowers each 4D matmul to
-# `view(clone(expand(_)))→bmm→view` which produces strided_copy_4d at runtime
-# (3 copies per matmul × 2 matmuls per layer = ~6 redundant copies per
-# attention block). Replacing with SDPA lets the alloy attention kernel
-# consume the 4D Q/K/V directly with no contiguify.
-# ---------------------------------------------------------------------------
+# Triggered by any model whose attention head is the textbook
+# `eager_attention_forward`: AOT lowers each 4D matmul to
+# `view(clone(expand(_)))→bmm→view` (3 copies per matmul × 2 matmuls per layer).
+# SDPA lets the alloy attention kernel consume the 4D Q/K/V with no contiguify.
 
 _BMM_TARGETS = {torch.ops.aten.bmm.default}
 _PERMUTE_TARGETS = {torch.ops.aten.permute.default, torch.ops.aten.transpose.int}
@@ -368,12 +362,10 @@ def _unwrap_expand_clone_view_to_4d(
     node: torch.fx.Node,
 ) -> tuple[torch.fx.Node, tuple[int, ...]] | None:
     """`view(clone(expand(x_4d)))` or `view(expand(x_4d))` → (x_4d, expand_shape).
-    Returns None if the pattern doesn't match.
 
-    The clone is optional because AOT elides it when expand is an identity
-    (e.g. batch=1 expand from (1, H, S, D) to (1, H, S, D) doesn't need a
-    contiguify). Shape comes from the expand's FX meta — alloy custom ops
-    like rope_apply may not propagate meta to their outputs."""
+    The clone is optional: AOT elides it when expand is an identity (e.g. batch=1
+    expand from (1, H, S, D) to (1, H, S, D)). Shape comes from the expand's FX
+    meta — alloy custom ops like rope_apply may not propagate meta to outputs."""
     if node.target not in _VIEW_TARGETS:
         return None
     mid = _arg_node(node, 0)
@@ -420,8 +412,7 @@ def _maybe_strip_permute(node: torch.fx.Node) -> tuple[torch.fx.Node, list[int] 
 
 
 def _scalar_from_mul(mul_node: torch.fx.Node) -> tuple[torch.fx.Node, float] | None:
-    """Extract `(tensor_arg, scalar)` from `mul(tensor, scalar)`. Returns None
-    when no scalar arg present."""
+    """Extract `(tensor_arg, scalar)` from `mul(tensor, scalar)`."""
     if mul_node.target not in _MUL_TARGETS or len(mul_node.args) < 2:
         return None
     a, b = mul_node.args[0], mul_node.args[1]
@@ -452,8 +443,7 @@ def rewrite_eager_attention_to_sdpa(graph: torch.fx.Graph) -> int:
             rhs = _arg_node(sm_in, 1)
             if lhs is None or rhs is None:
                 continue
-            # The branch with the bmm chain is the scaled scores; the other
-            # branch is the mask.
+            # The bmm-chain branch is the scaled scores; the other is the mask.
             scaled, mask_node = lhs, rhs
             if scaled.target not in _MUL_TARGETS:
                 scaled, mask_node = rhs, lhs

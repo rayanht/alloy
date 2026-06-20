@@ -42,8 +42,7 @@ def decode_with_soundfile(data: bytes, target_sr: int) -> np.ndarray:
 def load_audio(source: bytes | str | Path, target_sr: int = 16000) -> np.ndarray:
     """Bytes or a path → mono float32 waveform at target_sr. Tries soundfile first
     (wav/flac/ogg — an in-process libsndfile read, ~1 ms), falling back to ffmpeg only
-    for what it can't decode (mp3/m4a/webm). ffmpeg is a subprocess spawn (~20 ms), so
-    preferring it unconditionally taxed every wav request — the common serving case."""
+    for what it can't decode (mp3/m4a/webm) since ffmpeg is a ~20 ms subprocess spawn."""
     data = source if isinstance(source, bytes) else Path(source).read_bytes()
     try:
         return decode_with_soundfile(data, target_sr)

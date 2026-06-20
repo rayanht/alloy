@@ -8,8 +8,8 @@ and the per-round staging (embedding gather + post-norm hidden rows).
 Draft-input pairing: the MTP block's row for committed token t at position q
 consumes (embed(t), post-norm hidden of position q-1) — the hidden BEFORE t.
 Hiddens come from the session's verify taps (`TargetTaps(post_norm=True)`); the
-prefill emits no taps in v1, so round 0 drafts against a zero hidden and misses
-once (h0=zeros).
+prefill emits no taps, so round 0 drafts against a zero hidden and misses once
+(h0=zeros).
 
 The draft block's cache only ever absorbs COMMITTED tokens, so it needs no
 rollback: `propose` folds the unabsorbed committed tail [*prev_committed,
@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 class MTPDrafter:
     """Qwen3.5 native MTP head as a contract drafter. `blob_path` is the GGUF
     blob carrying the `mtp.*` tensors (the served model's own blob);
-    `draft_topk` installs the pruned shortlist head (lossless — verify stays
+    `draft_topk` installs the pruned shortlist head (verify stays
     full-vocab)."""
 
     name = "mtp"
@@ -109,8 +109,7 @@ class MTPDrafter:
         if self._abs_absorbed > length:
             # Branch/warm rewind past the absorbed point. The block cache is
             # locally dense, so absolute rewinds don't map to a row pointer —
-            # drop it and re-absorb from the anchor (costs a couple of
-            # low-context rounds after a rewind, nothing else).
+            # drop it and re-absorb from the anchor.
             self._pins["mcache"].reset()
             self._local_rows = 0
             self._abs_absorbed = length
@@ -163,8 +162,8 @@ class MTPDrafter:
         return kv + cfg.hidden_size * 2
 
     def snapshot_head(self, rows: int) -> object | None:
-        # MTP block cache rows for [0, rows) + the token/hidden mirrors. The
-        # session calls this around foreign side requests; M-C2 wires it.
+        # MTP block cache rows for [0, rows) + the token/hidden mirrors, around
+        # foreign side requests that overwrite the cache head.
         layer = self._pins["mcache"].layers[0] if self._pins else None
         if layer is None or layer.keys is None:
             return None

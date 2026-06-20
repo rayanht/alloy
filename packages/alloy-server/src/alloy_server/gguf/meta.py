@@ -26,10 +26,6 @@ ParsedGGUF = dict[str, GGUFConfig]
 
 # Bump when the cached on-disk layout changes (new fields, different
 # pickle protocol, different field semantics). Old files are ignored.
-# v3: CachedTensorMeta moved modules (gguf.py -> gguf/meta.py) + dropped its
-# leading underscore, so v2 sidecars no longer unpickle.
-# v4: config fixup moved from an arch if/elif to an injected `config_fixup`
-# callable (handler hook); bumped to force a rebuild that exercises the hook.
 GGUF_META_CACHE_VERSION = 4
 
 

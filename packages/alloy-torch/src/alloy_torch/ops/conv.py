@@ -33,10 +33,10 @@ def _convolution(
     x_shape = x.shape
     w_shape = weight.shape
 
-    # Depthwise Conv1d (one kernel per channel) — used by qwen3.5's
-    # GatedDeltaNet causal conv. groups must equal both in_channels and
-    # out_channels; weight shape is (C, 1, K). Skip the im2col + GEMM
-    # detour and dispatch the per-channel kernel directly.
+    # Depthwise Conv1d (one kernel per channel) — qwen3.5's GatedDeltaNet
+    # causal conv. groups must equal both in_channels and out_channels;
+    # weight shape is (C, 1, K). Dispatch the per-channel kernel directly
+    # rather than the im2col + GEMM detour.
     if (
         groups != 1
         and len(x_shape) == 3

@@ -2,12 +2,12 @@
 
 Combines every layer type that matters for real workloads (attention,
 MLP, residual, norm, LM head, cross-entropy) into one forward+backward
-check. Shapes are intentionally tiny (hidden=32, 1 layer, 4 tokens) so
-the CPU reference runs in well under a second.
+check. Shapes are tiny (hidden=32, 1 layer, 4 tokens) so the CPU
+reference runs in well under a second.
 
-If ``test_grad_ops.py`` and ``test_grad_modules.py`` pass but a test
-here fails, the culprit is usually interaction between fused rewrites
-(e.g. ``gemm_residual_layernorm``) and the backward graph.
+A failure here when the op- and module-level tests pass points at an
+interaction between fused rewrites (e.g. ``gemm_residual_layernorm``)
+and the backward graph.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from tests.grad_helpers import check_grads, module_factory
 
 
 # ---------------------------------------------------------------------------
-# Tiny GPT-2-style causal LM — hand-built so the test has no HF dependency
+# Tiny GPT-2-style causal LM — hand-built, no HF dependency
 # ---------------------------------------------------------------------------
 
 
@@ -56,9 +56,9 @@ class TinyGPT(nn.Module):
         self.block = TinyGPTBlock(d, nh, ff)
         self.ln_f = nn.LayerNorm(d)
         self.head = nn.Linear(d, vocab, bias=False)
-        self.head.weight = self.tok.weight  # weight tying, like real GPT-2
-        # Embeddings produce scatter-add on backward which alloy doesn't
-        # handle yet — freeze them so only the transformer body sees grad.
+        self.head.weight = self.tok.weight  # weight tying, like GPT-2
+        # Freeze embeddings so only the transformer body sees grad
+        # (embedding backward scatter-add is not handled yet).
         self.tok.weight.requires_grad_(False)
         self.pos.weight.requires_grad_(False)
 
@@ -87,9 +87,8 @@ def _tiny_gpt_inputs_factory():
 
 
 # ---------------------------------------------------------------------------
-# Tiny Llama-style block — RMSNorm + SwiGLU + RoPE omitted (CPU grad for
-# the RoPE decomposition is slow without adding more infra). Uses RMSNorm
-# and GLU-style FFN so the RMSNorm + residual backward is exercised.
+# Tiny Llama-style block — RMSNorm + GLU-style FFN, exercising the RMSNorm
+# + residual backward. RoPE is omitted (its decomposed CPU grad is slow).
 # ---------------------------------------------------------------------------
 
 

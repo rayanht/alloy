@@ -19,7 +19,6 @@ def attention(
 ):
     D = Q.shape[1]
     N = Q.shape[0] // BH
-    # Derived constants — no need to pass these as params
     N_KV_BLOCKS = (N + BLOCK_N - 1) // BLOCK_N
     SCALE = CUSTOM_SCALE if (CUSTOM_SCALE is not None and CUSTOM_SCALE > 0) else 1.0 / (D**0.5)
     q_block = al.program_id(0)
@@ -222,7 +221,7 @@ def attention_strided(
     Qh = Q + q_head_off
     Kh = K + k_head_off
     Vh = V + v_head_off
-    # Write output in (B, N, H, D) order — no transpose kernel needed downstream
+    # Write output in (B, N, H, D) order
     O_STRIDE = HEADS_PER_BATCH * D  # stride between sequence positions
     Oh = O + batch * N * O_STRIDE + head * D
     q_start = q_block * BLOCK_M
@@ -240,11 +239,8 @@ def attention_strided(
     # Block-level causal early-exit. The last Q row in this block lives at
     # absolute position Q_START_POS + q_start + BLOCK_M - 1, so the highest
     # K position it can attend to is the same value. K blocks past
-    # `ceil((q_max + 1) / BLOCK_N)` contain only causally-masked positions
-    # and contribute nothing — skipping them halves the K-loop on a full
-    # prefill (triangular workload). The intra-block causal where below
-    # still trims the boundary block. Non-causal callers iterate the full
-    # cache (alloy resolves the `if causal:` branch at trace time).
+    # `ceil((q_max + 1) / BLOCK_N)` are fully causally-masked, so skip them;
+    # the intra-block causal where below trims the boundary block.
     if causal:
         end_kv_blocks = al.minimum(
             al.cast(
@@ -267,11 +263,9 @@ def attention_strided(
     for _jb in range(start_kv_block, end_kv_blocks, 1):
         j = _jb * BLOCK_N
         # K_WRAP > 0 means the K/V buffer is a wrap-modulo cache of that
-        # physical size: read at slot = logical_pos % K_WRAP. Cold prefill
-        # passes the un-wrapped new_k/new_v tensors and sets K_WRAP=0 so
-        # the K-loop reads linearly even when SLIDING_WINDOW > 0 (the
-        # sliding-window logic remains active for masking and loop-start
-        # clamp, but the data lives in a contiguous N-length buffer).
+        # physical size: read at slot = logical_pos % K_WRAP. K_WRAP=0
+        # reads linearly even when SLIDING_WINDOW > 0 (sliding logic stays
+        # active for masking and loop-start clamp on a contiguous buffer).
         if K_WRAP > 0:
             kv_slot = (j + rn) % K_WRAP
         else:
@@ -285,28 +279,19 @@ def attention_strided(
         s = s * SCALE
         s = al.where((j + rn)[None, :] < N_KV, s, -1e30)
         if causal and SLIDING_WINDOW > 0:
-            # Combined causal + sliding-window mask. Original form:
-            #   (k_pos <= q_pos) & (k_pos >= q_pos - SW + 1)
-            # needed q_pos cast to int32 so the subtraction didn't
-            # underflow on uint `rm`. The int32 lowering had an SSA
-            # bug that corrupted the causal check for some Q rows
-            # (gemma3 short prompt would emit `<end_of_turn>` as the
-            # first decoded token even though the sliding lower bound
-            # was a no-op for those positions). Reformulate the
-            # sliding lower bound to (k_pos + SW > q_pos), keeping
-            # both sides uint — equivalent math, no broken cast.
+            # Combined causal + sliding-window mask. The sliding lower bound
+            # (k_pos >= q_pos - SW + 1) is reformulated to (k_pos + SW > q_pos)
+            # to keep both sides uint and avoid a subtraction that underflows
+            # on uint `rm`.
             q_pos = (Q_START_POS + q_start + rm)[:, None]
             k_pos = (j + rn)[None, :]
             s = al.where((k_pos <= q_pos) & (k_pos + SLIDING_WINDOW > q_pos), s, -1e30)
         elif causal:
-            # Causal mask uses ABSOLUTE sequence position. For prefill of a
-            # full prompt, Q_START_POS=0 and (q_start + rm) is already the
-            # sequence index. For warm-prefill of a suffix, Q_START_POS is
-            # the prefix length; (Q_START_POS + q_start + rm) is the
-            # sequence index of the q-th row.
+            # Causal mask uses ABSOLUTE sequence position: Q_START_POS is the
+            # prefix length, so (Q_START_POS + q_start + rm) is the sequence
+            # index of the q-th row (0 for a full-prompt prefill).
             s = al.where((Q_START_POS + q_start + rm)[:, None] >= (j + rn)[None, :], s, -1e30)
         elif SLIDING_WINDOW > 0:
-            # Same k-side reformulation: (k_pos + SW > q_pos).
             q_pos = (Q_START_POS + q_start + rm)[:, None]
             s = al.where(
                 (j + rn)[None, :] + SLIDING_WINDOW > q_pos,
@@ -372,11 +357,9 @@ def attention_strided_runtime_pos(
 ):
     """Warm-prefill variant of `attention_strided` with runtime Q_START_POS.
 
-    Identical to `attention_strided` except `Q_START_POS` is read from a
-    1-element int32 buffer instead of being baked as a constexpr. This lets
-    a single compiled plan handle arbitrary cache offsets across multi-turn
-    requests where the suffix lands at a different absolute position every
-    turn. The cold/SDPA-handler path keeps the constexpr variant so Metal
+    `Q_START_POS` is read from a 1-element int32 buffer instead of a constexpr,
+    so one compiled plan handles arbitrary cache offsets across multi-turn
+    requests. The cold/SDPA-handler path keeps the constexpr variant so Metal
     can constant-fold the causal early-exit's loop bound.
     """
     D = HEAD_DIM
@@ -407,11 +390,10 @@ def attention_strided_runtime_pos(
         mask=(q_start + rm[:, None]) < N,
         other=0.0,
     )
-    # Fold the attention scale into Q (once, before the K-loop) instead of into
-    # each K tile. Mathematically identical — (q*SCALE)·K = SCALE*(q·K) — and it
-    # leaves K a raw device Load whose only consumer is the QK Dot, so the
-    # planner streams K straight from device into the MMA (no shmem tile). The
-    # scaled-Q logit stays as bounded as the scaled-K path did → no f16 overflow.
+    # Fold the attention scale into Q (once, before the K-loop): (q*SCALE)·K =
+    # SCALE*(q·K). K stays a raw device Load whose only consumer is the QK Dot,
+    # so the planner streams it straight into the MMA (no shmem tile). The
+    # scaled-Q logit stays bounded → no f16 overflow.
     q = al.cast(q * SCALE, q.dtype)
     m = -1e30
     l = 0.0  # noqa: E741
@@ -474,37 +456,19 @@ def attention_strided_runtime_pos(
                 mask=(j + rn[:, None]) < N_KV,
                 other=0.0,
             )
-        # Fold the attention scale into K (loaded fresh each iteration, so the
-        # in-place scale applies once per tile — scaling the persistent Q tile
-        # would re-apply it every iteration). Q is downcast to f16 at the
-        # dispatch boundary for f16-throughput MMA, so the QK Dot result spills
-        # to f16 shmem; applying the scale AFTER that spill lets the raw q·k
-        # (summed over HEAD_DIM) exceed f16's 65504 max → +inf → NaN in the
-        # online softmax (all-garbage output on large-logit models, e.g.
-        # qwen2.5:1.5b). Pre-scaling K bounds the stored score to the scaled
-        # logit (~O(10)). The -1e30 causal masks still saturate to -inf in f16,
-        # but that is harmless here: every query attends at least its own key, so
-        # the running max is finite and masked entries exp to 0. al.cast keeps
-        # K's dtype so the MMA stays f16; scale is associative, so it's identical.
         s = al.tile_dot(q, k_tile, transpose_rhs=True)
         # The kv-bound mask only does work when the final K-block overhangs N_KV
-        # (N_KV not a multiple of BLOCK_N). When N_KV divides BLOCK_N evenly —
-        # the common case, native caches are powers of two — every iterated
-        # column index (j+rn) is < N_KV, so the `where` masks nothing yet still
-        # costs ~6% of GPU time at depth in per-element predication + the f16↔f32
-        # round-trip. Both operands are constexprs, so gate it out at trace time
-        # (the cooperative K-load's bound is likewise already elided when even).
+        # (N_KV not a multiple of BLOCK_N). When N_KV divides BLOCK_N evenly
+        # (native caches are powers of two) every column (j+rn) is < N_KV, so the
+        # `where` masks nothing yet costs ~6% of GPU time at depth in predication
+        # + the f16↔f32 round-trip. Both operands are constexprs → gate it out at
+        # trace time.
         if K_WRAP == 0 and N_KV % BLOCK_N != 0:
             s = al.where((j + rn)[None, :] < N_KV, s, -1e30)
         if causal and SLIDING_WINDOW > 0:
-            # Reformulated to avoid the int32-cast SSA lowering bug that
-            # corrupts the causal mask for some Q rows. Original mask:
-            #   (k_pos <= q_pos) & (k_pos >= q_pos - SW + 1)
-            # which requires q_pos as int32 so the subtraction doesn't
-            # underflow on the per-row `rm`. Equivalent form moving SW
-            # to the k side:
-            #   (k_pos <= q_pos) & (k_pos + SW > q_pos)
-            # keeps both sides uint, no cast, no broken lowering path.
+            # Combined causal + sliding-window mask. Move SW to the k side —
+            # (k_pos <= q_pos) & (k_pos + SW > q_pos) — to keep both sides uint
+            # and avoid a subtraction that underflows on the per-row `rm`.
             q_pos = (Q_START_POS + q_start + rm)[:, None]
             k_pos = (j + rn)[None, :]
             valid = (k_pos <= q_pos) & (k_pos + SLIDING_WINDOW > q_pos)
@@ -587,12 +551,9 @@ def attention_strided_runtime_pos_split(
 ):
     """Split-KV (flash-decoding-style) variant of `attention_strided_runtime_pos`.
 
-    Identical masking/softmax/device-streaming to the single-pass kernel (scale
-    folded into Q so K/V stay raw device Loads → the planner streams them into
-    the MMA), but the causal KV block range [start_kv_block, end_kv_blocks) is
-    partitioned evenly across `SPLITS` threadgroups along program_id(2). This
-    parallelizes the long serial K-scan that dominates deep-context prefill,
-    recovering the grid-tail waste (few q-blocks × heads can't fill all cores).
+    The causal KV block range [start_kv_block, end_kv_blocks) is partitioned
+    evenly across `SPLITS` threadgroups along program_id(2), parallelizing the
+    long serial K-scan that dominates deep-context prefill.
 
     Each (q_block, head, split) emits a per-split normalized softmax result
     `partial_O` + its log-sum-exp `partial_lse`; `attention_combine_splits`
@@ -725,15 +686,11 @@ def attention_strided_runtime_pos_split(
         m = mn
         al.barrier()
     # Per-split normalize, guarded for EMPTY splits (split_lo >= split_hi → loop
-    # skipped → l == 0). The plain `o * (1/max(l,eps))` NaNs here: the
-    # persistent-MMA pass lifts the post-scale out of the loop and divides by the
-    # raw (pre-clamp) l, so 1/0 = inf and o*(0*inf) = NaN — which the combine then
-    # propagates (NaN * its 0 weight = NaN). Use the branchless safe reciprocal
-    # l/(l²+ε): exactly 0 when l == 0, and 1/l (relative error ε/l² ≤ ε for the
-    # real l ≥ 1) otherwise. l is the f32 softmax denominator, so ε=1e-12 neither
-    # underflows nor perturbs the result. An empty split thus writes a clean
-    # finite 0 partial; its lse below is -inf, so the combine ignores it. The
-    # single-pass kernel needs no guard (every query attends at least its key).
+    # skipped → l == 0). The persistent-MMA pass lifts the post-scale out of the
+    # loop and divides by the raw (pre-clamp) l, so a plain reciprocal gives
+    # 1/0 = inf and o*(0*inf) = NaN. The branchless safe reciprocal l/(l²+ε) is
+    # exactly 0 when l == 0, and 1/l (relative error ε/l² ≤ ε for l ≥ 1) otherwise;
+    # ε=1e-12 on the f32 softmax denominator neither underflows nor perturbs.
     inv_l = l / (l * l + 1e-12)
     o = o * inv_l
     l = al.maximum(l, 1e-30)  # noqa: E741  (kept finite for the log in lse)
@@ -772,11 +729,9 @@ def attention_combine_splits(
     head), D threads each, so each thread owns a single output element `d` and
     the online-softmax accumulator is 1 float/thread.
 
-    The per-row mapping is what makes the combine a rounding error (~7us vs the
-    split's ~1500us at deep prefill): a 2D (BLOCK_M, D) tile instead lowers the
-    accumulator to a per-thread float[D] that SPILLS to thread-local memory and
-    is held 32x-redundantly across a row's lanes — ~300us, 40x slower, erasing
-    the split-K win.
+    The per-row mapping keeps the accumulator at 1 float/thread; a 2D (BLOCK_M, D)
+    tile would lower it to a per-thread float[D] that SPILLS to thread-local memory
+    held 32x-redundantly across a row's lanes (~40x slower, erasing the split-K win).
     """
     D = HEAD_DIM
     N = SEQ_LEN
@@ -915,7 +870,6 @@ def attention_strided_masked_by_batch(
 
 # fuse_loops=1 is excluded: per-kernel max-diff stays within f32 tolerance
 # but the error compounds across decoder layers into NaN at the lm_head.
-# Re-enable once the fusion pass is fixed or end-to-end validation gates it.
 @al.tunable(BLOCK_M=[8, 16, 32, 64], BLOCK_N=[8, 16, 32], options=dict(fuse_loops=[0]))
 @al.kernel
 def attention_strided_masked_by_batch_with_lse(
@@ -949,10 +903,9 @@ def attention_strided_masked_by_batch_with_lse(
     KV_LEN: al.constexpr = 0,
     Q_START_POS: al.constexpr = 0,
 ):
-    """Fwd attention + lse in one pass. Saves re-reading Q/K/mask for the
-    separate logsumexp kernel. Body mirrors `attention_strided_masked_by_batch`
-    exactly — only addition is the `log_sum_exp` store at the end using the
-    final (m, l) already computed for the output normalization."""
+    """Fwd attention + lse in one pass, saving a re-read of Q/K/mask for the
+    separate logsumexp kernel. Body mirrors `attention_strided_masked_by_batch`;
+    the only addition is the `log_sum_exp` store using the final (m, l)."""
     D = HEAD_DIM
     N = SEQ_LEN
     N_KV = KV_LEN if KV_LEN > 0 else N
@@ -1256,14 +1209,10 @@ def attention_compute_delta_strided(
         mask=row_mask[:, None],
         other=0.0,
     )
-    # Match metal-flash-attention's `D_accumulator += float2(dO_value) *
-    # float2(O_value)` — Metal's `bfloat * bfloat` does not auto-promote to
-    # float (unlike `half`), so without explicit f32 casts the multiply lives
-    # in bf16 precision. Per-element bf16 product loses ~0.4% precision and
-    # the resulting delta error breaks the FA-2 cancellation `ds = p*(dp -
-    # delta)` under K-bias amplification (Qwen K bias 316 → q_proj LoRA grad
-    # explodes). With the deferred-cast emitter fix in tile_msl.py, the cast
-    # propagates through `_elem_access` to per-element shared-mem accesses.
+    # Explicit f32 casts: Metal's `bfloat * bfloat` does not auto-promote to float
+    # (unlike `half`), so without them the multiply lives in bf16. The ~0.4% bf16
+    # product error breaks the FA-2 cancellation `ds = p*(dp - delta)` under K-bias
+    # amplification (Qwen K bias 316 → q_proj LoRA grad explodes).
     delta = al.sum(al.cast(go, al.float32) * al.cast(o, al.float32), axis=1)
     al.store(Delta + bh * SEQ_LEN + s + rm, delta, mask=row_mask)
 
@@ -2068,13 +2017,9 @@ def attention_kv_update_split(
     N_KV_ACTIVE = cache_pos + 1
 
     # Partition the ACTIVE blocks (ceil(fill/BLOCK_N)) across splits, not the
-    # allocated cache length. Sizing the chunk by the cache size concentrates a
-    # fixed fill into the first fill/CHUNK splits and idles the rest, collapsing
-    # TG occupancy when fill << cache (a 1.4k-fill decode in a 16k cache lit only
-    # 6/64 splits → 9% occupancy vs 36% in a 4k cache). The active-end clamp
-    # below still trims the last split's tail; partitioning by N_ACTIVE_BLOCKS
-    # makes the split layout itself track fill so all SPLITS stay busy
-    # regardless of the cache budget.
+    # allocated cache length: sizing the chunk by the cache size concentrates a
+    # fixed fill into the first fill/CHUNK splits and idles the rest when
+    # fill << cache. Tracking fill keeps all SPLITS busy regardless of cache budget.
     N_ACTIVE_BLOCKS = al.cast((N_KV_ACTIVE + BLOCK_N - 1) // BLOCK_N, al.int32)
     CHUNK_BLOCKS = (N_ACTIVE_BLOCKS + SPLITS - 1) // SPLITS
     split_block_start = al.cast(split_idx, al.int32) * CHUNK_BLOCKS
@@ -2268,16 +2213,12 @@ def attention_decode_vector_split(
     lane = al.arange(0, 32)
     lane_off = lane * PER_LANE
 
-    # Per-split K range (precomputed before the PER_LANE branch so both paths
-    # share the bounds). Partition the ACTIVE WINDOW [loop_lo, N_KV_ACTIVE)
-    # evenly across splits — NOT [0, N_KV_ACTIVE): once the window has slid off
-    # zero (cache_pos >= SW) the leading [0, loop_lo) positions are evicted, and
-    # partitioning from 0 would pile the whole live window into the last
-    # split(s) and idle the rest. Sizing CHUNK by the live span also keeps all
-    # SPLITS busy regardless of cache allocation (a fixed fill in a big cache
-    # otherwise lights only the first few splits). Empty splits
-    # (split_start >= N_KV_ACTIVE) still write a -inf-lse partial that combine
-    # ignores.
+    # Per-split K range. Partition the ACTIVE WINDOW [loop_lo, N_KV_ACTIVE) evenly
+    # across splits — NOT [0, N_KV_ACTIVE): once the window has slid off zero
+    # (cache_pos >= SW) the leading [0, loop_lo) positions are evicted, and
+    # partitioning from 0 would pile the live window into the last split(s). Sizing
+    # CHUNK by the live span keeps all SPLITS busy regardless of cache allocation.
+    # Empty splits (split_start >= N_KV_ACTIVE) write a -inf-lse partial.
     SPAN = al.cast(N_KV_ACTIVE, al.int32) - loop_lo
     CHUNK = (SPAN + SPLITS - 1) // SPLITS
     split_start = loop_lo + al.cast(split_idx, al.int32) * CHUNK
@@ -2504,30 +2445,23 @@ def attention_kv_update_vector_split_multi(
     UNROLL: al.constexpr = 8,
     BIDIR_BLOCK: al.constexpr = 0,
 ):
-    """Vector-path multi-token flash decoding with fused KV update — the M in
-    [2, MAX_VERIFY_K] spec-verify counterpart of `attention_decode_vector_split`.
+    """Vector-path multi-token flash decoding with fused KV update — the
+    K_INPUT > 1 spec-verify counterpart of `attention_decode_vector_split`.
 
     BIDIR_BLOCK=1 lifts the per-row causal bound to the whole new-token block
     (every row attends [0, cache_pos + K_INPUT)): the DFlash draft's block
-    attention — mask tokens attend bidirectionally within the block and fully
-    to the context KV. Identical write/read structure
-    otherwise.
+    attention — mask tokens attend bidirectionally within the block and fully to
+    the context KV.
 
-    Same 1-simdgroup (32-thread) vec4 path as the M=1 vector decode — PER_LANE =
-    HEAD_DIM/32 dims per lane, one `simd_reduce` per score, zero shmem / zero
-    barriers in the K-loop, exp2 softmax frame — generalized to K_INPUT query
-    rows: each lane carries K_INPUT Q slices and K_INPUT (m, l, o) softmax states,
-    so K and V are read ONCE per position and reused across rows. A 2-token verify
-    then costs ~2× a 1-token decode instead of ~15× on the padded-MMA path
-    (`attention_kv_update_split_multi`: BLOCK_M=8 for 2 real rows, 8 splits).
-
-    Query row i sits at absolute position cache_pos + i and attends causally to
-    [0, cache_pos + i]; the per-row mask only bites at the K_INPUT-1 new-token
-    tail, the bulk scan is shared. Requires HEAD_DIM in {128, 256, 512}
+    Same 1-simdgroup (32-thread) vec4 path as the M=1 vector decode (PER_LANE =
+    HEAD_DIM/32 dims per lane, one `simd_reduce` per score, exp2 softmax frame),
+    generalized to K_INPUT query rows: each lane carries K_INPUT Q slices and
+    K_INPUT (m, l, o) softmax states, so K and V are read ONCE per position and
+    reused across rows. Query row i sits at absolute position cache_pos + i and
+    attends causally to [0, cache_pos + i]. Requires HEAD_DIM in {128, 256, 512}
     (PER_LANE 4/8/16, vec4 path); HEAD_DIM 64 stays on the MMA path.
 
-    partial_O: (BH, SPLITS, K_INPUT, HEAD_DIM); partial_lse: (BH, SPLITS, K_INPUT)
-    — combined by `attention_decode_combine_multi` with BLOCK_M = K_INPUT.
+    partial_O: (BH, SPLITS, K_INPUT, HEAD_DIM); partial_lse: (BH, SPLITS, K_INPUT).
     """
     D = HEAD_DIM
     SCALE = CUSTOM_SCALE if (CUSTOM_SCALE is not None and CUSTOM_SCALE > 0) else 1.0 / (D**0.5)
@@ -2732,15 +2666,11 @@ def attention_decode_combine_vector_par(
 ):
     """Split-parallel combine for `attention_decode_vector_split`.
 
-    The serial version runs one threadgroup per head and walks SPLITS serially
-    — fine at SPLITS≤64 but a 16-TG bottleneck that grows with SPLITS. This
-    spreads the work over a (BH, HEAD_DIM/4) grid: each 32-lane TG owns ONE head
-    and 4 output dims, the 32 lanes split the SPLITS reduction (each does
-    SPLITS/32), and a simd_reduce finishes it. Turns 16 TGs / SPLITS-serial into
-    BH*HEAD_DIM/4 TGs / (SPLITS/32)-serial, so it fills the machine and barely
-    grows with SPLITS — unlocking higher split counts for the split kernel.
-    Grid: (BH, HEAD_DIM // 4). Requires SPLITS a multiple of 32 (the flash
-    decoder always picks a power-of-two ≥ 32 here).
+    Spreads the reduction over a (BH, HEAD_DIM/4) grid: each 32-lane TG owns ONE
+    head and 4 output dims, the 32 lanes split the SPLITS reduction (each does
+    SPLITS/32), and a simd_reduce finishes it. Fills the machine and barely grows
+    with SPLITS (vs the serial one-TG-per-head combine). Grid: (BH, HEAD_DIM // 4).
+    Requires SPLITS a multiple of 32 (the flash decoder picks a power-of-two ≥ 32).
     """
     D = HEAD_DIM
     bh = al.program_id(0)
@@ -2810,11 +2740,8 @@ def attention_decode_combine(
 
     Two passes: pass 1 builds m_global + sum_weights via online merge;
     pass 2 accumulates each split's pre-normalized partial weighted by
-    exp(lse_s - m_global) / sum_weights.
-
-    Uses 1D tile loads (not 2D with a broadcast row) — the 2D cooperative
-    load pattern silently dropped the coef multiplier in pass 2, producing
-    an unweighted sum of partials.
+    exp(lse_s - m_global) / sum_weights. Uses 1D tile loads — the 2D
+    cooperative load pattern drops the coef multiplier in pass 2.
     """
     D = HEAD_DIM
     bh = al.program_id(0)
@@ -3022,11 +2949,7 @@ def attention_kv_update_split_multi(
         o,
         mask=(rm[:, None] < BLOCK_M) & (rd[None, :] < D) & (bh < BH),
     )
-    # Per-row lse stored as 1D. The single-token kernel uses a (BLOCK_M, 1)
-    # tile because its BLOCK_M rows are padded copies of one query — the
-    # broadcast-with-zeros there preserves row 0's value across all stores.
-    # For multi-token each row carries a distinct query so we need real
-    # per-row writes.
+    # Per-row lse stored as 1D — each row carries a distinct query.
     lse_value = m + al.log(l)
     al.store(PLseh + rm, lse_value, mask=(rm < BLOCK_M) & (bh < BH))
 
@@ -3076,9 +2999,8 @@ def attention_kv_write(
     last REAL row index, so the real end position is cache_pos + last_real + 1.
     When set (>= 0) only positions [end-SW, end) write — ONE writer per ring
     slot. Without it a chunk longer than the window has rows s, s+SW, s+2·SW…
-    racing for slot s with no ordering guarantee: measured >80% of slots
-    holding stale-position K/V, non-deterministic run-to-run. Negative =
-    sentinel "no bound" (legacy multi-writer behaviour) so unmanaged dispatch
+    racing for slot s with no ordering guarantee (>80% stale-position K/V,
+    non-deterministic). Negative = sentinel "no bound" so unmanaged dispatch
     paths fail open, not silent-empty.
     """
     q_idx = al.program_id(0)
@@ -3158,12 +3080,10 @@ def attention_decode_combine_multi(
             other=0.0,
         )
         # Empty splits (their KV-block loop never ran) carry the lse=-inf
-        # sentinel and an UNINITIALIZED persistent-MMA `partial_O` (the split
-        # kernel's `o * (1/l)` can't zero a garbage accumulator). coef is ~0 for
-        # them, but NaN*0 = NaN would poison the sum — so select 0 by the
-        # sentinel (a select, not a multiply, so the NaN never propagates). A
-        # fully causal-masked real row hits the same sentinel and is also a true
-        # zero contribution, so this is correct, not just defensive.
+        # sentinel and an UNINITIALIZED persistent-MMA `partial_O`. coef is ~0 for
+        # them, but NaN*0 = NaN would poison the sum — so select 0 by the sentinel
+        # (a select, not a multiply, so the NaN never propagates). A fully
+        # causal-masked real row hits the same sentinel and is a true zero too.
         o_s = al.where(lse_s > -1e29, o_s, 0.0)
         o_accum = o_accum + o_s * coef
 

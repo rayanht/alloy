@@ -1,9 +1,8 @@
 """FX handler for the on-GPU categorical sampler.
 
 Lowers `torch.ops.alloy.sample_categorical` to the `std.sample_categorical`
-kernel. Mirrors `_argmax` (reductions.py): reduces the last (vocab) dim of
-`logits` to a sampled token id, so the decode plan's final kernel can be the
-sampler instead of `argmax_last_dim` with no other change to the loop.
+kernel: reduces the last (vocab) dim of `logits` to a sampled token id, so the
+decode plan's final kernel can be the sampler instead of `argmax_last_dim`.
 """
 
 import math

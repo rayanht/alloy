@@ -2,10 +2,8 @@
 
 Reference: a numpy decode of the exact GGUF block_q4_K layout (d/dmin f16,
 12B packed 6-bit scales/mins via get_scale_min_k4, 128B interleaved nibbles;
-weight = d*scale*nibble - dmin*min). Every migrated kernel decodes the same
-random blocks and must match this reference. The matvec (dot_q4_k_v2) is the
-kernel_bench/llama-validated body; this additionally pins the new pieces — the
-tiled cooperative-load dequant, the amortized rows kernels, and embedding.
+weight = d*scale*nibble - dmin*min). Every kernel decodes the same random
+blocks and must match this reference.
 """
 
 import numpy as np

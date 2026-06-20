@@ -1,16 +1,14 @@
 """Generic transformers GGUF-loader patches + the fast in-RAM metadata walk.
 
-These are architecture-agnostic loading mechanics (not model shims): a single-pass
-mmap walk that replaces `gguf.GGUFReader`'s per-element parse, a fast
+Architecture-agnostic loading mechanics: a single-pass mmap walk that replaces
+`gguf.GGUFReader`'s per-element parse, a fast
 `load_gguf_checkpoint(return_tensors=False)` path, memoization of
 `get_tensor_name_map`, and the split-out-text-config → GGUF-arch translation the
 weight map needs. They patch transformers at import.
 
-`BYPASS_CONFIG_FIXUPS` is the one model seam: archs whose config needs a fixup on
-code paths that bypass the main loader (the AutoTokenizer build calls
-`load_gguf_checkpoint` directly, then feeds the config to `AutoConfig.for_model`)
-register their fixup here (the handler does it in `apply_transformers_patches`),
-so this module stays free of any `models/` import.
+`BYPASS_CONFIG_FIXUPS` lets archs whose config needs a fixup on code paths that
+bypass the main loader (the AutoTokenizer build calls `load_gguf_checkpoint`
+directly, then feeds the config to `AutoConfig.for_model`) register their fixup.
 """
 
 from __future__ import annotations
@@ -30,7 +28,7 @@ from transformers.models.auto import tokenization_auto
 
 # Arch (GGUF `model_type`) -> config fixup, applied on loader paths that bypass
 # the main `load_causal_lm` (e.g. AutoTokenizer). Populated by handlers at
-# `apply_transformers_patches`; keeps this module free of a `models/` import.
+# `apply_transformers_patches`.
 BYPASS_CONFIG_FIXUPS: dict[str, Callable[[dict], None]] = {}
 
 
@@ -155,8 +153,7 @@ def arch_needs_original_loader(architecture, model_name):
     stablelm qkv_bias probing, t5 gated-act, gemma3/minimax/lfm2 model_type
     rewrites, MoE arch renames, mistral-via-llama). For those, fall back to the
     original loader so the model config never silently diverges. The supported
-    models (qwen2/qwen3/qwen35, llama, deepseek=qwen2) need none of this and are
-    dict-equality-validated against the original."""
+    models (qwen2/qwen3/qwen35, llama, deepseek=qwen2) need none of this."""
     a = architecture
     if "t5" in a or "stablelm" in a or "gpt_oss" in a or "gpt-oss" in a:
         return True
@@ -175,8 +172,7 @@ def fast_load_gguf_checkpoint(gguf_checkpoint_path):
     Reproduces transformers' field-rename loop + the metadata-only fixups
     (tie_word_embeddings, config defaults, vocab_size-from-tokens) exactly,
     using `GGUF_TO_TRANSFORMERS_MAPPING`, so the returned `{config, tokenizer,
-    tokenizer_config}` dict is byte-equal to the original's. Validated by
-    dict-equality against the GGUFReader path on every supported model.
+    tokenizer_config}` dict is byte-equal to the original's.
 
     Returns ``None`` for architectures that need the original loader's extra
     config logic (see `arch_needs_original_loader`) — the caller then falls back.
@@ -240,8 +236,7 @@ def patched_load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, mod
     `AutoConfig.for_model`).
 
     For metadata-only loads (`return_tensors=False`), parse via the fast in-RAM
-    walk instead of the per-element GGUFReader. The fast walk yields a
-    byte-identical dict, so every downstream consumer is unchanged.
+    walk instead of the per-element GGUFReader.
     """
     parsed = None
     if not return_tensors and FAST_GGUF_METADATA:
@@ -263,8 +258,7 @@ ORIGINAL_GET_GGUF_HF_WEIGHTS_MAP = modeling_gguf_pytorch_utils.get_gguf_hf_weigh
 
 def patched_get_gguf_hf_weights_map(hf_model, processor, model_type=None, num_layers=None, qual_name=""):
     """Wrap get_gguf_hf_weights_map to translate split-out text model_types to
-    the GGUF arch name gguf-py's MODEL_ARCH_NAMES expects. Pass through
-    everything else unchanged."""
+    the GGUF arch name gguf-py's MODEL_ARCH_NAMES expects."""
     effective_model_type = (
         hf_model.config.model_type if model_type is None else model_type
     )

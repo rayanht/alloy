@@ -44,8 +44,8 @@ def _alloc_quantized_kv(
 ) -> None:
     """Allocate the quantized KV buffer set in place of fp16 keys/values:
     int8 codes (same logical shape) + fp16 scales per 32-elem head_dim block.
-    The fp16 K/V tensors are never allocated — that's the memory win; the
-    attention path reads/writes codes via `alloy.attention_cache_q8`."""
+    The fp16 K/V tensors are never allocated (the memory win); the attention
+    path reads/writes codes via `alloy.attention_cache_q8`."""
     assert head_dim % kv_format.block_elems == 0, (head_dim, kv_format.block_elems)
     codes_shape = (max_batch_size, num_kv_heads, phys_len, head_dim)
     scales_shape = (max_batch_size, num_kv_heads, phys_len, head_dim // kv_format.block_elems)
@@ -95,16 +95,13 @@ class AlloyStaticLayer(StaticLayer):
                 torch._dynamo.mark_static_address(self.cumulative_length)
             self.is_initialized = True
             return
-        # Eagerly allocate K/V in alloy-owned memory at construction (mirroring
-        # AlloyLinearAttentionLayer's conv/recurrent states) instead of lazily
-        # on the first forward. Lazy init calls buf_alloc/buf_ptr (nanobind) +
-        # memset/from_address (ctypes) — none traceable by dynamo — so doing it
+        # Eagerly allocate K/V in alloy-owned memory at construction instead of
+        # lazily on the first forward. Lazy init calls buf_alloc/buf_ptr (nanobind)
+        # + memset/from_address (ctypes) — none traceable by dynamo — so doing it
         # inside the compiled forward forces a graph break per layer per buffer
-        # (~50 across a hybrid model, the only avoidable breaks left). Allocating
-        # here, outside the compiled region, keeps the prefill forward
-        # break-free. Shapes come from config; fall back to lazy init when the
-        # head dims aren't known (mark_static_address runs because construction
-        # is always in eager mode).
+        # (~50 across a hybrid model). Allocating here, outside the compiled region,
+        # keeps the prefill forward break-free. Shapes come from config; fall back
+        # to lazy init when the head dims aren't known.
         if cache_dtype is not None and num_kv_heads is not None and head_dim is not None:
             kv_shape = (max_batch_size, num_kv_heads, max_cache_len, head_dim)
             self.keys = _alloy_owned_empty(kv_shape, cache_dtype, alloc)
@@ -135,12 +132,10 @@ class AlloyStaticLayer(StaticLayer):
         cache_kwargs: CacheKwargs = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # HF's StaticLayer.update increments self.cumulative_length per call,
-        # producing one tiny add_cast_i64 dispatch per layer per step —
-        # every full_attention layer advances in lockstep, so the per-layer
-        # increment is redundant work. Skip the in-graph increment here;
-        # AlloyStaticCache aliases one cumulative_length tensor across all
-        # AlloyStaticLayers so a single wrapper-level .add_() advances
-        # every layer's view at once.
+        # one tiny add_cast_i64 dispatch per layer per step — redundant since every
+        # full_attention layer advances in lockstep. Skip the in-graph increment
+        # here; AlloyStaticCache aliases one cumulative_length tensor across all
+        # AlloyStaticLayers so a single wrapper-level .add_() advances every layer.
         write_key_states, write_value_states = _cache_write_views(self, key_states, value_states)
         if not self.is_initialized:
             self.lazy_initialization(write_key_states, write_value_states)
@@ -215,15 +210,13 @@ class AlloyStaticSlidingWindowLayer(StaticSlidingWindowLayer):
                     torch._dynamo.mark_static_address(self.cumulative_length)
             self.is_initialized = True
             return
-        # Eagerly allocate K/V here (mirroring AlloyStaticLayer) instead of lazily
-        # on the first forward. Lazy init runs INSIDE the compiled forward where
-        # `is_torchdynamo_compiling()` is True, so `_alloy_lazy_initialization`
-        # SKIPS `mark_static_address` — leaving the sliding cache buffers as
-        # non-static addresses. Dynamo then mishandles them (symbolic-shape /
-        # changing-address path), silently producing garbage output that
-        # compounds over the sliding layers. AlloyStaticLayer dodges this because
-        # it allocates at construction (eager mode). `self.max_cache_len` is the
-        # HF-capped window size after `super().__init__`.
+        # Eagerly allocate K/V here instead of lazily on the first forward. Lazy
+        # init runs INSIDE the compiled forward where `is_torchdynamo_compiling()`
+        # is True, so `_alloy_lazy_initialization` SKIPS `mark_static_address`,
+        # leaving the sliding cache buffers as non-static addresses. Dynamo then
+        # mishandles them (symbolic-shape / changing-address path), producing
+        # garbage output that compounds over the sliding layers. `self.max_cache_len`
+        # is the HF-capped window size after `super().__init__`.
         if cache_dtype is not None and num_kv_heads is not None and head_dim is not None:
             kv_shape = (max_batch_size, num_kv_heads, self.max_cache_len, head_dim)
             self.keys = _alloy_owned_empty(kv_shape, cache_dtype, alloc)
@@ -276,12 +269,10 @@ class AlloyStaticSlidingWindowLayer(StaticSlidingWindowLayer):
 
 
 # Speculative-verify slot-bank width for DeltaNet recurrent states. attach_spec
-# sets this to the drafter's verify width BEFORE any cache is constructed
-# (single-user server contract — same pattern as set_use_alloy_warm_op). Plain
-# decode reads ONLY slot 0, so the default is 1 — a wider bank is pure waste
-# without a drafter (the bank is `recurrent_states`' leading dim, replicated
-# per layer AND per paged KV slice: at width 8 on qwen3.5:4b that was ~2.7 GB
-# committed across the 8-slice table for a feature that wasn't attached).
+# sets this to the drafter's verify width BEFORE any cache is constructed. Plain
+# decode reads ONLY slot 0, so the default is 1 — a wider bank is waste without a
+# drafter (the bank is `recurrent_states`' leading dim, replicated per layer AND
+# per paged KV slice: width 8 on qwen3.5:4b is ~2.7 GB across the 8-slice table).
 _SPEC_SLOT_BANK = 1
 
 
@@ -302,20 +293,16 @@ class AlloyLinearAttentionLayer(LinearAttentionLayer):
       - `recurrent_states`: (B, num_v_heads, head_k_dim, head_v_dim) —
         GatedDeltaNet recurrent state.
 
-    Unlike the upstream `LinearAttentionLayer` which lazy-initialises
-    in `update_conv_state` / `update_recurrent_state`, we eagerly
-    allocate both states at construction time in alloy-owned memory.
-    Reason: the alloy custom op `linear_attention_update` reads
-    `layer.conv_states` / `layer.recurrent_states` directly as op
-    inputs — they need to be real tensors at FX-trace time, not None.
-    Eager allocation also guarantees stable storage_ptrs across calls
-    so Dynamo doesn't recompile when the lazy-init flips.
+    Both states are eagerly allocated at construction in alloy-owned memory
+    (not lazily): the alloy custom op `linear_attention_update` reads
+    `layer.conv_states` / `layer.recurrent_states` directly as op inputs, so
+    they must be real tensors at FX-trace time. Eager allocation also keeps
+    storage_ptrs stable across calls so Dynamo doesn't recompile.
 
-    `_alloy_cache_dtype = None` keeps `use_alloy_cache_op(layer)`
-    returning False for linear layers — the gated-attention forward
-    patch only routes ATTENTION layers through `alloy_cache_attention`.
-    The DeltaNet path uses the dedicated `linear_attention_update`
-    custom op directly.
+    `_alloy_cache_dtype = None` keeps `use_alloy_cache_op(layer)` False for
+    linear layers — the gated-attention forward patch routes only ATTENTION
+    layers through `alloy_cache_attention`; the DeltaNet path uses the
+    dedicated `linear_attention_update` op.
     """
 
     _alloy_cache_dtype: torch.dtype | None = None
@@ -336,8 +323,8 @@ class AlloyLinearAttentionLayer(LinearAttentionLayer):
             text = config.get_text_config(decoder=True)
         else:
             text = config
-        # Direct attribute access — errors explicitly if missing so we
-        # catch new hybrid models that diverge from this contract.
+        # Direct attribute access — errors explicitly if a new hybrid model
+        # diverges from this contract.
         conv_kernel_size = int(text.linear_conv_kernel_dim)
         num_k_heads = int(text.linear_num_key_heads)
         num_v_heads = int(text.linear_num_value_heads)
@@ -353,32 +340,26 @@ class AlloyLinearAttentionLayer(LinearAttentionLayer):
         dtype = torch.float32
         conv_shape = (max_batch_size, conv_dim, conv_kernel_size)
         # Leading dim = K-step bank (the speculative-verify width). Decode and
-        # prefill write only slot [0] (the recurrent kernel's SAVE_STEPS=0 path,
-        # which uses `state_col_addr` = offset into slot 0); a serial SAVE_STEPS
-        # spec verify writes per-token states [0..S-1] so a partial-accept
-        # rollback is a free slot-copy instead of a target re-run. Extra slots
-        # are inert otherwise. Sized by `set_spec_slot_bank` (attach_spec sets
-        # it BEFORE any cache is built): 8 covers the small-width slot-bank
-        # drafters (MTP/PLD); chunk-aligned widths (DFlash block 16) use the
-        # dvblock+reconstruct verify, which never writes past slot 0, so
-        # attach_spec sizes the bank to 1 (vs 16 slots ≈ +400MB resident on
-        # qwen3.5:4b).
+        # prefill write only slot [0] (the recurrent kernel's SAVE_STEPS=0 path);
+        # a serial SAVE_STEPS spec verify writes per-token states [0..S-1] so a
+        # partial-accept rollback is a slot-copy instead of a target re-run. Sized
+        # by `set_spec_slot_bank` (attach_spec sets it BEFORE any cache is built):
+        # 8 covers the small-width slot-bank drafters (MTP/PLD); chunk-aligned
+        # widths (DFlash block 16) use the dvblock+reconstruct verify, which never
+        # writes past slot 0, so attach_spec sizes the bank to 1 (16 slots ≈ +400MB
+        # resident on qwen3.5:4b).
         rec_shape = (_SPEC_SLOT_BANK, max_batch_size, num_v_heads, head_k_dim, head_v_dim)
         self.conv_states = _alloy_owned_empty(conv_shape, dtype, alloc)
         self.recurrent_states = _alloy_owned_empty(rec_shape, dtype, alloc)
-        # Pad mask buffer: int64 (1, max_prefill_bucket) — 1 for real tokens,
-        # 0 for pads. Pre-allocated so the patched DeltaNet forward can read
-        # it via `layer.alloy_attn_mask` (a normal tensor attribute that
-        # dynamo traces) instead of going through a Python dict lookup that
-        # forces a graph break and disables Tensor(c!) mutation propagation
-        # on the linear_attention_update op. Updated via .copy_() each
-        # prefill call. Initialised to all-ones so decode (seq_len=1)
-        # always sees "no pads".
-        # Must span the longest single prefill. Chunked prefill caps at the chunk
-        # size, but grid-shrunk chunk prefill drives seq_len up to the model's native
-        # context (the cache is sized there too), so a hardcoded 4096 cap would
-        # clamp the mask (`full_mask[:, :seq_len]`) and corrupt DeltaNet pad
-        # handling for M_MAX > 4096. int64 × native ≈ a few MB/layer — negligible.
+        # Pad mask buffer: int64 (1, max_mask) — 1 for real tokens, 0 for pads.
+        # Pre-allocated so the patched DeltaNet forward reads it via
+        # `layer.alloy_attn_mask` (a normal tensor attribute dynamo traces) instead
+        # of a Python dict lookup that forces a graph break and disables Tensor(c!)
+        # mutation propagation on the linear_attention_update op. Updated via
+        # .copy_() each prefill call; all-ones so decode (seq_len=1) sees "no pads".
+        # Must span the longest single prefill: grid-shrunk chunk prefill drives
+        # seq_len up to the model's native context, so a 4096 cap would clamp the
+        # mask (`full_mask[:, :seq_len]`) and corrupt pad handling for M_MAX > 4096.
         max_mask = int(text.max_position_embeddings)
         self.alloy_attn_mask = _alloy_owned_empty((max_batch_size, max_mask), torch.int64, alloc)
         self.alloy_attn_mask.fill_(1)
@@ -400,15 +381,13 @@ class AlloyShortConvLayer(AlloyLinearAttentionLayer):
     The conv-only sibling of `AlloyLinearAttentionLayer`: LFM2's mixer is a
     causal depthwise Conv1d with NO recurrent rule, so it keeps ONLY the rolling
     `conv_states` window — `recurrent_states` stays None. Subclassing
-    `AlloyLinearAttentionLayer` means every `isinstance(layer,
-    AlloyLinearAttentionLayer)` hybrid check (kv.py / prefix.py / spec.py)
-    automatically treats it as position-bound state; those sites guard
-    `recurrent_states` with `is not None`.
+    `AlloyLinearAttentionLayer` makes every `isinstance(layer,
+    AlloyLinearAttentionLayer)` hybrid check treat it as position-bound state;
+    those sites guard `recurrent_states` with `is not None`.
 
-    `conv_states` is `(B, hidden_size, conv_L_cache)` — the conv operates on the
-    `B * x` channels (hidden_size wide), kernel length `conv_L_cache`. The pad
-    mask (`alloy_attn_mask`) is carried so the patched conv forward derives the
-    real prompt length for the conv-state save in a padded prefill chunk.
+    `conv_states` is `(B, hidden_size, conv_L_cache)`. The pad mask
+    (`alloy_attn_mask`) is carried so the patched conv forward derives the real
+    prompt length for the conv-state save in a padded prefill chunk.
     """
 
     def __init__(
@@ -428,8 +407,8 @@ class AlloyShortConvLayer(AlloyLinearAttentionLayer):
         text = config.get_text_config(decoder=True) if hasattr(config, "get_text_config") else config
         conv_kernel_size = int(text.conv_L_cache)
         conv_dim = int(text.hidden_size)
-        # Conv state kept in fp32 (the conv kernels accumulate in fp32; the
-        # window is tiny so fp16 buys nothing and would truncate the carry).
+        # Conv state kept in fp32 (the conv kernels accumulate in fp32; fp16 would
+        # truncate the carry).
         dtype = torch.float32
         conv_shape = (max_batch_size, conv_dim, conv_kernel_size)
         self.conv_states = _alloy_owned_empty(conv_shape, dtype, alloc)
@@ -490,29 +469,21 @@ class AlloyStaticCache(StaticCache):
         ]
 
         # Alias cumulative_length across every attention layer — full AND
-        # sliding-window. Combined with AlloyStaticLayer.update skipping the
-        # per-layer .add_, this lets the model wrapper do ONE in-graph
-        # cumulative_length.add_(kv_length) to advance every layer's view of
-        # the current position.
+        # sliding-window — so the model wrapper does ONE in-graph
+        # cumulative_length.add_(kv_length) to advance every layer's view.
         #
         # Sliding layers MUST be included: in a hybrid stack (Gemma3's 5:1
-        # sliding:full pattern) layer 0 is a sliding-window layer, and
-        # generation.py advances `layers[0].cumulative_length`. The model's
-        # `position_ids = arange(seq) + past_key_values.get_seq_length()`
-        # reads the cumulative_length off a (different) layer; if the sliding
-        # layers carry their own un-aliased tensors, the wrapper's advance
-        # never reaches the layer get_seq_length() inspects. That pins decode
-        # `position_ids` at 0 — every decoded token gets RoPE for position 0
-        # while the cache is written at the correct slot, so Q/K rotations
-        # mismatch the cached keys and decode produces garbage. (Full-attn
-        # models dodged this only because layer 0 was already the shared
-        # tensor.) Alias every alloy attention layer to ONE tensor so the
-        # single wrapper advance moves all views, sliding included.
+        # sliding:full pattern) layer 0 is sliding, and generation.py advances
+        # `layers[0].cumulative_length`. The model's `position_ids = arange(seq) +
+        # past_key_values.get_seq_length()` reads cumulative_length off a layer; if
+        # the sliding layers carry their own un-aliased tensors, the advance never
+        # reaches the layer get_seq_length() inspects, pinning decode `position_ids`
+        # at 0 — RoPE for position 0 against keys cached at the correct slot, so Q/K
+        # rotations mismatch and decode produces garbage.
         #
-        # For hybrid caches (qwen3.5: linear-attention layers interleaved with
-        # full attention), the linear layers don't normally carry a
-        # cumulative_length attribute. Alias the shared tensor onto linear
-        # layers as well so the wrapper-level access stays uniform.
+        # Hybrid linear-attention layers don't normally carry a cumulative_length
+        # attribute; alias the shared tensor onto them too so wrapper-level access
+        # stays uniform.
         shared: torch.Tensor | None = None
         for layer in layers:
             if not isinstance(layer, (AlloyStaticLayer, AlloyStaticSlidingWindowLayer)):
@@ -593,14 +564,12 @@ def _alloy_owned_empty(
     handle = (alloc or _metal_ext.buf_alloc)(nbytes)
     aligned_ptr = _metal_ext.buf_ptr(handle)
     # No memset: a Metal shared buffer is anonymous memory, so macOS zero-fills
-    # each page on first fault — it reads as zero until written, identical to an
-    # explicit memset but without committing physical pages up front. This keeps
-    # allocation lazy so a full-context KV cache (e.g. qwen3.5's 256k) costs only
-    # the pages actually filled, not its entire virtual size. Reuse paths that
-    # need a clean slate (linear-attention recurrent/conv state) re-zero
-    # explicitly; full-attention KV is never read past cumulative_length (causal
-    # mask), so it needs no init. (Mirrors buf_alloc, which dropped its memset in
-    # 4ea7f64 for the same reason.)
+    # each page on first fault — it reads as zero until written, without committing
+    # physical pages up front. This keeps allocation lazy so a full-context KV cache
+    # (e.g. qwen3.5's 256k) costs only the pages actually filled, not its entire
+    # virtual size. Reuse paths that need a clean slate (linear-attention
+    # recurrent/conv state) re-zero explicitly; full-attention KV is never read past
+    # cumulative_length (causal mask), so it needs no init.
     raw = (ctypes.c_uint8 * nbytes).from_address(aligned_ptr)
     flat = torch.frombuffer(raw, dtype=torch.uint8)
     new_storage = flat.untyped_storage()
@@ -667,11 +636,9 @@ def _make_cache_layer(
     # Sliding/chunked layers stay fp16 even when a KV format is active: their
     # cache is BOUNDED (window-sized — no growing-KV memory or bandwidth win),
     # and their chunk>window prefill needs the cold-path linear-temp machinery
-    # (`attention_prefill_cold`) that the unified q8 op's materialize fallback
-    # does not build — quantizing them produced all-<pad> gemma4 output even
-    # with the single-writer ring bound in place. The growing full-attention
-    # layers (gemma4: the 7 d512 globals) are the quantization win and DO
-    # quantize.
+    # (`attention_prefill_cold`) the unified q8 op's materialize fallback does not
+    # build (quantizing them produced all-<pad> gemma4 output). The growing
+    # full-attention layers (gemma4's 7 d512 globals) are the quantization win.
     if layer_type == "sliding_attention":
         num_kv_heads, head_dim = _full_attn_kv_dims(values)
         return AlloyStaticSlidingWindowLayer(
@@ -766,11 +733,10 @@ def _cache_layer_types(values: Mapping[str, ConfigValue]) -> tuple[str, ...]:
     # gemma4 (identified by global_head_dim): its trailing `num_kv_shared_layers`
     # reuse an earlier layer's K/V. Those reused K/V are head_dim 512 on the full
     # layers, and the cache-LESS attention kernel overflows the 32 KB threadgroup
-    # budget at 512 — whereas the `attention_cache` kernel (used by cached layers)
+    # budget at 512, whereas the `attention_cache` kernel (used by cached layers)
     # fits. So keep a cache entry for every gemma4 layer and route the shared
-    # layers' (reused) K/V through the cached attention op. The K/V values are
-    # identical to the source layer's, so attention is exact; only the
-    # memory-sharing optimization is given up (a follow-up). Other models keep
+    # layers' (reused) K/V through the cached attention op; the K/V values are
+    # identical to the source layer's, so attention is exact. Other models keep
     # the trimmed (shared) cache.
     if _int_value(values, "global_head_dim") is not None:
         return layer_types

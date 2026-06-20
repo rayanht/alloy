@@ -114,9 +114,8 @@ def reconstruct_warm_input_ids(
     """
     def bail(reason: str, **extra: object) -> None:
         # A bailed reconstruction costs a FULL cold re-prefill of the whole
-        # prompt next; the reason is the first thing to look at whenever
-        # turns are mysteriously slow (e.g. a client mutating its system
-        # prompt every request — Claude Code's billing-header hash).
+        # prompt next; the reason is the first thing to check when turns are
+        # mysteriously slow (e.g. a client mutating its system prompt each request).
         logger.info("warm_reconstruct_bail", reason=reason, **extra)
 
     if not saved_decoded or not saved_input_ids:
@@ -128,8 +127,8 @@ def reconstruct_warm_input_ids(
     if len(messages) != len(saved_messages) + 2:
         # Diagnostic: name the first content divergence among the shared
         # leading messages — a client mutating an early block (billing hash,
-        # git snapshot, timestamps) silently caps every later request's
-        # token-LCP at that point, and the excerpt is how it gets found.
+        # git snapshot, timestamps) caps every later request's token-LCP at
+        # that point.
         for i, (prior, incoming) in enumerate(zip(saved_messages, messages, strict=False)):
             if prior.role != incoming.role or prior.content != incoming.content:
                 j = next(

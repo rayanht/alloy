@@ -16,12 +16,9 @@ Forward (depth 1):
     x = block(x)                                          # one full-attn layer
     logits = lm_head( norm(x) )                           # shared output head
 
-Validated against the Qwen3.5 reference (ml-explore/mlx-lm#990) and offline against
-the target's own greedy trace. Measured round acceptance is content-dependent — ~42%
-on code, ~56% on predictable prose (qwen3.5:4b, greedy). MTP weight PRECISION does NOT
-move it: fp16 and Q4_K weights give bit-identical acceptance (the draft output is an
-argmax, robust to the Q4_K logit perturbation) while the fp16 block is ~10% slower per
-round, so Q4_K is the right default — see load_quantized_mtp. The concat order is
+MTP weight precision does not move acceptance (the draft output is an argmax,
+robust to the Q4_K logit perturbation) while the fp16 block is ~10% slower per
+round, so Q4_K is the default — see load_quantized_mtp. The concat order is
 [embedding, hidden]; the hidden input is the backbone's pre-final-norm residual
 (recovered from the post-norm head input, see below).
 
@@ -89,7 +86,7 @@ class Qwen35MTP(nn.Module):
         # Optional pruned top-K draft head (set by install_pruned_draft_head): a
         # gathered [K, hidden] subset of lm_head's rows. When present, the draft
         # projects only K vocab entries and remaps the argmax back to a real token id
-        # via `shortlist` — lossless because the verify stays full-vocab. lm_head untouched.
+        # via `shortlist`; the verify stays full-vocab.
         self.draft_head: nn.Module | None = None
 
     def forward(
@@ -119,9 +116,8 @@ class Qwen35MTP(nn.Module):
             cache_position=cache_position,
         )
         out = out[0] if isinstance(out, tuple) else out
-        # Only the last position predicts the next draft token, so apply the head to
-        # that position alone — applying it across a whole window is ~8x wasted
-        # vocab-projection work. Use the pruned top-K head when installed.
+        # Only the last position predicts the next draft token; applying the head
+        # across the whole window is ~8x wasted vocab-projection work.
         head = self.draft_head if self.draft_head is not None else self.lm_head
         return head(self.norm(out[:, -1:]))
 
@@ -129,8 +125,7 @@ class Qwen35MTP(nn.Module):
         """Attach the backbone's (quantized) input embedding, rotary module, and
         `output_norm` weight so `draft_forward` runs entirely GPU-side: embedding
         gather, pre-norm-hidden recovery (post-norm / output_norm), and rope all
-        happen *inside* the compiled draft plan — the steady-state loop only mutates
-        token-id / hidden / position buffers, with zero python tensor setup."""
+        happen inside the compiled draft plan."""
         self.embed = embed_tokens
         self.rotary = rotary_emb
         self.register_buffer("output_norm", output_norm_weight, persistent=False)
@@ -138,20 +133,19 @@ class Qwen35MTP(nn.Module):
     def draft_forward(self, token_embeds, hidden_post_norm, cos, sin, position_ids, past_key_values, cache_position):
         """GPU-side draft step. The per-round inputs are the gathered `token_embeds`
         (B,M,H), the post-norm `hidden_post_norm` (B,M,H), and the precomputed rotary
-        `cos`/`sin` (B,M,rotary_dim). The compiled function is ONLY the MTP block
-        (`forward`) plus the elementwise pre-norm recovery — the embedding gather and
-        the rotary derivation are kept OUT of the graph (both constant-fold under
+        `cos`/`sin` (B,M,rotary_dim). The compiled function is only the MTP block
+        (`forward`) plus the elementwise pre-norm recovery; the embedding gather and
+        rotary derivation are kept out of the graph (both constant-fold under
         torch.compile when done in-plan). Returns the last position's argmax."""
         hidden = hidden_post_norm / self.output_norm  # recover dir of pre-norm residual
         out = self.forward(
             token_embeds, hidden, (cos, sin), None, position_ids,
             past_key_values=past_key_values, cache_position=cache_position,
         )
-        idx = out[:, -1].argmax(-1)  # (B,) argmax over the head's output rows
+        idx = out[:, -1].argmax(-1)
         if self.draft_head is None:
             return idx  # full head: argmax index IS the vocab id
-        # Pruned head: idx indexes the shortlist; remap to the real vocab id IN-PLAN
-        # (the C++ spec loop reads this i64 straight from the plan output).
+        # Pruned head: idx indexes the shortlist; remap to the real vocab id in-plan.
         return torch.nn.functional.embedding(idx, self.shortlist).reshape(idx.shape)
 
 
@@ -226,9 +220,9 @@ def build_draft_shortlist(special_ids, vocab: int, k: int) -> torch.Tensor:
 
 def install_pruned_draft_head(mtp: Qwen35MTP, model, shortlist: torch.Tensor, reader=None) -> None:
     """Give the MTP draft a gathered top-K head (rows `shortlist` of the shared lm_head)
-    plus the [K,1] int64 `shortlist` remap buffer. lm_head itself is untouched — the
-    verify keeps the full vocab, so this is lossless. Q6_K heads gather packed bytes
-    bit-exactly; other head types dequantize the K rows to fp16 (needs `reader`)."""
+    plus the [K,1] int64 `shortlist` remap buffer. lm_head itself is untouched; the
+    verify keeps the full vocab. Q6_K heads gather packed bytes bit-exactly; other
+    head types dequantize the K rows to fp16 (needs `reader`)."""
     head = model.lm_head
     sl = shortlist.to(torch.int64)
     k = int(sl.numel())
@@ -255,15 +249,14 @@ def install_pruned_draft_head(mtp: Qwen35MTP, model, shortlist: torch.Tensor, re
 def load_quantized_mtp(model, blob_path, quantize: bool = True, draft_topk: int | None = None) -> Qwen35MTP:
     """Attach an MTP head to `model` and load the `mtp.*` GGUF tensors.
 
-    `quantize=True` (default) routes the fc/attn/FFN through the SAME alloy
+    `quantize=True` (default) routes the fc/attn/FFN through the same alloy
     quantized-weight path the backbone uses. `quantize=False` dequantizes them to
-    fp16 instead (precision does NOT affect draft acceptance, so quantize=True is
-    strictly better; the fp16 path is a debug knob). The lm_head is always shared
-    with the (already-quantized) backbone head.
+    fp16 instead (a debug knob; precision doesn't affect draft acceptance). The
+    lm_head is always shared with the (already-quantized) backbone head.
 
     `draft_topk=K` prunes the draft's vocab projection to a K-token shortlist (all
-    special tokens + top-K-by-id), remapping argmax->vocab in-plan. Lossless and
-    cuts the draft lm_head — the draft pass's dominant cost — to ~K/vocab."""
+    special tokens + top-K-by-id), remapping argmax->vocab in-plan, cutting the
+    draft lm_head — the draft pass's dominant cost — to ~K/vocab."""
     cfg = model.config
     full_idx = next(i for i, lt in enumerate(cfg.layer_types) if "full" in lt)
     mtp = Qwen35MTP(cfg, full_idx)

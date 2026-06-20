@@ -65,17 +65,11 @@ class TileValue:
 class TileOp:
     """Base class for tile IR operations.
 
-    Operand contract: each subclass declares `_operand_fields` — the
-    explicit tuple of attribute names that hold TileValue-typed operands
-    (directly, or nested inside list / list-of-tuple fields). The base
-    class provides `operand_values()` and `remap(mapping)` built on top
-    of that declaration. Readers learn which fields carry dataflow by
-    looking at `_operand_fields`; fusion/optimizer passes rewrite via
-    `remap()` instead of walking dataclass fields dynamically by name.
-
-    Subclasses that leave `_operand_fields` as the inherited `None` fall
-    back to full dataclass introspection — safe but slow. Declare it on
-    every op that carries operand refs worth tracking.
+    Each subclass declares `_operand_fields` — the attribute names holding
+    TileValue operands (directly, or nested in list / list-of-tuple fields).
+    `operand_values()` and `remap()` are built on that. Subclasses that leave
+    `_operand_fields` as the inherited `None` fall back to dataclass
+    introspection (slower).
     """
 
     result: TileValue | None = None  # None for ops with no result (store)
@@ -163,9 +157,8 @@ class TileOp:
 
 def _remap_list_copy_on_write(v: list, mapping: dict[str, "TileValue"]) -> list:
     """Remap TileValue refs in list items. Returns the same list if nothing
-    changed, or a fresh list when any item was remapped — so a shallow-copied
-    parent op that still shares its list with the original doesn't leak
-    mutation back to the cached IR."""
+    changed, else a fresh list — so a shallow-copied parent op sharing its
+    list with the original doesn't leak mutation back to the cached IR."""
     out: list | None = None
     for i, item in enumerate(v):
         new_item = item
@@ -393,12 +386,10 @@ class Store(TileOp):
     col_indices: TileValue | None = None
     row_stride: int | None = None
     base_offset: TileValue | None = None
-    # When True, the MSL MMA epilogue rounds the f32 acc to the store's
-    # narrow target dtype before applying the transform chain. Matches
-    # eager-style precision when the epilogue is a tile binop (e.g.,
-    # `gemm + residual_tile`) — eager rounds the gemm output to bf16
-    # before adding, fusion would otherwise keep f32 acc through the add.
-    # Set by the fusion engine for tile_consumer epilogues only.
+    # When True, the MMA epilogue rounds the f32 acc to the store's narrow
+    # dtype before the transform chain, matching eager precision for tile-binop
+    # epilogues (e.g. `gemm + residual_tile`, where eager rounds the gemm output
+    # to bf16 before adding). Set by the fusion engine for tile_consumer only.
     round_acc_for_eager: bool = False
 
     # FA-2 forward post-loop normalization: when set, the persistent acc
@@ -476,11 +467,9 @@ class Unpack4(TileOp):
     `lane` selects the component: 0=.x, 1=.y, 2=.z, 3=.w. Result is a
     scalar matching the elementwise dtype of the source vec.
 
-    Lets a kernel issue one vectorised load (`load4_vec`) and then use the
-    individual components as scalar register values for downstream FMAs —
-    matches the cache-line transaction pattern of half4 K loads while
-    keeping per-component FMAs in registers (where the alternative is 4
-    separate scalar loads that emit 4× the LSU instructions).
+    Lets a kernel issue one vectorised load and use the components as scalar
+    register values for downstream FMAs; the alternative is 4 separate scalar
+    loads that emit 4× the LSU instructions.
     """
 
     a: TileValue | None = None
@@ -498,8 +487,7 @@ class AsChar4(TileOp):
     reinterpret + one convert. Lets a quantized-KV kernel fetch 16 int8 codes
     with ONE 16-byte load (uint4) and feed dot4 float4 operands: 4x fewer
     load-issue slots than four char4 loads on the load-issue-bound decode
-    attention path.
-    """
+    attention path."""
 
     a: TileValue | None = None
     lane: int = 0
@@ -900,26 +888,16 @@ def shallow_clone_for_fusion(func: "TileFunction") -> "TileFunction":
     """Clone a TileFunction for fusion-time mutation without deep-copying
     every op.
 
-    Fusion mutates only:
-      - The ops lists themselves (tee-branch Stores get inserted).
-      - Load/Store fields: transform, transform_extras, transform_source_name,
-        col_slice.
-    Everything else — TileValue, BinOp, Dot, Reduce, index-math ops, and the
-    immutable fields of Load/Store (ptr/offsets/mask/row_indices/…) — is safe
-    to share across the original and cloned TileFunction.
-
-    Load/Store ops are typically a minority of the total op count, so
-    skipping a deep clone of the shared immutable fields cuts allocation
-    and clone time substantially relative to copy.deepcopy(func).
+    Fusion mutates only the ops lists (tee-branch Stores get inserted) and
+    Load/Store fields (transform, transform_extras, transform_source_name,
+    col_slice). Everything else is shared. Load/Store ops are a minority of
+    the op count, so this is substantially cheaper than copy.deepcopy(func).
     """
     def _clone_list(ops: list[TileOp]) -> list[TileOp]:
         return [_clone_op(op) for op in ops]
 
     def _clone_op(op: TileOp) -> TileOp:
         if isinstance(op, (Load, Store)):
-            # Defensive: fusion assigns `op.transform = […]` outright, so
-            # a shared empty list is technically safe, but cloning the
-            # list / dict isolates any future append-style mutation.
             if isinstance(op, Store):
                 return dataclasses.replace(
                     op,
@@ -946,8 +924,6 @@ def shallow_clone_for_fusion(func: "TileFunction") -> "TileFunction":
             return dataclasses.replace(op, ops=_clone_list(op.ops))
         if isinstance(op, RowPass):
             return dataclasses.replace(op, ops=_clone_list(op.ops))
-        # BinOp, UnaryOp, Dot, Reduce, ProgramId, …: fusion never mutates
-        # them, so share the instance.
         return op
 
     return dataclasses.replace(
@@ -958,7 +934,6 @@ def shallow_clone_for_fusion(func: "TileFunction") -> "TileFunction":
         shape_vars=dict(func.shape_vars),
         buffer_shapes=dict(func.buffer_shapes),
         options=dict(func.options),
-        # dispatch_spec is a read-only contract — share.
     )
 
 

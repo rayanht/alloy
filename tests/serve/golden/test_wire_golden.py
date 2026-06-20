@@ -1,10 +1,9 @@
 """Wire-format golden gate.
 
 Replays the dialect corpus against the current server and asserts every record
-matches `wire_golden.json` byte-for-byte (structurally — see harness docstring).
-This is the regression net for the whole server refactor: any change to dialect
-parsing/rendering, SSE/NDJSON framing, error envelopes, or CORS that isn't a
-deliberate, re-captured wire change trips here.
+matches `wire_golden.json` (structurally — see harness docstring). Any change to
+dialect parsing/rendering, SSE/NDJSON framing, error envelopes, or CORS that
+isn't a deliberate, re-captured wire change trips here.
 """
 
 from __future__ import annotations

@@ -77,8 +77,8 @@ _ATTENTION_BACKWARD_DKDV_MASKED_KERNEL = cast(
 AttentionConstexprs = dict[str, int | float]
 AttentionBuffers = list[tuple[str, AlloyBuffer]]
 
-# Inert "no ring bound" constant for dispatch sites without a managed
-# `last_real` operand — allocated once, never mutated (negative = unbounded).
+# No ring bound for dispatch sites without a managed `last_real` operand
+# (negative = unbounded).
 _NO_BOUND: AlloyBuffer | None = None
 
 
@@ -95,21 +95,9 @@ _kbias_cache: set[tuple[int, ...]] = set()
 
 # Max query length routed through the spec-decode multi-token verify kernel.
 # seq_len in [2, _MAX_VERIFY_K] uses attention_kv_update_multi; above it goes
-# to the prefill (strided) path; ==1 is single-token decode. Canonical home is
-# here (the lower layer where the handlers live); `multi_token_attention`
-# imports it. Used by `_attention_cache_handler`'s runtime dispatch.
-# 16 covers the block-16 DFlash verify (the z-lab drafts are trained at
-# block 16); seq_len 9..16 occurs only in spec verify, so plain decode and
-# prefill routing are unaffected.
+# to the prefill (strided) path; ==1 is single-token decode. 16 covers the
+# block-16 DFlash verify.
 _MAX_VERIFY_K = 16
-
-# Warm-prefill and grid-shrink compile flags live on
-# `alloy_torch.compile_window` (the trace-boundary channel); the SDPA
-# handler reads them below. Grid-shrink rationale: a split-K plan's `splits`
-# is M_MAX-derived and its combine grid is (M_MAX, heads), neither of which
-# shrinks per request — single-pass has grid (q_blocks, heads) whose q_blocks
-# axis shrinks cleanly, and its causal early-exit bounds each real query's
-# K-scan to its own position, so attention cost scales with the real prompt.
 
 
 def _attention_kv_update_static_kv_len(k_cache_shape: tuple[int, ...]) -> int:
@@ -121,15 +109,12 @@ def _attention_kv_update_static_kv_len(k_cache_shape: tuple[int, ...]) -> int:
 
 
 def _q_to_cache_dtype(q: AlloyBuffer, k_cache: AlloyBuffer) -> AlloyBuffer:
-    """Downcast Q to the KV-cache dtype (f16) at the dispatch boundary so the
-    attention simdgroup MMA runs at f16 tensor-core throughput (~2x) instead of
-    being forced to f32 by a mismatched operand: the planner gates both MMA
-    operands to one shmem-tile dtype, so an f32 Q drags K up to f32 and halves
-    the Q·K / P·V dot throughput. Q is born f32 from q_proj; a model-forward
-    cast is normalized away by the FX attention rewrite (it sees through
-    `_to_copy`), so the downcast must happen here where the kernel's operand
-    buffer dtype is set. Scores, softmax, and output still accumulate in f32
-    in-kernel, so this is precision-neutral for 1/sqrt(d)-scaled attention."""
+    """Downcast Q to the KV-cache dtype (f16) so the attention simdgroup MMA
+    runs at f16 throughput (~2x): the planner gates both MMA operands to one
+    shmem-tile dtype, so an f32 Q drags K up to f32 and halves the Q·K / P·V
+    dot throughput. The FX attention rewrite normalizes away a model-forward
+    cast, so the downcast must happen here where the kernel's operand buffer
+    dtype is set. Scores, softmax, and output still accumulate in f32."""
     if q._dtype != k_cache._dtype:
         return _to_copy(q, dtype=k_cache._dtype.to_torch_dtype())
     return q
@@ -170,12 +155,11 @@ def _legal_fallback_blocks(head_dim: int, block: int) -> tuple[int, int]:
     The o-accumulator dot (p @ v, N = head_dim) spawns
     (block_m/tile)*(head_dim/tile) simdgroups — tile = 16 when block_m % 16 == 0
     (pick_dot_reg picks reg=2), else 8 — and >32 simdgroups busts the 1024
-    thread/threadgroup limit. Counterintuitively a LARGER block_m can be legal
-    where a smaller one isn't: at head_dim 512, block_m 8 is reg=1 → 64
-    simdgroups (illegal) but block_m 16 is reg=2 → 32 (legal). So where the
-    square default overflows, step up to the reg=2 block and shrink block_n until
-    the Q + 2·(K,V) shmem tiles fit 32 KB. A no-op for the head dims (≤256) where
-    the default already fits — those keep their tuned/larger blocks."""
+    thread/threadgroup limit. A larger block_m can be legal where a smaller one
+    isn't: at head_dim 512, block_m 8 is reg=1 → 64 simdgroups (illegal) but
+    block_m 16 is reg=2 → 32 (legal). So where the square default overflows,
+    step up to the reg=2 block and shrink block_n until the Q + 2·(K,V) shmem
+    tiles fit 32 KB. A no-op for head dims (≤256) where the default fits."""
     def n_simdgroups(bm: int) -> int:
         tile = 16 if bm % 16 == 0 else 8
         return (bm // tile) * (head_dim // tile)
@@ -184,10 +168,14 @@ def _legal_fallback_blocks(head_dim: int, block: int) -> tuple[int, int]:
         return block, block
     # head_dim >= 256: BLOCK_M must drop to 16 even where the simdgroup count
     # is legal — at head_dim 256 the Q tile + f32 o-accumulator alone overrun
-    # the 32KB budget for ANY BLOCK_M=32 config (measured: (32, 8) emits
-    # 42240B, the planner cannot column-tile Dot kernels), while BLOCK_M=16
-    # compiles at every BLOCK_N up to 128. The (bm + 2*bn) shmem loop below
-    # underestimates (no accumulator term), so it alone cannot catch this.
+    # the 32KB budget for any BLOCK_M=32 config ((32, 8) emits 42240B; the
+    # planner cannot column-tile Dot kernels), while BLOCK_M=16 compiles at
+    # every BLOCK_N up to 128. The (bm + 2*bn) shmem loop below underestimates
+    # (no accumulator term), so it alone cannot catch this.
+    # At head_dim 256 the Q tile + f32 o-accumulator alone overrun 32KB for any
+    # BLOCK_M=32 config (the planner cannot column-tile Dot kernels), so BLOCK_M
+    # must drop to 16. The (bm + 2*bn) shmem loop below has no accumulator term,
+    # so it alone cannot catch this.
     block_m, block_n = 16, (min(block, 32) if head_dim >= 256 else block)
     while block_n > 8 and (block_m + 2 * block_n) * head_dim * 2 > 32768:
         block_n //= 2
@@ -202,14 +190,9 @@ def _resolved_blocks_for_attention(
 ) -> tuple[int, int]:
     """Resolve BLOCK_M and BLOCK_N for an SDPA kernel from the tune cache.
 
-    Goes through `resolve_config` — the SAME entry point the kernel-level
-    `_resolve_tune` uses — so cross-cutting key transforms apply here too.
-    A previous duplicate of the dict lookup bypassed the grid-shrink
-    representative-M cap (`_apply_oneshot_cap`): at native M_MAX the handler
-    missed the tuned entry and fell back to BLOCK_M=8/BLOCK_N=32 while the
-    kernel-level resolution (capped) hit BLOCK_M=16/BLOCK_N=128 — a 10x
-    attention slowdown per one-shot dispatch that the resolve-probe (which
-    patches resolve_config) couldn't see.
+    Goes through `resolve_config` — the same entry point the kernel-level
+    `_resolve_tune` uses — so cross-cutting key transforms (including the
+    grid-shrink representative-M cap) apply here too.
     """
     key_values: dict[str, int] = {}
     if kernel._tune_key is not None:
@@ -226,21 +209,17 @@ def _resolved_blocks_for_attention(
 
     cfg = resolve_config(kernel.name, key_values)
     head_dim = int(constexpr_kwargs.get("HEAD_DIM", 0))
-    # A kernel-wide CONSERVATIVE DEFAULT is not shape-aware: attention's
-    # (32, 64) busts the 32KB shmem budget at head_dim >= 256 (gemma4's
-    # one-shot recipe-probe compile dies on it — the probe's off-tune
-    # SEQ_LEN misses every entry). Route defaults through the head_dim-aware
-    # fallback; only configs TUNED for a matching shape are trusted.
+    # A kernel-wide default is not shape-aware: attention's (32, 64) busts the
+    # 32KB shmem budget at head_dim >= 256. Route defaults through the
+    # head_dim-aware fallback.
     if not cfg.constexprs or cfg.is_default:
         return _legal_fallback_blocks(head_dim, fallback_block)
     block_m = int(cfg.constexprs.get("BLOCK_M", fallback_block))
     block_n = int(cfg.constexprs.get("BLOCK_N", fallback_block))
     # Validate thread-legality: a tuned/stale config can carry a block that busts
     # the 1024-thread limit at large head_dim — e.g. head_dim 512 with block_m 32 →
-    # (32/16)*(512/16) = 64 simdgroups = 2048 threads. (This bites gemma4's head_dim
-    # 512 global layers once split-K is off for them: they take this single-pass
-    # path, and a stale split-K-era config would otherwise emit an illegal kernel.)
-    # Fall back to the legal block rather than fail in the thread-model planner.
+    # (32/16)*(512/16) = 64 simdgroups = 2048 threads. Fall back to the legal
+    # block rather than fail in the thread-model planner.
     if head_dim > 0:
         tile = 16 if block_m % 16 == 0 else 8
         if (block_m // tile) * (head_dim // tile) > 32:
@@ -289,11 +268,9 @@ def _reshape_attention_mask(
 ) -> AlloyBuffer | None:
     """Reshape attention mask to (B*q_len, k_len) for the masked kernel."""
     if not attn_mask._dtype.is_float():
-        # Bool/int mask -> additive: 0 where keep (True/1), -1e30 where masked
-        # (False/0). `(mask - 1) * 1e30` instead of where(mask, 0, -1e30) — the
-        # scalar-broadcast path of `where` is buggy, and this is a clean two-op
-        # elementwise chain. Only runs for non-float masks; float masks (the text
-        # path's additive masks) skip this entirely.
+        # Bool/int mask -> additive: 0 where keep, -1e30 where masked.
+        # `(mask - 1) * 1e30` rather than where(mask, 0, -1e30) — the
+        # scalar-broadcast path of `where` is buggy.
         mask_f = attn_mask.to(torch.float32)
         attn_mask = (mask_f - 1.0) * 1e30
 
@@ -362,35 +339,22 @@ def _gpu_sdpa(
     if not q._dtype.is_float():
         raise ValueError("Q buffer is not a float type")
 
-    # Bucketed prefill: the K/V tensors come straight from HF's StaticLayer
-    # cache, which always returns the full max_context view (e.g. 2048).
-    # For COLD prefill the first q_len positions are real and the rest are
-    # zero/garbage; slice to [0..q_len) so the kernel doesn't iterate over
-    # irrelevant positions.
-    # For WARM prefill the cache holds a populated prefix the model attends
-    # to via causal attention, so K/V keep the full cache extent.
+    # K/V come from HF's StaticLayer cache, which returns the full max_context
+    # view. Cold prefill: the first q_len positions are real and the rest are
+    # zero/garbage; slice to [0..q_len). Warm prefill: the cache holds a
+    # populated prefix attended causally, so K/V keep the full cache extent.
     q_start_pos = compile_window.q_start_pos
     effective_kv_len = q_start_pos + q_len
-    # COLD prefill: slice K/V/mask to the real-data region — the rest of
-    # the cache is uninitialized and the plan's KV_LEN constexpr can
-    # safely bake `q_len`.
-    # WARM prefill: leave K/V at full cache size.
-    # Dynamo caches the alloy plan by graph bytecode + input shape, so a
-    # per-call effective_kv_len would bake a stale KV_LEN constexpr that
-    # the next warm call at a different start_pos would silently reuse,
-    # truncating K/V iteration and producing wrong attention. The HF
-    # causal mask (sliced only on q, full kv extent) already encodes
-    # per-row causality including the warm-start offset, so the kernel
-    # needs no Q_START_POS / effective_kv_len constexpr — it iterates
-    # the full cache and the mask zeroes everything past each row's
-    # allowed range.
+    # A per-call effective_kv_len would bake a stale KV_LEN constexpr that the
+    # next warm call at a different start_pos reuses, truncating K/V iteration.
+    # The HF causal mask already encodes per-row causality including the
+    # warm-start offset, so the kernel needs no Q_START_POS constexpr.
     #
-    # Only valid for CAUSAL attention: the slice drops K/V[q_len:kv_len] on the
-    # premise those positions are future/garbage (a bucketed causal cache). A
-    # NON-causal call with a full real K/V (q_len < kv_len) — e.g. whisper's
-    # cross-attention prefill (4 SOT queries over 1500 real encoder frames) —
-    # must attend ALL kv; slicing there silently drops 1496/1500 frames. Gate on
-    # causality (is_causal, or a causal mask present) so cross-attention is left whole.
+    # Only valid for causal attention: the slice drops K/V[q_len:kv_len] as
+    # future/garbage. A non-causal call with a full real K/V (q_len < kv_len) —
+    # e.g. whisper's cross-attention prefill (4 SOT queries over 1500 real
+    # encoder frames) — must attend all kv; gate on causality so
+    # cross-attention is left whole.
     if (q_len > 1 and q_start_pos == 0 and kv_len > effective_kv_len
             and (is_causal or attn_mask is not None)):
         k = k.slice(2, 0, effective_kv_len)
@@ -500,10 +464,8 @@ def _gpu_sdpa(
         )
         if need_lse:
             # Training / CPU-export path: emit lse via a second full attention
-            # pass. Inference (`_scaled_dot_product_attention`) sets
-            # `need_lse=False` and skips this — lse on the no-mask path was
-            # being discarded immediately by the caller, costing one full
-            # extra K-loop per attention layer.
+            # pass. Inference sets `need_lse=False` and skips this — lse on the
+            # no-mask path costs one full extra K-loop per attention layer.
             log_sum_exp = _ATTENTION_STRIDED_LSE_KERNEL(
                 q_flat,
                 k_flat,
@@ -944,8 +906,7 @@ def _attention_cache_handler(
 
     `scale` is forwarded to every path. The decode/verify kernels default to
     1/sqrt(head_dim) when it matches (gemma3/qwen/llama), but gemma4 uses
-    scaling=1.0, so the explicit scale must reach them. Mirrors the in-handler
-    seq_len branch `linear_attention_update` already uses for DeltaNet."""
+    scaling=1.0, so the explicit scale must reach them."""
     seq_len = q.shape[2]
     if seq_len == 1:
         return _attention_kv_update_handler(
@@ -960,12 +921,9 @@ def _attention_cache_handler(
         # Verify rows route to the tiled prefill kernel (KV write + strided
         # runtime-pos MMA, split-K at depth), NOT the vector multi kernel:
         # the vector path's 1-simdgroup serial scan is depth-toxic in the
-        # production schedule — 5.4ms/layer at 12K ctx vs ~0.1ms bandwidth
-        # bound (the spec depth-decay root cause; it profiles flat in
-        # isolation because its slice re-reads hit SLC, so only the
-        # group-pipelined profile sees it). The draft's bidir block
-        # attention keeps the vector multi path (bidir has no prefill
-        # equivalent).
+        # production schedule (5.4ms/layer at 12K ctx vs ~0.1ms bandwidth
+        # bound). The draft's bidir block attention keeps the vector multi
+        # path (bidir has no prefill equivalent).
         return _attention_prefill_warm_handler(
             q, new_k, new_v, cache_pos, k_cache, v_cache,
             scale, sliding_window=sliding_window,
@@ -993,11 +951,10 @@ def _attention_kv_update_handler(
     batch, heads, seq_len, head_dim = q_shape
     _, kv_heads, _, _ = new_k.shape
     kv_group = heads // kv_heads
-    q = _q_to_cache_dtype(q, k_cache)  # f16 MMA on the padded-MMA decode-split path
+    q = _q_to_cache_dtype(q, k_cache)
 
     # Honor a non-default attention scale (gemma4 uses scaling=1.0, not
-    # 1/sqrt(head_dim)). CUSTOM_SCALE=0 keeps the kernel's 1/sqrt(d) default —
-    # which equals the passed scale for gemma3/qwen/llama, so they are unchanged.
+    # 1/sqrt(head_dim)). CUSTOM_SCALE=0 keeps the kernel's 1/sqrt(d) default.
     default_scale = 1.0 / math.sqrt(head_dim)
     if scale is None or scale <= 0 or math.isclose(
         float(scale), default_scale, rel_tol=1e-6, abs_tol=1e-6
@@ -1046,12 +1003,10 @@ def _attention_kv_update_handler(
     ):
         # M=1 vector path — no MMA, no shmem in the K-loop. 32-thread TGs
         # (1 simdgroup each), each lane owns PER_LANE=HEAD_DIM/32 dims.
-        # Vec4 fast path for PER_LANE=4 (HEAD_DIM=128 — qwen3, llama
-        # 3.x 3B/8B); scalar path for PER_LANE=2 (HEAD_DIM=64 — llama
-        # 3.2 1B); dual-vec4 path for PER_LANE=8 (HEAD_DIM=256 — gemma3);
-        # quad-vec4 path for PER_LANE=16 (HEAD_DIM=512 — gemma4 global layers).
-        # 1-simdgroup TG needs ~8× more splits than the padded-MMA path to
-        # match its GPU occupancy.
+        # PER_LANE=4 (HEAD_DIM=128: qwen3, llama 3B/8B), PER_LANE=2
+        # (HEAD_DIM=64: llama 3.2 1B), PER_LANE=8 (HEAD_DIM=256: gemma3),
+        # PER_LANE=16 (HEAD_DIM=512: gemma4 global layers). 1-simdgroup TG
+        # needs ~8× more splits than the padded-MMA path for equal occupancy.
         splits = _choose_flash_decoding_splits(
             total_heads, kv_len, simdgroups_per_tg=1
         )
@@ -1068,9 +1023,9 @@ def _attention_kv_update_handler(
         and head_dim in _vector_decode_head_dims
     )
     # Read-only attend (write_kv=False) is only implemented on the vector path
-    # (the gemma4 KV-shared global layers, head_dim 512). Every other decode
-    # path writes the cache unconditionally, so fail loudly rather than silently
-    # corrupting the source cache if read-only ever reaches one.
+    # (gemma4 KV-shared global layers, head_dim 512). Every other decode path
+    # writes the cache unconditionally; fail loudly rather than corrupt the
+    # source cache.
     if not write_kv and not use_vector:
         raise ValueError(
             "write_kv=False requires the vector-decode path "
@@ -1108,9 +1063,9 @@ def _attention_kv_update_handler(
             CUSTOM_SCALE=custom_scale,
             WRITE_KV=1 if write_kv else 0,
         )
-        # Split-parallel combine when there are enough splits to fill it (SPLITS
-        # is a power of two, so >=32 ⇒ multiple of 32, the par kernel's lane
-        # tiling); otherwise the serial one-TG-per-head combine.
+        # Split-parallel combine when there are enough splits to fill it
+        # (>=32 ⇒ multiple of 32, the par kernel's lane tiling); otherwise the
+        # serial one-TG-per-head combine.
         if splits >= 32:
             result = _ATTENTION_DECODE_COMBINE_VECTOR_PAR_KERNEL[(total_heads, head_dim // 4)](
                 partial_o,
@@ -1244,13 +1199,12 @@ def _spec_kv_write_handler(
 ) -> AlloyBuffer:
     """Write-only KV row store for the DFlash observe/fusion plan: M rows of
     (B, KV_H, M, D) k/v land in the (B, KV_H, S, D) caches at
-    [cache_pos, cache_pos+M). Returns k unchanged (keeps the dispatch live in
-    the lazy collector; the cache mutation is the effect). The cache writes
-    are semantically side effects nothing in-plan reads - register them as
-    extern roots or the collector DCEs the dispatch (the gemma4 ring-write
-    precedent)."""
-    # Register the ROOT buffers (the kernel writes roots; materialize_many
-    # on a view does not chase root writes — the gemma4 ring-write precedent).
+    [cache_pos, cache_pos+M). Returns k unchanged to keep the dispatch live in
+    the lazy collector. The cache writes are side effects nothing in-plan
+    reads, so they must be registered as extern roots or the collector DCEs
+    the dispatch."""
+    # Register the ROOT buffers: the kernel writes roots, and materialize_many
+    # on a view does not chase root writes.
     note_extern_kv_write(k_cache)
     note_extern_kv_write(v_cache)
     _, kv_heads, seq_len, head_dim = k.shape
@@ -1569,8 +1523,7 @@ def _attention_prefill_cold_handler(
     if use_temp_kv:
         # The attend below reads the linear temp copy, so nothing in-plan
         # reads the ring write above — register it as a side-effect root or
-        # the collector DCEs it and the post-prefill ring stays EMPTY (gemma4
-        # sliding layers: decode against zero windows, garbage output).
+        # the collector DCEs it and the post-prefill ring stays empty.
         note_extern_kv_write(kc_base)
         note_extern_kv_write(vc_base)
         cache_dtype = k_cache._dtype
@@ -1715,10 +1668,10 @@ def _attention_prefill_warm_handler(
 
     Runtime vs constexpr Q_START_POS is GPU-free here: the causal early-exit
     clamps the K-scan to the query position regardless of KV_LEN, so reading
-    the full cache costs the same as a sliced read (measured ±0% at min/p10).
-    Cold and warm then collapse to one kernel specialization → one plan → one
-    compile. Sliding-window prefill keeps the separate cold handler
-    (its >SW case needs a linear temp-KV layout this path doesn't build).
+    the full cache costs the same as a sliced read. Cold and warm then collapse
+    to one kernel specialization. Sliding-window prefill keeps the separate
+    cold handler (its >SW case needs a linear temp-KV layout this path doesn't
+    build).
     """
     q_shape = q.shape
     if len(q_shape) != 4:
@@ -1759,8 +1712,8 @@ def _attention_prefill_warm_handler(
 
     # Phase 1: write new_k / new_v into the cache at [cache_pos..cache_pos+K_INPUT).
     # Skipped for read-only attend (write_kv=False) — gemma4's KV-shared global
-    # layers own no K/V projection and attend the SOURCE layer's already-written
-    # cache, so new_k/new_v are a throwaway shape-only view and must not be written.
+    # layers own no K/V projection and attend the source layer's already-written
+    # cache, so new_k/new_v are a throwaway shape-only view.
     if write_kv:
         _ATTENTION_KV_WRITE_KERNEL[(K_INPUT, kv_heads)](
             nk_base,
@@ -1857,27 +1810,21 @@ def _attention_prefill_warm_handler(
     # grid tail. Fanning the scan across SPLITS (program_id(2)) fills the machine;
     # the per-row combine reduces the partials ~free. Gated to plain causal,
     # head_dim ≤ 256: sliding-window stays single-pass (a window spans only part of
-    # the K range, so splitting the full range wastes work on out-of-window splits,
-    # and the window already bounds the scan). head_dim 512 (gemma4's global layers)
-    # is EXCLUDED: the split kernel's (BLOCK_M, 512) f32 o-accumulator + barriers
-    # race across simdgroups there — non-deterministic KV (Δ≈20 run-to-run, bisected
-    # to 6fe6bbc "enable split-K prefill for head_dim 512"), so those layers take the
-    # deterministic single-pass path (the head_dim-512 split-K gain was small anyway;
-    # the partial f32 write is 4× heavier at 512). `splits` is shape-derived, so a
-    # given plan always takes the same branch and compiles consistently.
+    # the K range, so splitting wastes work on out-of-window splits, and the window
+    # already bounds the scan). head_dim 512 (gemma4's global layers) is excluded:
+    # the split kernel's (BLOCK_M, 512) f32 o-accumulator + barriers race across
+    # simdgroups there, giving non-deterministic KV, so those layers take the
+    # single-pass path (the partial f32 write is 4× heavier at 512 anyway).
     splits = 1
     if sliding_window == 0 and head_dim <= 256 and not compile_window.grid_shrink_active():
         q_blocks = (seq_len + block_m - 1) // block_m
         if seq_len <= _MAX_VERIFY_K:
-            # Verify-width dispatch (spec decode): q_blocks == 1, so the
-            # q-axis contributes no parallelism and the static split slicing
-            # (slice = KV_LEN/SPLITS) decides everything — only
+            # Verify-width dispatch (spec decode): q_blocks == 1, so only
             # ceil(depth/slice) splits carry work at runtime. The prefill
             # chooser's cap of 8 gives 32K-position slices on a 262K-native
             # cache: at 12K depth a single split per head scans serially
-            # (~3.4ms/layer, the spec depth-decay residual). Slice at the
-            # decode path's ~2K granularity instead so working-split count
-            # tracks depth.
+            # (~3.4ms/layer). Slice at the decode path's ~2K granularity so
+            # working-split count tracks depth.
             splits = max(1, min(128, kv_len // 2048))
         else:
             splits = _choose_prefill_splits(q_blocks, total_heads, kv_len, block_n)
@@ -1959,11 +1906,11 @@ def _choose_flash_decoding_splits(
     TG" must be matched ~8× by more splits, so target_tgs scales with
     `simdgroups_per_tg`'s inverse.
     """
-    # The 1-simdgroup vector path pairs with a split-PARALLEL combine
+    # The 1-simdgroup vector path pairs with a split-parallel combine
     # (attention_decode_combine_vector_par), so extra splits are nearly free —
     # oversubscribe harder (4x) and lift the cap to 128 there to shrink the
-    # split kernel's grid-tail drain (measured ~3% on qwen2.5:3b at 16k depth).
-    # The padded-MMA path keeps its serial one-TG-per-head combine: 2x / cap 64.
+    # split kernel's grid-tail drain (~3% on qwen2.5:3b at 16k depth). The
+    # padded-MMA path keeps its serial one-TG-per-head combine: 2x / cap 64.
     oversub = 4 if simdgroups_per_tg == 1 else 2
     cap = 128 if simdgroups_per_tg == 1 else 64
     target_simdgroups = _APPLE9_MAX_CORES * 8 * oversub

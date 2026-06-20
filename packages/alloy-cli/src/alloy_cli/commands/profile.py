@@ -210,10 +210,9 @@ def profile(
             _print_kernel_summary(p.label, kernels)
             written.append(path)
 
-    # Print a file:// URL on its own line (soft_wrap so it isn't split across
-    # lines) for reference, then open it directly — many terminals route both
-    # bare paths and file:// links to the editor, so a click won't reach the
-    # browser; webbrowser.open hands the file to the default browser instead.
+    # Print a file:// URL on its own line, then open it directly: many terminals
+    # route both bare paths and file:// links to the editor, so a click won't
+    # reach the browser; webbrowser.open hands the file to the default browser.
     console.print("[green]wrote[/]", soft_wrap=True)
     for path in written:
         console.print(path.as_uri(), soft_wrap=True, highlight=False)

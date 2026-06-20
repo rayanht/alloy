@@ -205,10 +205,8 @@ def test_decode_vector_split_sliding_window_wrap():
     cache_pos >= W the write wraps (slot = pos % W) and the live window is the
     LAST W logical positions [cache_pos+1-W, cache_pos]. The kernel must walk
     those logical positions (reading slot = j % W), not stop at the physical
-    buffer end W. It previously bounded the K-loop at N_KV (== W), so after the
-    wrap it dropped the newest positions (the self token first) — on gemma4 a
-    45-token prompt then degenerated hard ~6 tokens past position 512. Here
-    cache_pos=600 wraps by 89 positions; the reference attends the full window.
+    buffer end W. Here cache_pos=600 wraps by 89 positions; the reference
+    attends the full window.
     """
     D, W, splits = 128, 512, 4
     cache_pos = 600                       # wrapped: window lo = cache_pos+1-W = 89

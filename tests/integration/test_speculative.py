@@ -1,14 +1,13 @@
 """Speculative-session integration tests.
 
-Scope here: session MECHANICS (round loop, accept/commit bookkeeping, EOS,
-metrics) on a tiny model, plus pure-CPU PLD behavior. Token-level lossless
-A/B gates do NOT live here: a randomly-initialized toy emits near-uniform
-logits whose argmax flips under run-to-run GPU accumulation-order wiggle
-(measured: three identical greedy prefills → three different "first tokens"),
-so cross-path token equality on a toy tests tie-breaking luck, not the
-session. The real gates run on qwen3.5:0.8b — sharp real-model logits, hybrid
-DeltaNet rollback, greedy + seeded-sampled bit-identity — the required
-validation surface for replay changes.
+Scope: session MECHANICS (round loop, accept/commit bookkeeping, EOS,
+metrics) on a tiny model, plus pure-CPU PLD behavior. Token-level
+lossless A/B gates do NOT live here: a randomly-initialized toy emits
+near-uniform logits whose argmax flips under run-to-run GPU
+accumulation-order wiggle, so cross-path token equality on a toy tests
+tie-breaking luck, not the session. The real gates run on qwen3.5:0.8b
+(sharp logits, hybrid DeltaNet rollback, greedy + seeded-sampled
+bit-identity).
 """
 
 from __future__ import annotations

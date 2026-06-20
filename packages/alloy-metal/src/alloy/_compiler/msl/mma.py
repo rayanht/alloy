@@ -126,9 +126,7 @@ class MmaEmitterMixin:
 
     def _emit_mma(self, op: Dot):
         # Conditional barrier flush: only emit if our reads/writes conflict
-        # with pending state. Persistent MMA on operands already in shmem
-        # (no fresh writes from prior op) can elide the barrier — the
-        # check_flush_for call below stays silent for RAR.
+        # with pending state. RAR stays silent.
         result = op.result
         lhs = op.lhs
         rhs = op.rhs
@@ -156,10 +154,8 @@ class MmaEmitterMixin:
             self._buffers_since_barrier.clear()
             self._buffers_read.clear()
         # Per-dot reg pick: each Dot's tile factor must independently divide
-        # its (M, N). Using the kernel-global `self._reg` (the MIN across
-        # all dots) for big dots wastes simdgroups; using the global MAX
-        # for small dots makes `_sg_cols = N // (reg*8) = 0` and skips the
-        # dot entirely.
+        # its (M, N). A kernel-global reg wastes simdgroups for big dots or
+        # makes `_sg_cols = N // (reg*8) = 0` and skips small dots entirely.
         if op.transpose_lhs:
             _M_for_reg = lhs.shape[1]
         else:
@@ -266,11 +262,10 @@ class MmaEmitterMixin:
                         self._cow_save(CowProxy(), vloc, M_dim, vloc.stride)
                         did_cow = True
 
-        # Fence the cross-thread race: all 128 threads read the shmem buffer
-        # into per-thread _cow arrays above, then only simd 0's 32 threads
-        # issue simdgroup_store to the same buffer below.  Without this
-        # barrier, simd 0 can overwrite _s4 before simds 1-3 finish the
-        # COW read, producing non-deterministic values in the saved array.
+        # Fence the cross-thread race: all threads read the shmem buffer into
+        # per-thread _cow arrays above, then only simd 0 issues simdgroup_store
+        # to the same buffer below. Without this barrier, simd 0 can overwrite
+        # the buffer before other simds finish the COW read.
         if did_cow:
             self._emit("threadgroup_barrier(mem_flags::mem_threadgroup);")
 
@@ -289,11 +284,11 @@ class MmaEmitterMixin:
 
         # FA-2 forward rescale `o = (o * alpha) + tile_dot(p, V)`: multiply
         # the persistent accumulator's per-lane thread_elements() by the
-        # per-row alpha in-register. thread_elements() writes do propagate
-        # into the next simdgroup_multiply_accumulate on M4 Max / Metal 3.x,
-        # so we avoid spilling the accumulator to shmem just to rescale it.
-        # Lane→element mapping mirrors the store epilog: lane holds
-        # thread_elements()[0..1] at row `_lr` of an 8x8 simdgroup_matrix.
+        # per-row alpha in-register. thread_elements() writes propagate into
+        # the next simdgroup_multiply_accumulate on M4 Max / Metal 3.x, so the
+        # accumulator need not spill to shmem to be rescaled. Lane→element
+        # mapping: lane holds thread_elements()[0..1] at row `_lr` of an 8x8
+        # simdgroup_matrix.
         if is_persistent and op.acc_pre_scale is not None:
             alpha_buf = self._acc_pre_scale_buf_name(op)
             self._emit("uint _lr_ps = (simd_lane / 16u) * 4u + (simd_lane % 8u) / 2u;")

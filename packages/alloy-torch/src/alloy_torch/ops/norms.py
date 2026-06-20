@@ -107,9 +107,8 @@ def _native_layer_norm(
     beta = _full((cols,), 0, dtype=x._dtype.to_torch_dtype()) if bias is None else bias
     out = _LAYER_NORM_KERNEL(flat, gamma, beta, EPS=eps)
 
-    # Use E[X^2] - E[X]^2 instead of mean((x - mean)^2). The broadcast-subtract
-    # plus row-wise reduce chain mis-reduces at cols < 64 and breaks tiny hidden
-    # dim training backward saved tensors.
+    # Use E[X^2] - E[X]^2 instead of mean((x - mean)^2): the broadcast-subtract
+    # plus row-wise reduce chain mis-reduces at cols < 64.
     row_mean = _MEAN_KERNEL(flat, axis=1)
     ex2 = _MEAN_KERNEL(flat * flat, axis=1)
     var = ex2 - row_mean * row_mean

@@ -1,10 +1,9 @@
 """Pytest fixtures for the Anthropic Messages API tests.
 
-Mirrors the ollama_compat fixture: spawns a live `AlloyServer` in a
-background thread with a stub `ServedModel` that echoes the last user
-message. We deliberately do NOT share with ollama_compat/conftest.py via
-import — pytest discovers conftest.py per directory and importing across
-dirs creates package-loading order surprises.
+Spawns a live `AlloyServer` in a background thread with a stub `ServedModel`
+that echoes the last user message. Not shared with ollama_compat/conftest.py:
+pytest discovers conftest.py per directory, and importing across dirs creates
+package-loading order surprises.
 """
 
 from __future__ import annotations

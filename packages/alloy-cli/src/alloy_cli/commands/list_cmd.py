@@ -1,7 +1,6 @@
 """`alloy list` — installed GGUF models, a read-only unified view over the
 Ollama store (`~/.ollama/models`) and the HuggingFace cache
-(`~/.cache/huggingface/hub`). No server, no alloy-owned store: alloy serves
-GGUFs you already have, it doesn't download or curate them.
+(`~/.cache/huggingface/hub`).
 
 `name` is the ref you'd pass to `alloy serve -m` (an HF repo expands to one row
 per quant, `<org>/<repo>:<quant>`). quant/params come from the Ollama config

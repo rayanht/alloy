@@ -6,7 +6,7 @@ generate / stream / count, sampling, multimodal hooks. `GenerationWorker` owns
 the per-request orchestration: warm-prefix reuse + branch/preserve policy (via
 ConversationStore), the cold/warm prefill choice, generation, and reporting
 finish/timings back through the per-request `record` callback. One worker per
-served model; today it runs inline (the serve loop serializes it).
+served model, run inline (the serve loop serializes it).
 """
 
 from __future__ import annotations

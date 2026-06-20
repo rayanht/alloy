@@ -35,13 +35,11 @@ def _make_elementwise_unary(name, op_fn):
 
 
 add = _make_elementwise_binary("add", lambda a, b: a + b)
-# silu(g) * u for the unfused gate/up GEMM pair — the expression tree matches
-# the fused dot_*_silu epilogue exactly (same MSL ops, bit-identical output).
+# silu(g) * u for the unfused gate/up GEMM pair.
 silu_mul = _make_elementwise_binary(
     "silu_mul", lambda g, u: g * (1.0 / (1.0 + al.exp(-g))) * u
 )
-# gelu_tanh(g) * u for the unfused gate/up GEMM pair — matches the fused
-# dot_q4_k_gelu_v2 epilogue (same al.gelu_tanh primitive, bit-identical).
+# gelu_tanh(g) * u for the unfused gate/up GEMM pair.
 gelu_tanh_mul = _make_elementwise_binary(
     "gelu_tanh_mul", lambda g, u: al.gelu_tanh(g) * u
 )

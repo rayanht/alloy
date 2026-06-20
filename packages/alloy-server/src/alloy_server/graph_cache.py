@@ -1,40 +1,32 @@
 """FX-graph cache: skip Dynamo + AOT on repeat compiles of the same graph.
 
-THE DEV-LOOP PROBLEM. ~85% of `eager_compile_all` is the torch.compile
-front-end (Dynamo bytecode trace + FakeTensor meta-prop + FX proxying) re-run
-on every process start — measured 14.75s on qwen3.5:0.8b, of which alloy's own
-pipeline is ~10%. A plan-level cache is useless for development (any kernel
-edit invalidates it), but the ATen FX graph that Dynamo+AOT produce sits at a
-layer ABOVE everything a kernel developer iterates on: it depends only on the
-HF model code, the compat patches, the generation wrapper modules, the custom
-op registry, and the AOT decompositions. It is INVARIANT to std/* kernels, the
-tile compiler/emitter, the fusion engine, the dispatch layer — and even to
-rewrites/ and ops/ handlers, because those run INSIDE `_compile_fx` at replay.
+~85% of `eager_compile_all` is the torch.compile front-end (Dynamo bytecode
+trace + FakeTensor meta-prop + FX proxying) re-run on every process start
+(~14.75s on qwen3.5:0.8b, of which alloy's own pipeline is ~10%). The ATen FX
+graph Dynamo+AOT produce sits ABOVE everything a kernel developer iterates on:
+it depends only on the HF model code, the compat patches, the generation
+wrapper modules, the custom op registry, and the AOT decompositions — invariant
+to kernels, the tile compiler/emitter, the fusion engine, the dispatch layer,
+and even rewrites/ and ops/ handlers (those run INSIDE `_compile_fx` at replay).
 
 So: cache the PRE-rewrite ATen graph `_compile_fx` receives, keyed by the
-graph-affecting sources. On a hit, feed it straight back to `_compile_fx` —
-no Dynamo, no AOT — and the whole alloy pipeline still executes fresh.
+graph-affecting sources. On a hit, feed it straight back to `_compile_fx` and
+the whole alloy pipeline still executes fresh.
 
-WHAT A CACHE ENTRY HOLDS
-- the sanitized graph (node.meta reduced to meta-device 'val' tensors),
-- the input spec: for each flat graph arg, where it comes from — a module
-  param/buffer (FQN), a caller kwarg (name), a StaticCache field
-  (kwarg, layer index, attr), or a lifted constant (serialized) — recorded by
-  matching tensor identity on the first real call,
-- the user-output index: which flat output the wrapped module returns,
-  matched by identity against the Dynamo path's return value.
+A cache entry holds the sanitized graph (node.meta reduced to meta-device 'val'
+tensors), the input spec (for each flat graph arg: a module param/buffer FQN, a
+caller kwarg, a StaticCache field, or a lifted constant — recorded by matching
+tensor identity on the first real call), and the user-output index.
 
-REPLAY contract matches the pinned-plan path that production already runs:
-calling `_compile_fx`'s product directly bypasses AOT's runtime epilogue, but
-alloy plans write mutated inputs (KV cache, cumulative_length) in place
-through the converted storages — the same contract `PrefillEngine.chunk_step`'s
-pinned fast path relies on. The plan-capture hooks (`capture_plan`) live
-inside `compiled`, so eager_compile pinning works identically on both paths.
+REPLAY matches the pinned-plan path production already runs: calling
+`_compile_fx`'s product directly bypasses AOT's runtime epilogue, but alloy
+plans write mutated inputs (KV cache, cumulative_length) in place through the
+converted storages — the same contract `PrefillEngine.chunk_step`'s pinned fast
+path relies on.
 
 Anything unexpected (graph breaks producing != 1 graph, an unmatchable arg, a
-return value not found in the flat outputs, a deserialization error) falls
-back to the plain torch.compile path for that entry, permanently and loudly.
-ALLOY_FX_CACHE=0 disables the whole mechanism.
+return value not in the flat outputs, a deserialization error) falls back to the
+plain torch.compile path for that entry. ALLOY_FX_CACHE=0 disables it.
 """
 
 from __future__ import annotations
@@ -68,8 +60,7 @@ _CACHE_DIR = pathlib.Path(
 )
 
 # Sources whose changes alter the traced ATen graph. Kernel / emitter / fusion /
-# dispatch / rewrites / ops-handler edits do NOT appear here by design — that is
-# the whole point of caching at this layer.
+# dispatch / rewrites / ops-handler edits do NOT appear here by design.
 _FINGERPRINT_FILES = (
     "generation.py",
     "cache.py",
@@ -144,10 +135,10 @@ def _deserialize_target(entry: tuple) -> Any:
     if kind == "attr":
         return entry[1]
     if kind == "op":
-        # Resolve through the NORMAL attribute protocol (attrgetter) — calling
+        # Resolve through the NORMAL attribute protocol (attrgetter): calling
         # __getattr__ directly on torch.ops bypasses its namespace caching and
         # mints fresh OpOverload objects that fail the rewrites' identity/set
-        # checks (every view node silently stopped matching _VIEW_OPS).
+        # checks (view nodes stop matching _VIEW_OPS).
         return operator.attrgetter(entry[1])(torch.ops)
     if kind == "hop":
         return operator.attrgetter(f"higher_order.{entry[1]}")(torch.ops)
@@ -293,7 +284,7 @@ def _id_to_source(module: torch.nn.Module, kwargs: dict) -> dict[int, tuple]:
                 # cache layer (e.g. DeltaNet's `alloy_attn_mask` pad mask) must
                 # resolve live at replay. Const-baking it freezes mutable state:
                 # an all-zero capture-time snapshot reads as "every position is
-                # padding" forever — found as garbage decode on every hybrid.
+                # padding" forever (garbage decode on every hybrid).
                 for attr, t in vars(layer).items():
                     if torch.is_tensor(t):
                         id2src.setdefault(id(t), ("cache", name, i, attr))
@@ -331,11 +322,11 @@ class GraphCachingModule:
     """Drop-in for `torch.compile(module, backend='alloy', dynamic=False)`.
 
     Per call signature (shapes/dtypes of the kwarg leaves + the trace-time
-    mode globals), the first process EVER pays the Dynamo trace and persists
-    the ATen graph + input spec; every later process replays it through
+    mode globals), the first process pays the Dynamo trace and persists the
+    ATen graph + input spec; every later process replays it through
     `_compile_fx` directly. In-process repeat calls go through whichever
     callable the first call built (Dynamo's guard cache / the replay closure's
-    `_compiled_plan` fast path — identical steady-state behavior)."""
+    fast path)."""
 
     def __init__(self, module: torch.nn.Module, label: str) -> None:
         self._module = module
@@ -366,7 +357,7 @@ class GraphCachingModule:
         # Module-level graph variants (e.g. ChunkPrefill's drafter tap
         # layers) are constructor STATE, invisible to source/model
         # fingerprints — without this a tapless cached graph replays for a
-        # tapped module and the taps silently vanish.
+        # tapped module and the taps vanish.
         variant = vars(self._module).get("_cache_variant")
         if variant is not None:
             parts.append(f"variant:{variant}")
@@ -393,10 +384,9 @@ class GraphCachingModule:
                             h.update(part.encode())
                     # Dynamo SPECIALIZES on python-bool cache state (guards),
                     # so it must split the signature too: the GDN forward
-                    # branches on `layer.has_previous_state`, and a decode
-                    # graph captured at False (fresh cache, eager-compile)
-                    # replayed against True runs the prefill conv variant with
-                    # zero pre-context — silent decode drift on every hybrid.
+                    # branches on `layer.has_previous_state`, and a decode graph
+                    # captured at False replayed against True runs the prefill
+                    # conv variant with zero pre-context (decode drift).
                     hps = vars(layer).get("has_previous_state")
                     if isinstance(hps, bool):
                         part = f"{name}.{i}.has_previous_state:{hps}"
@@ -445,9 +435,9 @@ class GraphCachingModule:
             # side effects on the cache object; the replayed graph performs
             # only the tensor work. Replicate the one transition our forwards
             # depend on: the call wrote every linear-attention layer's
-            # conv/recurrent state, so the lazy-init flag must flip — without
-            # this, downstream signatures keep computing has_previous_state=
-            # False and pin the unprimed decode graph (garbage decode).
+            # conv/recurrent state, so the lazy-init flag must flip — else
+            # downstream signatures keep computing has_previous_state=False
+            # and pin the unprimed decode graph (garbage decode).
             for v in kwargs.values():
                 if not torch.is_tensor(v) and hasattr(v, "layers"):
                     for layer in v.layers:
@@ -480,9 +470,7 @@ class GraphCachingModule:
             # not internalize (`arg.copy_(out)` — e.g. gemma4's read-after-
             # write cumulative_length advance). The raw boxed fn has no AOT
             # wrapper, so the replay branch must apply the same epilogue; the
-            # post-rewrite map (desc + auto_functionalized sidecar entries)
-            # rides on the boxed fn — same reason the C++ greedy loop carries
-            # mutation_pairs.
+            # post-rewrite map rides on the boxed fn.
             mut_map = boxed._alloy_mutation_map
             logger.info(
                 "fx_graph_cache_hit",

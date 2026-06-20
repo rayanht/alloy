@@ -58,11 +58,9 @@ CompileIndividual = Callable[["KernelFunction", LazyOp], DispatchLaunch]
 
 logger = get_logger("alloy.fusion")
 
-# Dedupe set for fusion_compile_error: the same codegen bug fires N times
-# during a warmup compile sweep (one per plan that touches the kernel).
-# We emit once per (kernel, pass_name) per process and rely on the
-# operator re-running with ALLOY_LOG_FUSION=debug if they want the
-# repeat-count too.
+# Dedupe set for fusion_compile_error: the same codegen failure fires once per
+# plan that touches the kernel during a warmup sweep. Warn once per
+# (kernel, pass_name) per process; ALLOY_LOG_FUSION=debug logs the repeats.
 _warned_fusion_failures: set[tuple[str, str]] = set()
 
 
@@ -699,11 +697,9 @@ def _compile_fused(func: TileFunction) -> tuple[CompiledKernel, str]:
     """Compile a fused TileFunction to a (CompiledKernel, msl_source).
 
     Process-local cache keyed by `func.fingerprint` (hash of dump_tile_ir)
-    short-circuits both `emit_msl_from_tile_ir` and the downstream PSO
-    lookup when a structurally identical TileFunction was compiled
-    earlier. The hit rate is high in practice (training graphs emit many
-    fused funcs that fingerprint identically), saving substantial MSL
-    emission time on cold compile.
+    short-circuits both `emit_msl_from_tile_ir` and the downstream PSO lookup
+    when a structurally identical TileFunction was compiled earlier (training
+    graphs emit many fused funcs that fingerprint identically).
     """
     key = func.fingerprint
     cached = _FUSED_EMIT_CACHE.get(key)

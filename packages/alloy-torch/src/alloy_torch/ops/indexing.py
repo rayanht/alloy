@@ -97,9 +97,9 @@ def k_index_put_add_rows(
     BLOCK_SIZE: constexpr = 1024,
 ):
     """Scatter-add `src[i]` into `out[index[i]]` (one program per src element).
-    Collisions (repeated index, e.g. a token appearing twice) accumulate via an
-    atomic-add store, so the per-row sum order is non-deterministic at f32-ULP.
-    `out` carries the running value and must be pre-initialised to the target."""
+    Collisions accumulate via an atomic-add store, so the per-row sum order is
+    non-deterministic at f32-ULP. `out` carries the running value and must be
+    pre-initialised to the target."""
     pid = alloy.program_id(0)
     offs = pid * BLOCK_SIZE + alloy.arange(0, BLOCK_SIZE)
     mask = offs < NUM_IDX * COLS
@@ -254,18 +254,14 @@ def k_cache_write_arange(
     SRC_OFF: constexpr = 0,
     BLOCK_SIZE: constexpr = 1024,
 ):
-    """Fast cache-write specialized for contiguous arange indices.
+    """Cache-write specialized for contiguous arange indices: a single-pass
+    O(B*H*L*D) kernel (vs k_index_copy_dim2_4d's O(L*T*H*D) inner-loop scan).
+    Each output element copies from target (seq index outside the new range) or
+    src (inside).
 
-    Replaces k_index_copy_dim2_4d's O(L*T*H*D) inner-loop scan with a
-    single-pass kernel: each output element either copies from target
-    (if its seq index is outside the new range) or from src (if inside).
-
-    Assumes `index[i] == index[0] + i` for all i in [0, T). True for HF's
-    StaticLayer.update where cache_position is built as
-    `arange(kv_length) + cumulative_length`. For non-contiguous indices,
-    fall back to k_index_copy_dim2_4d.
-
-    Work: O(B*H*L*D) memory traffic, no inner loop.
+    Assumes `index[i] == index[0] + i` for all i in [0, T) — HF's
+    StaticLayer.update builds cache_position as `arange(kv_length) +
+    cumulative_length`. For non-contiguous indices, use k_index_copy_dim2_4d.
     """
     pid = alloy.program_id(0)
     offs = pid * BLOCK_SIZE + alloy.arange(0, BLOCK_SIZE)
@@ -278,14 +274,12 @@ def k_cache_write_arange(
     h = rem % H
     b = rem // H
 
-    # All threads see the same start (scalar broadcast from index[0]).
     start = alloy.load(index + 0)
     t_for_seq = seq - start
     use_src = mask & (t_for_seq >= 0) & (t_for_seq < T)
-    # Clamp t to [0, T) regardless of use_src so the offset never points
-    # past src's buffer. Metal's `masked load with OOB pointer` is
-    # undefined — we observed garbage propagating into the output for
-    # small T where the unmasked computed address exceeded src.size.
+    # Clamp t to [0, T) regardless of use_src so the offset never points past
+    # src's buffer: Metal's masked load with an OOB pointer is undefined and
+    # propagates garbage for small T where the unmasked address exceeds src.size.
     t_clamped = alloy.maximum(
         alloy.minimum(alloy.cast(t_for_seq, alloy.int32), alloy.cast(T - 1, alloy.int32)),
         alloy.cast(0, alloy.int32),
@@ -383,17 +377,12 @@ def _select_backward(
 ) -> AlloyBuffer:
     """aten.select_backward: scatter grad into a zero tensor at [..., dim=index, ...].
 
-    AOT emits this to undo ``aten.select.int`` during backward. The default
+    AOT emits this to undo ``aten.select.int`` during backward. Concatenate
+    ``[zeros_before, grad.unsqueeze(dim), zeros_after]`` along ``dim`` — each
+    piece is contiguous and the grad buffer stays within its own allocation. The
     ``eq(arange) + where`` decomposition mis-scatters on small head_dim SDPA
-    paths, and ``_slice_scatter`` silently returns garbage when its kernel's
-    out-of-slice ``src`` offsets go negative (happens when dim_size * after
-    crosses the 1024-element BLOCK_SIZE boundary, seen on (3, B=2, H, N, D)
-    SDPA QKV-split shapes).
-
-    We concatenate ``[zeros_before, grad.unsqueeze(dim), zeros_after]`` along
-    ``dim`` instead. Each piece is contiguous, the concat kernel is the same
-    one used in the forward QKV pack, and the grad buffer flows through
-    without touching addresses outside its own allocation.
+    paths, and ``_slice_scatter`` returns garbage when its out-of-slice ``src``
+    offsets go negative.
     """
     sizes: tuple[int, ...] = tuple(int(size) for size in input_sizes)
     ndim = len(sizes)

@@ -1,8 +1,8 @@
 """KVStore: the cache-ownership seam between generation engines and KV memory.
 
-ContiguousKV is the default implementation — one StaticCache per (batch,
-max_len), always sized to the model's native context, with the machine-derived
-fill budget. PagedKV is the opt-in paged variant behind the same interface.
+ContiguousKV is the default — one StaticCache per (batch, max_len), sized to
+the model's native context, with the machine-derived fill budget. PagedKV is
+the opt-in paged variant behind the same interface.
 """
 
 from __future__ import annotations
@@ -69,29 +69,25 @@ class ContiguousKV:
         self.native_len = max_cache_len
         # Worst-case prefix-bookmark count, reserved out of the fill budget.
         self.bookmark_slots = bookmark_slots
-        # Derived lazily from the machine's memory budget on first use.
         self.fill_budget: int | None = None
         # Attached spec-decode session; its drafter state grows per token and
         # is counted into the fill budget. Set by AlloyGenerator.attach_spec.
         self.spec: SpecSession | None = None
         # Per-(batch_size, max_len) cache instances, reused across
         # conversations so the alloy backend's storage_ptr-keyed
-        # _cached_input_check doesn't invalidate the warm-prefill plan
-        # on every new conversation.
+        # _cached_input_check doesn't invalidate the warm-prefill plan.
         self.persistent_caches: dict[tuple[int, int], StaticCache] = {}
         # Bumped whenever the cache tensors are repointed to a different
         # slice's storage. Pinned-plan consumers that replay with
         # args_stable (spec verify) and per-storage scratch (the DeltaNet
         # conv tape / GDR round buffers, keyed by data_ptr) watch this to
-        # rebind — they would otherwise target the slice the plan was pinned
-        # against. 0 and never-incremented on ContiguousKV (no slices).
+        # rebind. 0 and never-incremented on ContiguousKV (no slices).
         self.slice_epoch = 0
 
     def cache_len_for(self, required: int) -> int:
-        """The KV-cache length for a request needing `required` positions. The
-        cache is always the model's native context (a single size — no buckets).
-        The memory budget is enforced upstream by `fit_to_budget` (which clamps
-        generation to fit), so this is just a final native-bound safety net."""
+        """The KV-cache length for a request needing `required` positions —
+        always the model's native context. A final native-bound safety net;
+        the memory budget is enforced upstream by `fit_to_budget`."""
         if required > self.native_len:
             raise ValueError(
                 f"request needs {required} positions, exceeding the model's native "
@@ -101,7 +97,7 @@ class ContiguousKV:
 
     @property
     def max_cache_len(self) -> int:
-        """The KV-cache size — the model's native context."""
+        """The model's native context."""
         return self.native_len
 
     @property
@@ -116,9 +112,8 @@ class ContiguousKV:
 
     def fit_to_budget(self, prompt_len: int, max_new_tokens: int, *, extra: int = 0) -> int:
         """Clamp `max_new_tokens` so prompt + generation fits the memory budget
-        (`max_fill`); raise a clear, actionable error if the prompt alone does
-        not fit. `extra` reserves positions for transient overshoot (e.g. the
-        spec-decode verify window). The cache stays native regardless."""
+        (`max_fill`); raise if the prompt alone does not fit. `extra` reserves
+        positions for transient overshoot (e.g. the spec-decode verify window)."""
         budget = self.max_fill
         if prompt_len + extra + 1 > budget:
             raise ValueError(
@@ -131,8 +126,7 @@ class ContiguousKV:
 
     def derive_fill_budget(self) -> int:
         """positions = (working_set·(1−headroom) − weight_bytes) / kv_bytes_per_token,
-        clamped to [MIN_FILL, native]. Any failure → native (no effective cap):
-        the budget is a safety valve, never a hard gate on a capable machine."""
+        clamped to [MIN_FILL, native]. Any failure → native (no effective cap)."""
         try:
             # scoped: GPU/Metal runtime dep — keep generation importable without a device
             from alloy._runtime.metal import default_device
@@ -167,22 +161,19 @@ class ContiguousKV:
         return state_bytes * self.bookmark_slots
 
     def kv_bytes_per_token(self) -> int:
-        """Bytes the KV cache grows by per added token, summed over layers with a
-        growing cache. Only full-attention layers grow with context; sliding-
-        window layers cap at their window and linear-attention layers keep
-        fixed-size state, so neither scales per token. Introspects a native cache
-        — the authoritative shapes (handles GQA, gemma4's mixed head dims, and
-        hybrid models without re-deriving the layer-type logic)."""
+        """Bytes the KV cache grows by per added token, summed over growing
+        layers. Only full-attention layers grow with context; sliding-window
+        layers cap at their window and linear-attention layers keep fixed-size
+        state. Introspects a native cache for the authoritative shapes (GQA,
+        gemma4's mixed head dims, hybrids)."""
         cache = self.acquire(1, self.native_len)
         per_token = 0
         for layer in cache.layers:
-            # Only full-attention layers grow with context. Sliding-window
-            # (AlloyStaticSlidingWindowLayer) caps at its window and linear-
-            # attention (AlloyLinearAttentionLayer) keeps fixed state — neither
-            # subclasses AlloyStaticLayer, so this selects exactly the growing
-            # layers, whose `keys` is (batch, n_kv_heads, max_cache_len, head_dim).
-            # `keys` is None for a dynamically-allocated cache (no eager buffers);
-            # skipping it yields 0 → `derive_fill_budget` falls back to native.
+            # Only full-attention layers grow with context. Sliding-window and
+            # linear-attention layers don't subclass AlloyStaticLayer, so this
+            # selects exactly the growing layers; `keys` is
+            # (batch, n_kv_heads, max_cache_len, head_dim). `keys` is None for a
+            # dynamically-allocated cache → 0 → fall back to native.
             if isinstance(layer, AlloyStaticLayer) and layer.keys is not None:
                 keys = layer.keys
                 per_token += 2 * int(keys.shape[1]) * int(keys.shape[3]) * keys.element_size()
@@ -221,7 +212,7 @@ class ContiguousKV:
 
     def supports_slices(self) -> bool:
         """True when the store can hold several KV slices and rebind the
-        cache between them (PagedKV). False = single-slot semantics."""
+        cache between them (PagedKV)."""
         return False
 
     def wire_slices(self, slices: "list[KVSlice]") -> None:
@@ -248,8 +239,7 @@ class ContiguousKV:
         return 0
 
     def pressure_level(self) -> int:
-        """System memory-pressure level (0 normal / 1 warn / 2 critical);
-        only meaningful when the store can reclaim."""
+        """System memory-pressure level (0 normal / 1 warn / 2 critical)."""
         return 0
 
     def clear_tail(self, cache: StaticCache, start: int) -> None:
@@ -271,15 +261,11 @@ class ContiguousKV:
     def acquire(self, batch_size: int, max_len: int) -> StaticCache:
         # Reuse the same StaticCache instance (= same tensor storage_ptrs)
         # across conversations. The alloy backend's `_cached_input_check`
-        # in `_execute_plan` matches by storage_ptr, so allocating a fresh
-        # cache per conversation would invalidate the warm-prefill plan
-        # and force a noticeable per-conversation rebuild hiccup on every
-        # new conversation. Reusing the cache keeps storage_ptrs stable.
-        # Safety: we reset cumulative_length to 0 so the model writes
-        # fresh K/V at positions [0..N) for the new conversation; any
-        # stale K/V left at higher positions is masked out by the
-        # model's causal attention as long as decode only reads
-        # cache[0..cur_pos+1).
+        # matches by storage_ptr, so a fresh cache per conversation would
+        # invalidate the warm-prefill plan and force a per-conversation
+        # rebuild. Resetting cumulative_length to 0 makes the model write
+        # fresh K/V at [0..N); stale K/V at higher positions is masked out
+        # by causal attention as long as decode reads cache[0..cur_pos+1).
         key = (batch_size, max_len)
         cache = self.persistent_caches.get(key)
         if cache is None:
@@ -293,17 +279,12 @@ class ContiguousKV:
             )
             self.persistent_caches[key] = cache
         else:
-            # Reset cumulative_length only. Stale K/V at positions beyond
-            # the new prompt's length is harmless: the model's causal
-            # attention only reads cache[0..cur_pos+1) so anything past
-            # cumulative_length never reaches the softmax.
-            #
-            # Linear-attention (GatedDeltaNet) layers ARE order-dependent:
-            # conv_states + recurrent_states carry the entire history,
-            # not a position window. Reset them along with the layer's
-            # has_previous_state flag so a fresh conversation starts
-            # from zero state instead of inheriting warmup or prior-
-            # request residue.
+            # Reset cumulative_length only; stale K/V past it never reaches
+            # the softmax (causal attention reads cache[0..cur_pos+1)).
+            # Linear-attention (GatedDeltaNet) layers carry the entire
+            # history in conv_states + recurrent_states, not a position
+            # window — reset them and has_previous_state so a fresh
+            # conversation doesn't inherit prior-request residue.
             for layer in cache.layers:
                 layer.cumulative_length.fill_(0)
                 if isinstance(layer, AlloyLinearAttentionLayer):
@@ -319,8 +300,7 @@ class PagedPool:
     page-aligned slices (`pool_slice` registers each as a first-class alloy
     buffer, so every pointer/handle path resolves it with the right Metal
     offset). Pages commit on first touch; `pool_reclaim` returns them.
-    Batch-1 today is a bump allocator over the slice table; the free list
-    arrives with multi-batch."""
+    A bump allocator over the slice table."""
 
     PAGE = 16384
 
@@ -340,10 +320,9 @@ class PagedPool:
 
 
 # Concurrent resumable conversations: each holds a full KV slice in the pool.
-# Committed pages scale with what each conversation actually filled; the LRU
-# entry is evicted (pages reclaimed, storages reused) when a new conversation
-# needs a slot. Sized for agentic traffic: interleaved sessions plus the side
-# calls clients fire around every real turn.
+# Committed pages scale with what each conversation filled; the LRU entry is
+# evicted (pages reclaimed, storages reused) when a new conversation needs a
+# slot. Sized for agentic traffic: interleaved sessions plus side calls.
 MAX_SLICES = 8
 
 # Per-conversation chunk-boundary resume points (see PrefixCache.mark_prefix);
@@ -355,9 +334,9 @@ PREFIX_MARK_CAP = 8
 class KVSlice:
     """One conversation's physical KV backing: a storage per cache tensor
     (canonical walk order) plus the python state the graph cache guards on.
-    The cache OBJECT never changes — binding a slice repoints every cache
-    tensor's storage with `set_()`; the pinned plans re-resolve bindings via
-    the existing storage-change check on the next dispatch."""
+    Binding a slice repoints every cache tensor's storage with `set_()`; the
+    pinned plans re-resolve bindings via the storage-change check on the next
+    dispatch."""
 
     def __init__(self, storages: list[torch.UntypedStorage]) -> None:
         self.storages = storages
@@ -370,11 +349,10 @@ class KVSlice:
 class PagedKV(ContiguousKV):
     """ContiguousKV with every cache tensor carved from one vm-reserved pool.
 
-    Same cache objects, same kernels, same plans — slices are virtual-
-    contiguous, so nothing above the allocator changes. What the pool adds:
-    page-level reclaim (`reclaim_beyond`: dead conversations hand their
-    KV pages back to the kernel) and the memory-pressure signal. Opt-in via
-    ALLOY_KV=paged.
+    Slices are virtual-contiguous, so the cache objects, kernels, and plans
+    are unchanged. The pool adds page-level reclaim (`reclaim_beyond`: dead
+    conversations hand their KV pages back to the kernel) and the
+    memory-pressure signal. Opt-in via ALLOY_KV=paged.
     """
 
     # Tensors safe to reclaim: KV rows past the live position are dead by the
@@ -393,10 +371,10 @@ class PagedKV(ContiguousKV):
     def tensor_alloc(self) -> Callable[[int], int]:
         if self.pool is None:
             # Reserve virtual space for the maximum the machine could ever
-            # hold (the fill budget bounds actual commitment). The
-            # reservation is pure VA — no Metal buffer spans it (each slice
-            # wraps its own range, so Metal's wire-whole-buffer-at-first-use
-            # behaviour stays per-tensor) and pages commit on first write.
+            # hold (the fill budget bounds actual commitment). Pure VA — no
+            # Metal buffer spans it (each slice wraps its own range, keeping
+            # Metal's wire-at-first-use per-tensor); pages commit on first
+            # write.
             try:
                 # scoped: GPU/Metal runtime dep — keep generation importable without a device
                 from alloy._runtime.metal import default_device
@@ -425,8 +403,7 @@ class PagedKV(ContiguousKV):
     def slice_entries(self, cache: StaticCache) -> list[tuple[str, torch.Tensor]]:
         """Every cache tensor as (attr_name, tensor) in a canonical, deduped
         order — THE walk every slice operation indexes by. Aliased tensors
-        (the shared cumulative_length / alloy_last_real) appear once — one
-        set_() repoints every layer's view because they are one object."""
+        (the shared cumulative_length / alloy_last_real) appear once."""
         seen: set[int] = set()
         out: list[tuple[str, torch.Tensor]] = []
         for layer in cache.layers:
@@ -464,7 +441,7 @@ class PagedKV(ContiguousKV):
         request path. A bytesNoCopy slice is native-context-VA, which Metal
         wires on first encoder use (~14ms/GB) — paid per fresh conversation
         otherwise. A dispatch-touch wires it now WITHOUT touching
-        phys_footprint (E1), so the demand-paged memory win is preserved."""
+        phys_footprint, so the demand-paged memory win is preserved."""
         handles = [
             storage._alloy_keepalive[1]  # type: ignore[attr-defined]
             for kvslice in slices
@@ -486,8 +463,8 @@ class PagedKV(ContiguousKV):
 
     def bind_slice(self, cache: StaticCache, kvslice: KVSlice) -> None:
         """Repoint every cache tensor to the slice's storages and restore the
-        slice's python state. Pinned plans self-heal: the next dispatch's
-        storage-change check rebuilds (handle, offset) bindings."""
+        slice's python state. The next dispatch's storage-change check
+        rebuilds the pinned plans' (handle, offset) bindings."""
         tensors = self.slice_tensors(cache)
         if len(tensors) != len(kvslice.storages):
             raise RuntimeError(
@@ -580,8 +557,7 @@ class PagedKV(ContiguousKV):
                 item = t.element_size()
                 base = t.data_ptr() - _metal_ext.buf_ptr(handle)
                 # (B, H, S, D) is contiguous: rows [start, seq) of each (b, h)
-                # plane are one byte range. Range count is the layout
-                # instrumentation feeding the seq-major decision.
+                # plane are one byte range.
                 for b in range(batch):
                     for h in range(heads):
                         plane = base + (b * t.stride(0) + h * t.stride(1)) * item

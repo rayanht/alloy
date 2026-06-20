@@ -42,10 +42,8 @@ def make_stub_model(name: str = "alloy-test:tiny") -> ServedModel:
 
 @pytest.fixture()
 def server() -> Iterator[AlloyServer]:
-    """A live HTTP server on a random port. Yields (server, port).
-
-    The server is shut down at fixture teardown; the background thread is a
-    daemon so leaks don't keep pytest alive.
+    """A live HTTP server on a random port, shut down at teardown. The
+    background thread is a daemon so leaks don't keep pytest alive.
     """
     instance = create_server("127.0.0.1", 0, chat_model=make_stub_model())
     thread = Thread(target=instance.serve_forever, daemon=True)

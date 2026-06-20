@@ -48,13 +48,11 @@ _DEFAULT_CHUNK = 4096
 
 # Representative WARM cache offset the prefill attention is benchmarked at. The
 # runtime-pos attention's causal early-exit makes its cost scale with the cache
-# offset, but the tile config saturates past a few thousand K-positions (the
-# K-side analogue of GRID_SHRINK_REP_M's M-saturation): the config optimal at an
-# 8K-position K-loop is the config optimal at native (262K), and benchmarking the
-# native offset is intractable (~7ms/dispatch × 20 runs × N configs). The cache
-# is still allocated at native, so the SHAPE KEY (KV_LEN) is unchanged and the
-# tuned config resolves at the production offset — only the benchmarked early-exit
-# trip count shrinks.
+# offset, but the tile config saturates past a few thousand K-positions: the
+# config optimal at an 8K-position K-loop is optimal at native (262K), and
+# benchmarking the native offset is intractable (~7ms/dispatch × 20 runs × N
+# configs). The cache is still allocated at native, so the shape key (KV_LEN) is
+# unchanged; only the benchmarked early-exit trip count shrinks.
 _WARM_TUNE_OFFSET = 4096
 
 
@@ -162,47 +160,42 @@ def tune(
 
     loaded = load_native_causal_lm(model)
     net = loaded.model.eval()
-    # The model's native context (max_position_embeddings); the GGUF loader maps
-    # `<arch>.context_length` onto this field. (Rope-scaled models where the
-    # deployable context != base would need to read the scaling factor; none of
-    # the current native models scale.)
+    # Native context (max_position_embeddings); the GGUF loader maps
+    # `<arch>.context_length` onto this field.
     context = int(net.config.max_position_embeddings)
     label = f"only={only!r}" if only else "all kernels"
     console.print(
         f"[bold]tuning[/] {model} @ context={context} — {label}, "
         f"prefill M={chunk} + decode M=1"
     )
-    # Configure the model exactly as production does (installs the multi-token
-    # attention patch for hybrid/gated-attention models, wires chunked prefill)
-    # so the tuner's forward exercises the real dispatch path. We keep only the
-    # in-place side effect on `net`; the generator object itself is unused here.
+    # Configure the model as production does (multi-token attention patch for
+    # hybrid/gated-attention models, chunked prefill) so the tuner's forward
+    # exercises the real dispatch path. Only the in-place side effect on `net`
+    # is kept; the generator object itself is unused here.
     AlloyGenerator.from_model(net, chunk_prefill_size=chunk)
     cfg = net.config
-    # Honor ALLOY_KV_QUANT (and the --kv-quant flag that exports it): the tune
-    # forwards must dispatch the SAME kernels production serves — a quantized
-    # KV deployment tunes the q8 attention variants, not the fp16 ones.
+    # Honor ALLOY_KV_QUANT: the tune forwards must dispatch the SAME kernels
+    # production serves — a quantized KV deployment tunes the q8 attention
+    # variants, not the fp16 ones.
     kv_format = resolve_kv_format(None)
     set_use_alloy_warm_op(False)
 
     # 1) Prefill: the single chunk shape generation dispatches, benchmarked at a
     # representative WARM offset. Chunked prefill runs this chunk shape at cache
     # offsets 0..(context-chunk) through `attention_strided_runtime_pos`, whose
-    # causal early-exit clamps the K-scan to Q_START_POS+chunk — so its cost
-    # scales with the offset. Tuning at offset 0 (a cold chunk) shrinks the
-    # benchmarked K-loop to ~chunk positions, so the tuner picks tile sizes
-    # optimal for a tiny attention (8x8) that are ~8x too slow at the warm
-    # offsets real prefill hits. We tune at _WARM_TUNE_OFFSET (a few thousand
-    # positions) — past the K-length where the tile config saturates, so its
-    # pick matches the native offset, but cheap to benchmark (the native offset
-    # is intractable). The cache is still native-sized, so KV_LEN — the shape
-    # key — is unchanged; only the runtime early-exit trip count shrinks.
-    # GEMMs/norms are offset-independent (M=chunk).
+    # causal early-exit clamps the K-scan to Q_START_POS+chunk, so its cost scales
+    # with the offset. Tuning at offset 0 shrinks the benchmarked K-loop to ~chunk
+    # positions, so the tuner picks tile sizes optimal for a tiny attention (8x8)
+    # that are ~8x too slow at the warm offsets real prefill hits. We tune at
+    # _WARM_TUNE_OFFSET — past the K-length where the tile config saturates — so
+    # the pick matches the native offset but stays cheap to benchmark. The cache
+    # is native-sized, so KV_LEN (the shape key) is unchanged; only the runtime
+    # early-exit trip count shrinks. GEMMs/norms are offset-independent (M=chunk).
     #
     # record_only: the extraction forward only needs SHAPES — the per-kernel
-    # benchmark synthesizes its own buffers. Running it for real executes the
-    # untuned attention across every layer just to recover shapes. The offset
-    # lives in a runtime Q_START_POS_BUF, lost when the forward is skipped, so
-    # re-inject it via q_start_pos so the attention benchmarks the warm extent.
+    # benchmark synthesizes its own buffers. The offset lives in a runtime
+    # Q_START_POS_BUF, lost when the forward is skipped, so re-inject it via
+    # q_start_pos so the attention benchmarks the warm extent.
     if not only_shrink and not only_spec:
         warm_pos = min(_WARM_TUNE_OFFSET, context - chunk)
         compile_window.q_start_pos = warm_pos
@@ -257,44 +250,39 @@ def tune(
     # 3) Grid-shrink chunk prefill: the production large chunk in a SINGLE cold
     # forward. The shrink-capable plan compiles at SEQ_LEN=chunk, so its GEMM /
     # attention / norm / DeltaNet kernels resolve configs by the large-chunk shape —
-    # distinct from the M=chunk entries above, no clash. Cold (start_pos=0) is the
-    # representative shrink-chunk extent (unlike the warm small-chunk pass). Without
-    # this the large-chunk dispatch falls back to untuned configs despite the
-    # larger, more efficient GEMMs.
+    # distinct from the M=chunk entries above. Without this the large-chunk
+    # dispatch falls back to untuned configs despite the larger, more efficient
+    # GEMMs.
     #
-    # We tune at the REPRESENTATIVE M (GRID_SHRINK_REP_M), NOT the deployment M_MAX: tile
-    # configs are M-saturated past a few thousand rows (measured: M=16384 == M=262144
+    # We tune at the REPRESENTATIVE M (GRID_SHRINK_REP_M), NOT the deployment M_MAX:
+    # tile configs are M-saturated past a few thousand rows (M=16384 == M=262144
     # configs for 3/4 GEMM shapes), and tuning at native M_MAX is intractable — the
     # cold single-pass attention is O(M^2) (~1hr+/shape at 262144). A larger-chunk
-    # plan caps its M-scaled config keys down to GRID_SHRINK_REP_M at resolution
-    # (tune_configs.set_grid_shrink_resolve_cap), so it resolves against this tune.
+    # plan caps its M-scaled config keys down to GRID_SHRINK_REP_M at resolution,
+    # so it resolves against this tune.
     if shrink_max and not only_spec:
         m = (min(shrink_max, context, GRID_SHRINK_REP_M) // 64) * 64
         compile_window.q_start_pos = 0
-        # Tune with single-pass attention forced — the branch the shrink-capable
-        # dispatch uses (the exact-grid path forces single-pass for
-        # shrinkability); otherwise the tuner benchmarks the split-K kernels the
-        # shrink-capable plan never runs, and the single-pass attention falls
-        # back to untuned configs. NOT shrink_m: the tuner must not couple in
-        # the resolve cap / bounded pool — it WRITES configs, it doesn't resolve.
+        # Force single-pass attention — the branch the shrink-capable dispatch
+        # uses (the exact-grid path forces single-pass for shrinkability);
+        # otherwise the tuner benchmarks the split-K kernels the shrink-capable
+        # plan never runs, and the single-pass attention falls back to untuned
+        # configs. NOT shrink_m: the tuner WRITES configs, it doesn't resolve, so
+        # it must not couple in the resolve cap / bounded pool.
         compile_window.single_pass_attention = True
         os_cache = AlloyStaticCache(cfg, max_cache_len=context, cache_dtype=torch.float16, kv_format=kv_format)
         try:
-            # logits_to_keep=1 — match production (`ChunkPrefill`): chunk
-            # prefill keeps ONLY the last token's logits, so the lm_head runs at
-            # M=1 (already tuned by the decode pass), NOT M=M_MAX. Without this the
-            # tuner benchmarks a phantom (M_MAX, vocab) lm_head GEMM that production
+            # logits_to_keep=1 — match production (`ChunkPrefill`): chunk prefill
+            # keeps ONLY the last token's logits, so the lm_head runs at M=1
+            # (already tuned by the decode pass), NOT M=M_MAX. Without this the
+            # tuner benchmarks a phantom (M_MAX, vocab) lm_head GEMM production
             # never dispatches — at M_MAX=16384, vocab≈248k that's a 16 GB output
-            # and ~580s/shape, the dominant tune cost and the M_MAX-scaling blocker.
-            # The backbone still runs at M=M_MAX (logits_to_keep only slices the
-            # final lm_head), so its kernels tune at the correct shape.
+            # and ~580s/shape, the dominant tune cost. The backbone still runs at
+            # M=M_MAX (logits_to_keep only slices the final lm_head).
             # record_only: the shape-extraction forward at M=M_MAX would hold
-            # O(M_MAX × layers) of activations and OOM (e.g. qwen3.5:4b at 16384).
-            # Record-only captures every kernel's shape with phantom intermediates
-            # and no GPU dispatch; the per-kernel benchmark still runs real. At
-            # M_MAX the big activations exceed the snapshot cap anyway, so no
-            # realistic-snapshot quality is lost (unlike the small-M chunk/decode
-            # passes, which keep record_only off).
+            # O(M_MAX × layers) of activations and OOM; it captures every kernel's
+            # shape with phantom intermediates and no GPU dispatch, while the
+            # per-kernel benchmark still runs real.
             alloy.tune(
                 net,
                 {
@@ -319,8 +307,8 @@ def tune(
     # 4) Speculative decoding: the M=block verify forward + the drafter's own
     # modules. The verify runs with the production flags (warm op, SAVE_STEPS,
     # taps) against a primed cache at a warm offset, so the dot_*_v2_rows quant
-    # kernels and the SAVE_STEPS recurrent tune at the exact verify shapes; the
-    # drafter contributes its propose/observe forwards via tune_targets().
+    # kernels and the SAVE_STEPS recurrent tune at the verify shapes; the drafter
+    # contributes its propose/observe forwards via tune_targets().
     if spec:
         gen = AlloyGenerator.from_model(net, chunk_prefill_size=chunk)
         if spec == "pld":
@@ -376,10 +364,9 @@ def tune(
             alloy.tune(module, inputs, **only_kw, **out_kw)
             console.print(f"  [green]done[/] {spec_label}")
 
-    # Modality front-ends (vision today; audio / qwen3.5-vision later) each expose
-    # their tunable forwards via capture_targets(). Their shapes are fixed and
-    # context-independent (a ViT attends its full patch count, not the text
-    # KV-context), so they tune once and merge by shape — no clash with text.
+    # Modality front-ends expose their tunable forwards via capture_targets().
+    # Their shapes are fixed and context-independent (a ViT attends its full
+    # patch count, not the text KV-context), so they tune once and merge by shape.
     if loaded.vision is not None:
         for target in loaded.vision.capture_targets():
             if target.setup is not None:

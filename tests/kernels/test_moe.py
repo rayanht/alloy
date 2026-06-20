@@ -31,9 +31,9 @@ def _buf(arr, dtype):
 def _q4k_blocks(rows, nb, rng):
     """Random valid GGUF-native Q4_K blocks (rows..., nb*144) uint8 with sane f16
     d/dmin. d is small because the native weight is d*scale_raw*nibble with the
-    6-bit scale_raw up to 63 — d~0.002 gives an effective per-weight scale ~0.05
-    (the magnitude the OLD normalized test used), keeping the two-stage MoE GEMM
-    within f16 range (random d~0.02 overflows f16 after gate_up→down compounding)."""
+    6-bit scale_raw up to 63 — d~0.002 gives an effective per-weight scale ~0.05,
+    keeping the two-stage MoE GEMM within f16 range (random d~0.02 overflows f16
+    after gate_up→down compounding)."""
     blk = rng.integers(0, 256, size=rows + (nb, 144), dtype=np.uint8)
     n = nb
     for r in rows:
@@ -105,8 +105,7 @@ def test_gguf_moe_routed_handler_matches_per_expert_reference():
     dview[..., 209] = db[1]
     # T==1 -> decode/GEMV path (f32, tight); T>1 -> prefill/grouped path (f16 MMA, f16 tol).
     # Compared by max-relative error (max|diff|/max|ref|) — the standard f16-GEMM metric;
-    # per-element rtol is meaningless on a GEMM output's wide dynamic range, but max-relative
-    # still catches catastrophic bugs (e.g. the auto-grid mis-size gave rel~1.0).
+    # per-element rtol is meaningless on a GEMM output's wide dynamic range.
     for T, rtol in [(1, 1e-3), (2, 5e-3)]:
         x = rng.standard_normal((T, H)).astype(np.float32)
         logits = rng.standard_normal((T, E)).astype(np.float32)

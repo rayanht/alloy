@@ -27,9 +27,8 @@
 namespace nb = nanobind;
 
 // The device, buffers, pipelines, and plan registry live in the shared,
-// nanobind-free core (alloy_core), linked by the on-device Swift engine too.
-// This translation unit keeps only the nb shims + Python-only paths (handler
-// dispatch, paged pool, profiling).
+// nanobind-free core (alloy_core). This translation unit keeps only the nb
+// shims + Python-only paths (handler dispatch, paged pool, profiling).
 
 #include "alloy_core.h"
 
@@ -37,18 +36,12 @@ using namespace alloycore;
 
 // Training mode: when true, dispatch_plan_profiled clears the get_buffer cache
 // on each call so optimizer.step() mutations on external storage are observed.
-// Production dispatch_plan resolves through alloy buffer handles and is
-// unaffected — it never reads g_training_mode.
 static bool g_training_mode = false;
 
-// buf_alloc / buf_release now live in alloy_core (shared with the Swift engine).
-
-// Live Metal-buffer accounting (debug/memory audit): count + total aligned
-// bytes of non-released alloy buffers, so leaked plan pools / scratch show up
-// without vmmap region guesswork.
+// Live Metal-buffer accounting: count + total aligned bytes of non-released
+// alloy buffers.
 static int64_t region_resident_bytes(uintptr_t addr, size_t len) {
-  // Sum resident pages over [addr, addr+len) via the VM region map — one
-  // recurse call per region, so cheap even for multi-GB demand-paged buffers.
+  // Sum resident pages over [addr, addr+len) via the VM region map.
   int64_t resident = 0;
   mach_vm_address_t a = addr;
   mach_vm_address_t end = addr + len;
@@ -79,7 +72,7 @@ static nb::dict buffer_stats() {
   int64_t n = 0, reserved = 0, resident = 0;
   for (auto &[h, ab] : g_alloy_buffers) {
     if (ab.released || ab.slice)
-      continue; // skip pool slices: their pages are counted under the pool
+      continue; // pool slices' pages are counted under the pool
     n++;
     reserved += (int64_t)ab.aligned_size;
     resident += region_resident_bytes((uintptr_t)ab.ptr, ab.aligned_size);
@@ -91,8 +84,7 @@ static nb::dict buffer_stats() {
   return d;
 }
 
-// Per-buffer (handle, reserved, resident) for the top-N by resident bytes —
-// memory-audit dump to see what the live Metal buffers actually are.
+// Per-buffer (handle, reserved, resident) for the top-N by resident bytes.
 static nb::list buffer_dump(int64_t top) {
   std::lock_guard<std::mutex> lock(g_buf_mutex);
   std::vector<std::tuple<int64_t, int64_t, int64_t>> rows;
@@ -120,13 +112,11 @@ static nb::list buffer_dump(int64_t top) {
 // MTLBuffer; slices register interior ranges as first-class alloy buffers so
 // every pointer/handle path (handler dispatch, compiled-plan binding,
 // buf_handle_for_ptr) resolves them with the right Metal offset. Pages commit
-// on first touch and return to the kernel via pool_reclaim (E0/E1-proven).
+// on first touch and return to the kernel via pool_reclaim.
 // ---------------------------------------------------------------------------
 
 // Memory-pressure level, polled from Python between requests (reclaim must
-// only run while the GPU is quiescent — the serve loop is serialized, so a
-// flag + between-request sweep keeps that invariant without a C++-side race
-// against the allocator). 0 = normal, 1 = warn, 2 = critical.
+// only run while the GPU is quiescent). 0 = normal, 1 = warn, 2 = critical.
 static std::atomic<int> g_memory_pressure{0};
 static dispatch_source_t g_pressure_source = nil;
 
@@ -158,12 +148,11 @@ static int64_t pool_max_bytes() {
 }
 
 // Reserve virtual address space only — NO Metal buffer over the pool. Metal
-// wires a buffer's FULL residency at first encoder use (the one-shot
-// intermediate pool learned this the hard way: see
-// update_plan_intermediate_slots), so a single working-set-sized pool buffer
-// would force-commit the entire reservation the first time any slice is
-// bound. Each pool_slice instead wraps its own page range in its own
-// bytesNoCopy MTLBuffer — wiring stays per-tensor, exactly like buf_alloc.
+// wires a buffer's FULL residency at first encoder use, so a single
+// working-set-sized pool buffer would force-commit the entire reservation the
+// first time any slice is bound. Each pool_slice instead wraps its own page
+// range in its own bytesNoCopy MTLBuffer — wiring stays per-tensor, like
+// buf_alloc.
 static int64_t pool_create(size_t nbytes) {
   ensure_device();
   ensure_pressure_source();

@@ -4,10 +4,8 @@ tensor-map fixup, transformers-registry patches, chat template) and builds the
 dense vision (SigLIP RoPE ViT) + audio (USM Conformer) towers as alloy-compiled
 `ModalityAdapter`s.
 
-Ported from the former `_gemma4_compat.py` + `_gemma4_audio.py` shims. The vision
-tower runs in f32; the audio tower in native f16 (the conformer is bit-near-exact
-at f16, and two alloy properties make it work — f16/bf16 scalar decode + the
-functional out-of-place conformer forwards below).
+The vision tower runs in f32; the audio tower in native f16, which needs f16/bf16
+scalar decode + the functional out-of-place conformer forwards below.
 """
 
 from __future__ import annotations
@@ -46,8 +44,8 @@ from alloy_server.models.modality import CaptureTarget, ModalityAdapter
 from alloy_server.models.registry import register
 
 # gemma4 multimodal token ids (from the HF Gemma4Config defaults): the image
-# placeholder whose embedding is replaced by a vision feature, plus the
-# begin/end-of-image brackets the processor wraps the soft-token run in.
+# placeholder, plus the begin/end-of-image brackets the processor wraps the
+# soft-token run in.
 GEMMA4_IMAGE_TOKEN_ID = 258880
 GEMMA4_BOI_TOKEN_ID = 255999
 GEMMA4_EOI_TOKEN_ID = 258882
@@ -62,8 +60,7 @@ def gemma4_chat_template() -> str:
     gemma4's GGUF doesn't embed a chat_template, and — unlike gemma2/3 — Google
     ships it as a standalone `chat_template.jinja` rather than inside
     tokenizer_config.json. Bundled in the package so the GGUF-loaded tokenizer can
-    render gemma4 chats (`<|turn>{role}\n…<turn|>` markers, with tool-call /
-    thinking-channel macros), matching ollama's `RENDERER gemma4`.
+    render gemma4 chats, matching ollama's `RENDERER gemma4`.
     """
     return (
         importlib.resources.files("alloy_server")
@@ -174,8 +171,7 @@ def build_gemma4_vision_config(kv: dict) -> Gemma4VisionConfig:
 
 
 # gemma4 vision/projector GGUF tensor names are unknown to transformers' GGUF→HF
-# weight map. These tables encode the GGUF→HF correspondence, verified 1:1 against
-# `Gemma4ForConditionalGeneration` (659 tensors, 0 shape mismatches).
+# weight map. These tables encode the GGUF→HF correspondence.
 # Per-layer linears (under `…encoder.layers.{N}.`):
 V_LIN = {
     "attn_q": "self_attn.q_proj.linear", "attn_k": "self_attn.k_proj.linear",
@@ -198,7 +194,7 @@ def gemma4_vision_target(name: str, prefix: str) -> tuple[str | None, str]:
     `transform`: 'linear'/'direct' = use as-is (gguf data is already HF [out,in]
     orientation), 'patch' = flatten (768,3,16,16)->(768,768), 'clip' = (1,)->scalar."""
     if name.startswith(("mm.a.", "a.")):
-        return None, "audio"  # audio modality handled separately
+        return None, "audio"
     if name == "mm.input_projection.weight":
         return prefix + "embed_vision.embedding_projection.weight", "linear"
     if name == "v.patch_embd.weight":
@@ -221,7 +217,7 @@ def gemma4_vision_target(name: str, prefix: str) -> tuple[str | None, str]:
 
 def gemma4_vision_tensor(t, how: str, dtype: torch.dtype) -> torch.Tensor:
     if t.tensor_type in GGUF_DENSE:
-        arr = np.array(t.data)  # gguf reader already yields HF (out,in) numpy orientation
+        arr = np.array(t.data)  # gguf reader yields HF (out,in) numpy orientation
     else:
         arr = dequantize(np.array(t.data), t.tensor_type).reshape(tuple(int(x) for x in reversed(t.shape)))
     x = torch.from_numpy(arr.astype(np.float32))
@@ -248,10 +244,10 @@ def gemma4_vision_state_dict(tensors, dtype: torch.dtype, prefix: str = "model."
 
 
 class Gemma4VisionHolder(torch.nn.Module):
-    """The dense (eager) half of gemma4 multimodal: the SigLIP RoPE ViT vision
-    tower + the projector that lifts its output into the language model's
-    embedding space. Runs on CPU in float32 (alloy's quantized decode is a
-    separate path; image features splice into its text embeddings)."""
+    """The dense half of gemma4 multimodal: the SigLIP RoPE ViT vision tower +
+    the projector that lifts its output into the language model's embedding
+    space. Runs on CPU in float32; image features splice into the quantized
+    decoder's text embeddings."""
 
     def __init__(self, vision_config: Gemma4VisionConfig, text_config) -> None:
         super().__init__()
@@ -273,7 +269,7 @@ class Gemma4VitEncode(torch.nn.Module):
     """Fixed-shape patch-embed + 16-layer ViT encoder -> (1, max_patches, hidden).
     The integer position bookkeeping (patch one-hot selector, padding-keep mask) is
     precomputed on CPU and passed in, so the graph is pure tensor compute (matmuls,
-    attention, norms) — one alloy plan, like the text decoder."""
+    attention, norms) — one alloy plan."""
 
     def __init__(self, vision_tower: torch.nn.Module) -> None:
         super().__init__()
@@ -322,7 +318,7 @@ class Gemma4VitPool(torch.nn.Module):
 class Gemma4VisionAdapter(ModalityAdapter):
     """Turns image bytes into language-model-space vision features for gemma4, and
     encodes gemma4's image-placeholder expansion. Implements the `Modality`
-    protocol the served model consumes — the server stays model-agnostic.
+    protocol the served model consumes.
 
     Owns the dense vision tower + projector (loaded from the GGUF's `v.*`/`mm.*`
     tensors) and the HF image processor. `encode` reproduces HF
@@ -342,13 +338,11 @@ class Gemma4VisionAdapter(ModalityAdapter):
     ) -> None:
         holder = Gemma4VisionHolder(build_gemma4_vision_config(vision_kv), text_config)
         state = gemma4_vision_state_dict(tensors, dtype, prefix="")
-        # strict=False tolerates registered-but-not-in-GGUF buffers (rope inv_freq);
-        # the 1:1 GGUF↔HF map is verified separately (659 tensors, 0 mismatches).
+        # strict=False tolerates registered-but-not-in-GGUF buffers (rope inv_freq).
         holder.load_state_dict(state, strict=False)
         self.holder = holder.eval().to(dtype)
-        # The whole vision tensor compute (patch + 16-layer encoder + pooler +
-        # projector) runs through alloy's Metal dispatch as one fixed-shape plan,
-        # like the text decoder; only the position bookkeeping + the variable
+        # The vision tensor compute runs through alloy's Metal dispatch as one
+        # fixed-shape plan; only the position bookkeeping + the variable
         # valid-token gather stay on CPU (see bookkeeping).
         self.encode_mod = Gemma4VitEncode(holder.vision_tower)
         self.pool_mod = Gemma4VitPool(holder.vision_tower, holder.embed_vision)
@@ -404,8 +398,8 @@ class Gemma4VisionAdapter(ModalityAdapter):
 
     def eager_compile_all(self) -> None:
         """Compile the two alloy vision plans (encode / pool) ahead of the first
-        real request — the ViT input shape is fixed, so one dummy image compiles
-        both stages."""
+        request. The ViT input shape is fixed, so one dummy image compiles both
+        stages."""
         self.encode(Image.new("RGB", (64, 64)))
 
     def capture_targets(self) -> list[CaptureTarget]:
@@ -576,7 +570,7 @@ def gemma4_audio_embedder_state_dict(tensors, dtype: torch.dtype) -> dict[str, t
 
 
 # Functional conformer forwards. The HF forwards mutate in place; alloy miscompiles
-# that in f16 (an AOT-functionalization × fusion interaction). These reproduce them
+# that in f16 (an AOT-functionalization × fusion interaction), so reproduce them
 # out-of-place.
 
 
@@ -652,7 +646,7 @@ class Gemma4AudioModule(torch.nn.Module):
 class Gemma4AudioAdapter(ModalityAdapter):
     """Turns audio bytes into language-model-space soft tokens for gemma4, and
     encodes gemma4's audio-placeholder expansion. Implements the `Modality`
-    protocol shape the served model consumes (audio is just another modality)."""
+    protocol the served model consumes."""
 
     placeholder_token_id = GEMMA4_AUDIO_TOKEN_ID
     PLACEHOLDER = "<|audio|>"
@@ -672,7 +666,7 @@ class Gemma4AudioAdapter(ModalityAdapter):
         )
         self.cfg = cfg
         self.dtype = dtype
-        # Eager (CPU) tower for the mask/position bookkeeping; the same weights,
+        # CPU tower for the mask/position bookkeeping; the same weights,
         # functionally patched, run the compiled forward.
         self.tower = patch_audio_functional(tower).eval().to(dtype)
         self.embedder = embedder.eval().to(dtype)

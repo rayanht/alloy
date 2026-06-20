@@ -1,17 +1,13 @@
-"""Serve Whisper STT through alloy: load a Whisper GGUF, compile BOTH the encoder
-and the decoder through the alloy backend (Metal), and drive HF generate() for
-transcription/translation.
+"""Serve Whisper STT through alloy: load a Whisper GGUF, compile both the encoder
+and the decoder through the alloy backend (Metal).
 
-Both halves run on alloy's compiled backend at the model's native precision (the
-q8_0 GGUF dequantizes to f32 — whisper-tiny is an f32 model; we do not force f16).
+Both halves run at the model's native precision (the q8_0 GGUF dequantizes to f32).
 The decoder self-attention routes through alloy's `attention_cache` op against an
-`AlloyStaticCache` (a single in-graph `cumulative_length.add_` advances the position,
-the GreedyNextToken pattern); cross-attention recomputes K/V from the fixed encoder
-output each step. HF generate() owns the seq2seq algorithm (long-form seeking,
-timestamps, temperature fallback).
+`AlloyStaticCache` (a single in-graph `cumulative_length.add_` advances the
+position); cross-attention recomputes K/V from the fixed encoder output each step.
 
 Tokenizer / feature extractor / generation config are NOT in the GGUF and load from
-the canonical openai/whisper-* tokenizer (local cache only, never download).
+the canonical openai/whisper-* tokenizer (local cache only).
 """
 
 from __future__ import annotations
@@ -59,8 +55,7 @@ class EncoderForward(torch.nn.Module):
 
 class GenerateEncoder(torch.nn.Module):
     """Drop-in for model.model.encoder inside generate(): runs the alloy-compiled
-    encoder and returns a BaseModelOutput, casting to the model dtype (alloy returns
-    f32). Holds the compiled module (not a self-reference), so no recursion."""
+    encoder and returns a BaseModelOutput, casting to the model dtype (alloy returns f32)."""
 
     main_input_name = "input_features"
 
@@ -80,9 +75,9 @@ class GenerateEncoder(torch.nn.Module):
 
 def alloy_whisper_attention(self, hidden_states, key_value_states=None, past_key_values=None,
                             attention_mask=None, output_attentions=False, **kwargs):
-    """Patched WhisperAttention.forward for the compiled decoder. Decoder SELF-attention
+    """Patched WhisperAttention.forward for the compiled decoder. Decoder self-attention
     routes through alloy's `attention_cache` op (upstream SDPA can't trace the int causal
-    mask); CROSS-attention recomputes K/V from the fixed encoder output and runs full
+    mask); cross-attention recomputes K/V from the fixed encoder output and runs full
     (non-causal) attention. q is unscaled; self.scaling is passed to the op/interface."""
     is_cross = key_value_states is not None
     input_shape = hidden_states.shape[:-1]
@@ -103,9 +98,9 @@ def alloy_whisper_attention(self, hidden_states, key_value_states=None, past_key
     elif past_key_values is not None:
         cache = past_key_values
 
-    # Decoder self-attention against an alloy static cache → the alloy op (the aliased
+    # Decoder self-attention against an alloy static cache → the alloy op. The aliased
     # cumulative_length tensor is the write-start position; the wrapper advances it once
-    # per step, alloy_cache_attention takes [:1]).
+    # per step.
     if not is_cross and cache is not None and use_alloy_cache_op(cache.layers[self.layer_idx]):
         layer = cache.layers[self.layer_idx]
         k = self.k_proj(hidden_states).view(kv_shape).transpose(1, 2).contiguous()
@@ -128,10 +123,10 @@ def alloy_whisper_attention(self, hidden_states, key_value_states=None, past_key
 
 def cached_suppress_call(self, input_ids, scores):
     """Drop-in for SuppressTokensLogitsProcessor.__call__ that caches the suppress mask.
-    HF rebuilds `torch.isin(arange(vocab), suppress_tokens)` — a CONSTANT — every decode
-    step (~1.2 ms/token on whisper-tiny's 51865 vocab, the single biggest per-token cost).
-    The mask depends only on (vocab_size, device), so cache it; the per-step cost drops to
-    a vectorized `where` (~0.04 ms). Bit-identical output."""
+    HF rebuilds `torch.isin(arange(vocab), suppress_tokens)` — a constant — every decode
+    step (~1.2 ms/token on whisper-tiny's 51865 vocab, the biggest per-token cost). The
+    mask depends only on (vocab_size, device), so cache it; the per-step cost drops to a
+    vectorized `where` (~0.04 ms)."""
     mask = self.__dict__.get("alloy_suppress_mask")
     if mask is None or mask.shape[-1] != scores.shape[-1] or mask.device != scores.device:
         vocab = torch.arange(scores.shape[-1], device=scores.device)
@@ -143,7 +138,7 @@ def cached_suppress_call(self, input_ids, scores):
 def install_fast_logits_processors() -> None:
     """Patch SuppressTokensLogitsProcessor to cache its constant mask (see
     cached_suppress_call). Idempotent; whisper's generate builds these processors
-    internally, so patching the class is the least-surface fix."""
+    internally, so patching the class is the only hook."""
     if SuppressTokensLogitsProcessor.__call__ is not cached_suppress_call:
         SuppressTokensLogitsProcessor.__call__ = cached_suppress_call
 
@@ -151,14 +146,13 @@ def install_fast_logits_processors() -> None:
 class WhisperNextToken(torch.nn.Module):
     """One whisper decode step, entirely on GPU: decoder → proj_out → + suppress mask →
     sample_categorical. Returns (token (1,1) i64, logits) — the token never leaves the
-    GPU, so the chunked decode plan can feed it back GPU-side and amortize the per-step
-    command-buffer commit/wait across a chunk (the LLM GreedyNextToken pattern).
+    GPU, so the chunked decode plan feeds it back GPU-side and amortizes the per-step
+    command-buffer commit/wait across a chunk.
 
-    Calls the decoder's RAW class forward (`type(decoder).forward`) to bypass the
-    instance's compiled_decode wrapper (used by the HF-generate path) while keeping the
-    instance-level alloy attention patches; advances the shared cumulative_length here as
-    an AOT input-mutation (folded into the chunk's GPU feedback). `suppress_mask` is an
-    additive (1,1,V) constant (0 / -inf) — bit-exact to HF's where(mask, -inf, scores)."""
+    Calls the decoder's raw class forward (`type(decoder).forward`) to bypass the
+    instance's compiled_decode wrapper while keeping the instance-level alloy attention
+    patches; advances the shared cumulative_length here as an AOT input-mutation.
+    `suppress_mask` is an additive (1,1,V) constant (0 / -inf)."""
 
     def __init__(self, decoder: torch.nn.Module, proj_out: torch.nn.Module) -> None:
         super().__init__()
@@ -183,7 +177,7 @@ class WhisperNextTokenTimestamped(torch.nn.Module):
     pairing/non-decreasing rules ride on three (1,) buffers carried as in-graph mutations
     — penult_in (the token before last), last_ts_in (the most recent timestamp value, or
     TB-1 if none), num_dec_in (count of decoded tokens) — which PlanStore.decode_chunk
-    propagates GPU-side between chunk iterations. Bit-exact to HF (validated)."""
+    propagates GPU-side between chunk iterations."""
 
     def __init__(self, decoder, proj_out, vocab_size: int, timestamp_begin: int, eos: int) -> None:
         super().__init__()
@@ -228,9 +222,7 @@ class WhisperChunkedDecoder:
     per-step command-buffer commit/wait across a chunk of decode steps via
     PlanStore.decode_chunk (GPU-side token feedback, zero Python per token inside a
     chunk) — ~1.08 ms/token vs ~3.5 with HF's per-token loop. The cumulative_length.add_
-    folds into the GPU feedback; enc_hidden + the suppress mask ride as stable inputs.
-    Timestamps and sampling stay on the per-token path (the timestamp processor is
-    stateful per-token; baking it on-GPU is the remaining M8 work)."""
+    folds into the GPU feedback; enc_hidden + the suppress mask ride as stable inputs."""
 
     def __init__(self, model, dtype: torch.dtype, chunks: tuple[int, ...] = (8,)) -> None:
         cfg = model.config
@@ -245,7 +237,7 @@ class WhisperChunkedDecoder:
         self.plans = PlanStore(hidden_size=cfg.d_model, grid_shrink=False)
         self.enc = torch.zeros(1, cfg.max_source_positions, cfg.d_model, dtype=dtype)
         torch._dynamo.mark_static_address(self.enc)
-        # additive suppress masks (0 / -inf) — bit-exact to HF's where(mask, -inf, scores).
+        # additive suppress masks (0 / -inf).
         # begin = suppress ∪ begin_suppress, applied only to the first decoded token.
         base = torch.zeros(1, 1, cfg.vocab_size)
         base[0, 0, list(gc.suppress_tokens)] = float("-inf")
@@ -319,11 +311,11 @@ class WhisperChunkedDecoder:
 
 
 class WhisperTimestampDecoder:
-    """Alloy-owned chunked decode for the TIMESTAMP path — WhisperNextTokenTimestamped
+    """Alloy-owned chunked decode for the timestamp path — WhisperNextTokenTimestamped
     (the on-GPU timestamp processor) + three state buffers (penult, last_ts, num_dec)
     carried through PlanStore.decode_chunk's GPU feedback. Same ~1.08 ms/token as the
-    no-timestamp path; bit-exact to HF generate(return_timestamps=True). The first token
-    forces an initial timestamp (the max_initial_timestamp rule, computed once on CPU)."""
+    no-timestamp path. The first token forces an initial timestamp (the
+    max_initial_timestamp rule, computed once on CPU)."""
 
     def __init__(self, model, dtype: torch.dtype, chunks: tuple[int, ...] = (8,)) -> None:
         cfg = model.config
@@ -360,8 +352,8 @@ class WhisperTimestampDecoder:
         prefix prefill's last-position logits."""
         self.enc.copy_(enc_hidden)
         plans, tb = self.plans, self.tb
-        # first token: force an initial timestamp in [tb, tb+max_initial] (bit-exact to
-        # HF's first-token processors — text is fully suppressed there too).
+        # first token: force an initial timestamp in [tb, tb+max_initial] (text is fully
+        # suppressed there too, matching HF's first-token processors).
         first_scores = prefill_logits[0, -1].clone()
         first_scores[:tb] = float("-inf")
         if self.max_initial is not None:
@@ -440,10 +432,10 @@ def install_whisper_decoder_compat(model, dtype: torch.dtype):
 
 
 class WhisperTranscriber:
-    """Loads a Whisper GGUF, compiles BOTH halves (encoder + decoder) on alloy at the
+    """Loads a Whisper GGUF, compiles both halves (encoder + decoder) on alloy at the
     model's native precision, eager-compiles every production plan at construction (no
-    first-request tax), and transcribes audio. Holds ONE persistent KV cache reused
-    across requests (the LLM ContiguousKV model) so the pinned plans never re-bind."""
+    first-request tax), and transcribes audio. Holds one persistent KV cache reused
+    across requests so the pinned plans never re-bind."""
 
     def __init__(self, gguf_path: str, tokenizer_ref: str = CANONICAL_TOKENIZER,
                  dtype: torch.dtype = torch.float32) -> None:
@@ -477,11 +469,10 @@ class WhisperTranscriber:
         decoder.forward = torch.compile(compiled_decode, backend="alloy", dynamic=False)
         self.model = model
 
-        # ONE persistent KV cache, reused across every request and reset between them
-        # (the LLM ContiguousKV model). Its buffers are eager-allocated + mark_static_
-        # address'd, so the pinned decoder plan binds them once — a fresh cache per
-        # request would change the static addresses and force a Dynamo recompile every
-        # call. eager_compile_all then compiles every production plan against it.
+        # One persistent KV cache, reused across every request and reset between them.
+        # Its buffers are eager-allocated + mark_static_address'd, so the pinned decoder
+        # plan binds them once — a fresh cache per request would change the static
+        # addresses and force a Dynamo recompile every call.
         self.kv = self.build_cache()
         self.chunked: WhisperChunkedDecoder | None = None  # alloy-owned chunked decode (lazy)
         self.ts_decoder: WhisperTimestampDecoder | None = None  # alloy-owned timestamp decode (lazy)
@@ -506,15 +497,10 @@ class WhisperTranscriber:
         self.kv.is_updated.clear()
 
     def eager_compile_all(self) -> None:
-        """Compile every plan the production path dispatches — encoder + each decoder
-        graph specialization (language probe, forced-prefix prefill, per-step decode) —
-        before the first request, so no production call ever pays torch.compile cost
-        inline (the LLM eager_compile contract).
-
-        Warms the exact alloy-owned forwards a request dispatches (no HF generate): the
-        encoder, language-detect ([SOT] M=1), forced-prefix prefill (M=3/M=4), and both
-        chunked decode paths (timestamped + plain) — module compile + replay capture +
-        chunk-plan registration — on a silent 30s frame under `no_grad`."""
+        """Compile every plan the production path dispatches before the first request:
+        the encoder, language-detect ([SOT] M=1), forced-prefix prefill (M=3/M=4), and
+        both chunked decode paths (timestamped + plain) — module compile + replay capture
+        + chunk-plan registration — on a silent 30s frame under `no_grad`."""
         self.reset_kv()
         feats = self.mel(torch.zeros(SAMPLE_RATE * 30, dtype=torch.float32))
         enc = self.encode(feats)
@@ -550,8 +536,8 @@ class WhisperTranscriber:
 
     def transcribe_text_fast(self, waveform, language: str | None, task: str) -> tuple[str, str]:
         """No-timestamp chunked decode of one ≤30s window → (text, language). Detects the
-        language (one [SOT] forward) when None. ~mlx-parity decode (~1.08 ms/token); the
-        model emits no timestamp tokens, so fewer tokens than the timestamped path."""
+        language (one [SOT] forward) when None. ~1.08 ms/token; the model emits no
+        timestamp tokens, so fewer tokens than the timestamped path."""
         chunked = self.ensure_chunked()
         enc = self.encode(self.mel(waveform))
         if language is None:
@@ -587,7 +573,7 @@ class WhisperTranscriber:
 
     def detect_language_from_enc(self, enc: torch.Tensor) -> str:
         """Whisper language detection: one [SOT] forward, argmax over the language token
-        ids only. Alloy-owned (no HF generate)."""
+        ids only."""
         lang_to_id = self.model.generation_config.to_dict().get("lang_to_id") or {}
         sot = self.processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
         self.reset_kv()
@@ -603,7 +589,7 @@ class WhisperTranscriber:
 
     def extract_segments(self, tokens: list[int], time_offset: float, final: bool
                          ) -> list[tuple[float, float, list[int]]]:
-        """Whisper consecutive-timestamp-pair segmentation (bit-exact to HF). Returns
+        """Whisper consecutive-timestamp-pair segmentation. Returns
         (start, end, content_tokens) per segment; timestamps decode at 0.02 s. `final`
         (the decode hit EOS / last window) also emits the trailing segment after the last
         consecutive boundary — which has no closing consecutive pair, just <…|tn|> EOS."""

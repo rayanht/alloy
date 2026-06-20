@@ -60,8 +60,7 @@ def register_training_mode_hooks(
     reader: Callable[[], bool], writer: Callable[[bool], None]
 ) -> None:
     """Called by alloy_torch.mode at import. Adopts any mode set before
-    alloy_torch loaded, so the two flags stay in lockstep like they did
-    when this module imported alloy_torch eagerly."""
+    alloy_torch loaded, so the two flags stay in lockstep."""
     global _training_mode_reader, _training_mode_writer
     _training_mode_reader = reader
     _training_mode_writer = writer
@@ -109,12 +108,12 @@ class CapturedKernel:
     # Explicit launch grid, when the dispatch used `kernel[grid](...)` (e.g.
     # split-K attention's SPLITS axis can't be derived from inputs). None means
     # the kernel derives its own grid. Captured so `dispatch_captured` can replay
-    # grid-requiring kernels faithfully.
+    # grid-requiring kernels.
     grid: tuple[int, ...] | None = None
-    # FULL ordered buffer list (inputs AND outputs) as actually dispatched —
-    # `buffer_args` above is filtered to inputs for the tuner's snapshot path, but
-    # a faithful replay (`dispatch_captured`) must pass every positional buffer,
-    # including pre-allocated outputs the kernel writes (e.g. split-K's pO/pL).
+    # Full ordered buffer list (inputs and outputs) as dispatched — `buffer_args`
+    # above is filtered to inputs for the snapshot path, but a replay
+    # (`dispatch_captured`) must pass every positional buffer, including
+    # pre-allocated outputs the kernel writes (e.g. split-K's pO/pL).
     replay_buffer_args: list[tuple[str, Any]] = field(default_factory=list)
 
 
@@ -124,14 +123,13 @@ def _extract_shapes(
     """Compile model, run one forward (+ optional backward) pass, collect kernel dispatch info.
 
     `record_only` runs the extraction forward without executing the GPU or
-    allocating real intermediate storage (phantom buffers) — shapes are captured
-    from the handler-path resolve regardless. Use for LARGE-M forwards (one-shot
+    allocating real intermediate storage (phantom buffers); shapes are captured
+    from the handler-path resolve regardless. Use for large-M forwards (one-shot
     prefill at M_MAX) that would otherwise hold O(M_MAX × layers) of activations
     and OOM. The per-kernel benchmark afterward synthesizes its own bounded test
-    buffers, so it needs only the shapes (+ small real-INPUT snapshots, which stay
-    real in record-only). At large M the big activations exceed the 16M-element
-    snapshot cap anyway (synthesized random either way), so nothing is lost; at
-    small M leave it off so realistic Q/K/V/Mask snapshots are captured."""
+    buffers, so it needs only the shapes (+ small real-input snapshots, which
+    stay real in record-only). At small M leave it off so realistic Q/K/V/Mask
+    snapshots are captured."""
     collected: list[CapturedKernel] = []
     seen: set[tuple[str, tuple]] = set()
 
@@ -264,7 +262,7 @@ def _extract_shapes(
             with torch.inference_mode():
                 # record_only: phantom intermediates + no GPU dispatch, so a
                 # large-M forward records every kernel's shape without holding all
-                # activations (the OOM otherwise). Reset before benchmarking, which
+                # activations (OOM otherwise). Reset before benchmarking, which
                 # must run real dispatches to time configs.
                 set_record_only(record_only)
                 try:
@@ -277,10 +275,6 @@ def _extract_shapes(
         if training:
             _set_training_mode(_prev_training)
 
-    # Snapshots were captured inline above (at dispatch time) — they hold
-    # the live data the kernel actually saw. Reading after the forward can
-    # hit freed/recycled buffers and produce NaN, which disables the tuner's
-    # correctness comparison (NaN != NaN at every threshold).
     return collected
 
 
@@ -323,8 +317,7 @@ def dispatch_captured(captured: CapturedKernel) -> tuple:
     """
     kwargs = dict(captured.kwargs)
     # Replay every positional buffer the dispatch used (inputs + pre-allocated
-    # outputs), in order — falling back to the input-only list for records
-    # captured before replay_buffer_args existed.
+    # outputs), in order.
     buf_args = captured.replay_buffer_args or captured.buffer_args
     if any(isinstance(a, AlloyBuffer) and is_phantom_buffer(a) for _, a in buf_args):
         buf_args = [
@@ -362,11 +355,11 @@ def _snapshot_small_buffers(input_bufs: list[tuple[str, Any]]) -> dict[str, np.n
     Cap at 16 M elements (~64 MB at f32) so we capture Q/K/V/Mask for all
     reasonable shapes while skipping embedding/lm_head weights.
 
-    `arg.numpy` doesn't gpu-sync (observation 10164), so for lazy buffers
-    (intermediate activations like Q/K/V projections) it can return the
-    pre-materialization underlying storage — zeros for freshly-allocated
-    intermediates. Force materialization via `materialize_many` and sync,
-    so the snapshot reflects what the kernel actually saw.
+    `arg.numpy` doesn't gpu-sync, so for lazy buffers (intermediate activations
+    like Q/K/V projections) it can return the pre-materialization underlying
+    storage — zeros for freshly-allocated intermediates. Force materialization
+    via `materialize_many` and sync, so the snapshot reflects what the kernel
+    actually saw.
     """
     # Skip record-only phantoms: their fake ptr can't be read (segfault, not a
     # catchable exception). In record-only extraction the kept snapshots are the
@@ -475,14 +468,12 @@ def _combine_splitk_partials(p_o: np.ndarray, p_lse: np.ndarray) -> np.ndarray:
     `out = Σ_s softmax_s(lse) · o_s`. Empty splits carry a huge-negative sentinel
     lse → ~0 weight, so they drop out automatically (no sentinel masking needed).
 
-    This is what the tuner must correctness-check, NOT the raw partials: which
+    This is what the tuner must correctness-check, not the raw partials: which
     split a boundary KV position lands in shifts with BLOCK_N, so each split's
     normalized `o_s` and `lse_s` are config-dependent intermediates — only this
     combined output (what `attention_combine_splits` feeds downstream) is
-    invariant. Verified against f32 truth: the combined output stays ~1e-5 from
-    ground truth even where a single split's partial_O differs by 5e-2 across
-    BLOCK_N (gemma4:e4b head_dim-512), so comparing raw partials falsely rejects
-    correct large-BLOCK_N configs.
+    invariant. Comparing raw partials falsely rejects correct large-BLOCK_N
+    configs.
     """
     m = p_lse.max(axis=0)
     w = np.exp(p_lse - m[None, ...])
@@ -604,11 +595,10 @@ def benchmark_config(
                 ref_arrays = ()
             if isinstance(out_bufs, tuple) and ref_arrays:
                 # Split-K attention emits (partial_O[S,BH,N,D], partial_lse[S,BH,N]).
-                # Validate the lse-weighted COMBINED output, not the raw per-split
+                # Validate the lse-weighted combined output, not the raw per-split
                 # partials (which legitimately shift across BLOCK_N — see
                 # `_combine_splitk_partials`). Comparing partials directly falsely
-                # rejected correct large-BLOCK_N configs (gemma4:e4b head_dim-512),
-                # pinning it to a ~7× slower BLOCK_N=8.
+                # rejects correct large-BLOCK_N configs.
                 go = np.asarray(out_bufs[0].numpy).astype(np.float32) if (out_bufs and isinstance(out_bufs[0], AlloyBuffer)) else None
                 is_splitk = (
                     len(out_bufs) == 2 and go is not None and go.ndim == 4
@@ -625,15 +615,11 @@ def benchmark_config(
                     cdiff = np.where(np.isfinite(g) & np.isfinite(r), np.abs(g - r), np.inf)
                     cmax = float(cdiff.max()) if cdiff.size else 0.0
                     cbad = float((cdiff > correctness_threshold).mean()) if cdiff.size else 0.0
-                    # Reject only WIDESPREAD disagreement. Split-K's f16 online softmax
+                    # Reject only widespread disagreement. Split-K's f16 online softmax
                     # and the borderline empty-split classification (a split covering a
                     # causally-marginal KV position flips empty↔non-empty on an fp-edge
-                    # call) are non-deterministic at a SPARSE set of elements — the SAME
-                    # config differs from itself run-to-run at ~0.5% of elements, and the
-                    # streamed-K path is bit-accurate on synthetic data (matches f32 to
-                    # 1e-4 at every scale/offset). Comparing raw per-split partials at
-                    # max-abs would falsely reject correct large-BLOCK_N configs: those
-                    # are config-dependent intermediates the combine reconciles. A
+                    # call) are non-deterministic at a sparse set of elements — the same
+                    # config differs from itself run-to-run at ~0.5% of elements. A
                     # genuinely wrong config diverges everywhere (or NaNs), not at 0.5%
                     # of elements.
                     if cbad > 0.02 or cmax > 0.25:
@@ -661,10 +647,9 @@ def benchmark_config(
                             # Which splits are "empty" is a borderline, tile-config-dependent fp
                             # call, so the raw lse flips between the sentinel and a tiny real value
                             # across configs even though partial_O agrees and those splits carry
-                            # negligible mass (the combine weights a sentinel lse to ~0). Mask
-                            # sentinel-magnitude entries so the check validates the real attention
-                            # values, not empty-split bookkeeping — otherwise every HEAD_DIM=256
-                            # config is wrongly rejected and only a slow fallback survives.
+                            # negligible mass. Mask sentinel-magnitude entries so the check
+                            # validates the real attention values, not empty-split bookkeeping —
+                            # otherwise every HEAD_DIM=256 config is wrongly rejected.
                             sentinel = (np.abs(o_arr) > 1e20) | (np.abs(r_arr) > 1e20)
                             diff = np.where(sentinel, 0.0, np.abs(o_arr - r_arr))
                             max_diff = float(diff.max()) if diff.size else 0.0
@@ -867,15 +852,13 @@ def tune_kernel(
 
     # Keep the tolerance tight for f32 compute (errors compound through many
     # downstream transformer layers), but use the f16 tolerance when the kernel's
-    # float *inputs* are f16 — the output then carries normal f16 rounding
-    # (~1e-3) that varies across tile configs and must not be flagged incorrect.
-    # The gate is "an f32 float INPUT", which excludes both 4-byte int index
-    # buffers (Q_START_POS / cache_position) and the f32 OUTPUT buffer (the
-    # f32-accumulated result — its dtype reflects the accumulator, not the MMA
-    # operand precision). Treating either as f32 compute forced the 0.0001
-    # threshold on f16-Q attention, rejecting every tile whose f16 rounding
-    # diverged from the reference (f16-Q at head_dim 256 produces ~2e-4 diffs)
-    # and leaving only a slow fallback config.
+    # float inputs are f16 — the output then carries normal f16 rounding (~1e-3)
+    # that varies across tile configs and must not be flagged incorrect. The gate
+    # is "an f32 float input", which excludes both 4-byte int index buffers
+    # (Q_START_POS / cache_position) and the f32 output buffer (its dtype reflects
+    # the accumulator, not the MMA operand precision). Treating either as f32
+    # compute rejects every f16-Q tile whose rounding diverges from the reference
+    # (f16-Q at head_dim 256 produces ~2e-4 diffs).
     threshold = 0.01
     _f32_trigger = None
     for pname, buf in input_arrays:
@@ -1161,14 +1144,11 @@ def tune(
 
         # Always synthesize fresh test buffers from the captured shapes.
         # The AlloyBuffers in ``cap.buffer_args`` are wrappers around storage
-        # that gets released when the torch tensors from the trace pass go
-        # out of scope (training mode skips ``__del__`` for those handles
-        # but Dynamo still drops the tensors). By the time we reach the
-        # later captured kernels, several of those buffer wrappers point at
-        # freed memory — every dispatch raises silently, ``benchmark_config``
-        # returns ``None``, and tuning prints "no valid config found" for
-        # the rest of the run. Synthesizing per-shape costs one alloc and
-        # is the only reliable path.
+        # that gets released when the torch tensors from the trace pass go out
+        # of scope (training mode skips ``__del__`` for those handles but Dynamo
+        # still drops the tensors), so by the later captured kernels several
+        # wrappers point at freed memory — every dispatch raises silently and
+        # tuning prints "no valid config found" for the rest of the run.
         # Pass cap.kwargs (the actual constexprs from the captured dispatch:
         # SEQ_LEN, HEAD_DIM, KV_GROUP, HIGH_PRECISION, all strides) so the kernel
         # measures the real workload, not a degenerate default-constexpr no-op.

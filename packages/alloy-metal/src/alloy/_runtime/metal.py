@@ -137,8 +137,8 @@ _ASYNC_COPY_PLACEHOLDER = "air_simdgroup_async_copy_2d_p3i8_p1i8"
 # pso_handle (int) → (msl_source, function_name). Lets the dispatch path
 # look up the MSL when only an integer handle is available (e.g. the
 # cached-fusion-dispatch hot path that bypasses CompiledKernel). Needed
-# to serialise compiled plans (L5) — every RecordedDispatch must carry
-# enough info to recompile on a different process.
+# to serialise compiled plans (L5): every RecordedDispatch must carry
+# enough info to recompile in a different process.
 _pso_source_registry: dict[int, tuple[str, str]] = {}
 
 
@@ -148,8 +148,7 @@ def _register_pso_source(handle: int, source: str, function_name: str) -> None:
 
 def pso_source(handle: int) -> tuple[str, str] | None:
     """Look up (msl_source, function_name) for a compiled pso_handle.
-    Returns None when the handle wasn't routed through CompiledKernel.from_msl
-    (rare — only the bare-int path in `_ext.compile_msl` would skip it)."""
+    Returns None when the handle wasn't routed through CompiledKernel.from_msl."""
     return _pso_source_registry.get(handle)
 _ASYNC_COPY_PATCHES = [
     (b"air_simdgroup_async_copy_2d_p3i8_p1i8", b"air.simdgroup_async_copy_2d.p3i8.p1i8"),
@@ -161,20 +160,18 @@ class CompiledKernel:
     def __init__(self, handle: int, function_name: str, msl_source: str = "") -> None:
         self._handle = handle
         self._function_name = function_name
-        # Kept for the L5 plan cache: serialise the MSL alongside the plan
-        # so a stale-process load can recompile to a fresh pso_handle via
-        # from_msl(). Empty when CompiledKernel was constructed from an
-        # already-cached pso_handle (no source available).
+        # For the L5 plan cache: serialise the MSL alongside the plan so a
+        # stale-process load can recompile to a fresh pso_handle via from_msl().
+        # Empty when constructed from an already-cached pso_handle.
         self._msl_source = msl_source
 
     @classmethod
     def from_msl(cls, device: MetalDevice, source: str, function_name: str) -> "CompiledKernel":
         # Route through AIR patching if MSL contains async copy placeholders.
-        # Compile failures here are NOT logged: this entry point is called
+        # Compile failures here are not logged: this entry point is called
         # speculatively by the fusion engine, which catches and falls back to
-        # per-op dispatch (logged as fusion_fallback). The exception still
-        # propagates with the full Metal diagnostic in its message; any caller
-        # that treats the failure as fatal will surface it via request_failed.
+        # per-op dispatch. The exception still propagates with the full Metal
+        # diagnostic in its message.
         if _ASYNC_COPY_PLACEHOLDER in source:
             kernel = cls._from_msl_patched(device, source, function_name)
             kernel._msl_source = source
@@ -337,7 +334,7 @@ class CompiledKernel:
             with open(ll_path, "w") as f:
                 f.write(ir)
 
-            # Text IR → AIR (lossless round-trip proven)
+            # Text IR → AIR
             result = subprocess.run(
                 ["xcrun", "metal-as", ll_path, "-o", patched_air],
                 capture_output=True,

@@ -1,11 +1,10 @@
 """Handler for `torch.ops.alloy.linear_attention_update` — Qwen 3.5
 GatedDeltaNet (linear-attention) layer core.
 
-Subsumes the entire layer body of the eager `Qwen3_5GatedDeltaNet.forward`
+Subsumes the layer body of the eager `Qwen3_5GatedDeltaNet.forward`
 (modeling_qwen3_5.py:424-543) so the conv- and recurrent-state cache writes
 stay inside the FX graph (the op schema declares them mutable; otherwise
-AOT autograd lifts the `.copy_()` and decode reads zero state → token-0
-spam).
+AOT autograd lifts the `.copy_()` and decode reads zero state).
 """
 
 from __future__ import annotations
@@ -49,13 +48,11 @@ def alias_dn_scratch(old_conv_ptr: int, new_conv_ptr: int,
                      old_rec_ptr: int, new_rec_ptr: int) -> None:
     """Re-key a layer's verify scratch from its old (conv, recurrent) storage
     pointers to its new ones. The pinned verify plan writes the conv tape /
-    GDR round-buffer tees to FIXED addresses (the buffers live at the
-    pointers it was recorded against); a multi-slice switch repoints the
+    GDR round-buffer tees to fixed addresses; a multi-slice switch repoints the
     cache storage, so the rollback's data_ptr-keyed lookups must alias to the
-    SAME buffers — re-allocating fresh ones would leave the readers on empty
-    memory while the plan keeps writing the originals (corrupts DeltaNet
-    state). Scratch is transient single-generation memory, so sharing it
-    across slices is correct."""
+    same buffers — re-allocating fresh ones would leave the readers on empty
+    memory while the plan keeps writing the originals. Scratch is transient
+    single-generation memory, so sharing it across slices is correct."""
     conv = _CONV_TAPE_BUFS.get(old_conv_ptr)
     if conv is not None:
         _CONV_TAPE_BUFS[new_conv_ptr] = conv
@@ -65,9 +62,8 @@ def alias_dn_scratch(old_conv_ptr: int, new_conv_ptr: int,
 
 
 def prealloc_conv_tape(conv_state_ptr: int, rows: int, conv_dim: int) -> None:
-    """Allocate a layer's tape bank OUTSIDE any plan recording (the DFlash
-    ctx-KV pattern) so the pinned verify's replayed writes keep landing in
-    this exact memory."""
+    """Allocate a layer's tape bank outside any plan recording so the pinned
+    verify's replayed writes keep landing in this exact memory."""
     entry = _CONV_TAPE_BUFS.get(conv_state_ptr)
     if entry is not None and entry[1] >= rows:
         return
@@ -97,26 +93,24 @@ def _tape_dummy() -> AlloyBuffer:
 
 
 # rec_state ptr → round-buffer entry for the verify GDR. The verify plan
-# tees k_l2 / g / beta / v IN-KERNEL into these stable untracked buffers
-# (`recurrent_gdr_dvblock_save` binds them directly — the conv-tape
-# contract; pooled intermediates may be physically recycled and separate
-# lazy copy ops never replay); the session's per-round
-# `gdr_state_reconstruct` dispatch re-runs the exact serial recurrence on
-# them to advance slot 0 by the committed token count. This replaces the
-# serial SAVE_STEPS slot bank fill for chunk-aligned verify widths:
-# materializing all S per-token states is pure state-write bandwidth
-# (S × 2MB fp32 ≈ 0.25ms/layer in-schedule at S=16 — the measured floor)
-# while only ONE is consumed.
+# tees k_l2 / g / beta / v in-kernel into these stable untracked buffers
+# (`recurrent_gdr_dvblock_save` binds them directly; pooled intermediates may
+# be physically recycled and separate lazy copy ops never replay). The
+# session's per-round `gdr_state_reconstruct` dispatch re-runs the serial
+# recurrence on them to advance slot 0 by the committed token count, for
+# chunk-aligned verify widths. Materializing all S per-token states is pure
+# state-write bandwidth (S × 2MB fp32 ≈ 0.25ms/layer at S=16) while only one
+# is consumed.
 _GDR_ROUND_BUFS: dict[int, dict] = {}
 
 
 def prealloc_gdr_round_bufs(
     rec_state_ptr: int, s: int, nv: int, dk: int, dv: int, nk: int, batch: int = 1
 ) -> None:
-    """Allocate a layer's verify round buffers outside plan recording (the
-    conv-tape contract). No-op when `s` isn't a whole number of chunks
-    (MTP/PLD's small widths stay on the serial SAVE_STEPS slot-bank path,
-    matching the dispatch gate in the handler)."""
+    """Allocate a layer's verify round buffers outside plan recording. No-op
+    when `s` isn't a whole number of chunks (MTP/PLD's small widths stay on the
+    serial SAVE_STEPS slot-bank path, matching the dispatch gate in the
+    handler)."""
     if s % _GDR_C != 0:
         return
     entry = _GDR_ROUND_BUFS.get(rec_state_ptr)
@@ -142,10 +136,10 @@ def gdr_round_bufs(rec_state_ptr: int) -> dict | None:
 
 def gdr_verify_uses_reconstruct(s: int, dv: int) -> bool:
     """True when a SAVE_STEPS verify at width `s` dispatches the
-    dvblock+reconstruct path — the recurrent slot bank then never
-    writes past slot 0, so attach_spec can size it to 1 slot (DFlash
-    block 16: 16 → 1 slot ≈ −400MB resident on qwen3.5:4b). MUST stay
-    the mirror of the handler's dispatch gate below."""
+    dvblock+reconstruct path — the recurrent slot bank then never writes past
+    slot 0, so attach_spec can size it to 1 slot (DFlash block 16: 16 → 1 slot
+    ≈ −400MB resident on qwen3.5:4b). Must mirror the handler's dispatch gate
+    below."""
     return s > 1 and s % _GDR_C == 0 and dv % _GDR_DVB == 0
 
 
@@ -206,11 +200,6 @@ def _linear_attention_update_handler(
          emits per-token output.
       8. Fused RMSNormGated with `z`.
       9. Reshape to (B, S, value_dim).
-
-    For Phase 1 we use the recurrent rule for both prefill and decode.
-    The chunked-prefill kernel is a follow-on optimization for longer
-    sequences (the recurrent loop over S is correct but unrolls
-    serially; chunked exploits per-chunk parallelism).
     """
     batch_size, seq_len, conv_dim = mixed_qkv.shape
     key_dim = num_k_heads * head_k_dim
@@ -220,22 +209,21 @@ def _linear_attention_update_handler(
         f"(2*{key_dim} + {value_dim})"
     )
 
-    # 1. Conv1d reads `mixed_qkv` in its native (B, S, C) layout directly — no
-    # transpose to (B, C, S). The conv kernels address (B,S,C) and emit (B,S,C),
-    # so the whole pipeline stays in (B,S,C), avoiding the (B,S,C)→(B,C,S) copy AND
-    # the (B,C,S)→(B,S,C) copy-back (one full-tensor strided copy per layer each
-    # way). Weight (C, 1, K) → (C, K).
+    # 1. Conv1d reads `mixed_qkv` in its native (B, S, C) layout directly. The
+    # conv kernels address (B,S,C) and emit (B,S,C), so the pipeline stays in
+    # (B,S,C), avoiding a full-tensor strided copy per layer each way.
+    # Weight (C, 1, K) → (C, K).
     w_squeezed = conv1d_w.reshape((conv_dim, conv_kernel_size))
     # conv_state is the cache buffer (Tensor(c!) — mutable input). The kernels
-    # use flat row-major addressing so we pass it as-is rather than via
-    # `.reshape(...)`: the reshape would create a fresh view slot the
-    # alloy backend treats as an intermediate, and the kernel writes would
-    # never propagate back to the original input slot's storage.
+    # use flat row-major addressing so pass it as-is rather than via
+    # `.reshape(...)`: the reshape would create a fresh view slot the alloy
+    # backend treats as an intermediate, and the kernel writes would never
+    # propagate back to the original input slot's storage.
     if has_previous_state and seq_len == 1:
         N_conv = batch_size * conv_dim
         qkv_post_conv = _alloc_scratch((N_conv,), float32)
-        # Decode: mixed_qkv (B,1,C) flattens to (B*C,) — the (B,C) layout the decode
-        # conv reads — with no transpose.
+        # Decode: mixed_qkv (B,1,C) flattens to (B*C,), the layout the decode
+        # conv reads.
         _CONV1D_DECODE[((N_conv + 255) // 256,)](
             mixed_qkv.reshape((N_conv,)),
             w_squeezed.reshape((conv_dim * conv_kernel_size,)),
@@ -270,10 +258,10 @@ def _linear_attention_update_handler(
             K=conv_kernel_size,
             SAVE_TAPE=save_tape,
         )
-        # Save conv_state from the last K REAL positions [real_len-K,
-        # real_len-1]. Pass qkv_post_conv as dep_in to force the planner
-        # to schedule this AFTER the conv kernel (otherwise topo-sort puts
-        # it first → conv's pre-context reads pick up real-position bytes).
+        # Save conv_state from the last K real positions [real_len-K,
+        # real_len-1]. Pass qkv_post_conv as dep_in to force the planner to
+        # schedule this after the conv kernel (otherwise topo-sort puts it
+        # first → conv's pre-context reads pick up real-position bytes).
         if real_len is not None and seq_len > 1:
             _CONV_STATE_REAL[((batch_size * conv_dim * conv_kernel_size + 255) // 256,)](
                 mixed_qkv.reshape((N_conv,)),
@@ -287,18 +275,18 @@ def _linear_attention_update_handler(
             )
         conv_out_shape = (batch_size, seq_len, conv_dim)
 
-    # 3. SiLU. Conv kernels emit the linear conv output; alloy's MSL
-    # emitter doesn't hoist post-loop scalar SiLU into outer scope
-    # correctly, so it's a separate elementwise pass. 2D grid (B*S, ceil(C/256))
-    # over the (B,S,C) conv output so the grid-shrink recipe shrinks it.
+    # 3. SiLU. Conv kernels emit the linear conv output; alloy's MSL emitter
+    # doesn't hoist post-loop scalar SiLU into outer scope correctly, so it's a
+    # separate elementwise pass. 2D grid (B*S, ceil(C/256)) over the (B,S,C)
+    # conv output so the grid-shrink recipe shrinks it.
     qkv_silu = _alloc_scratch((N_conv,), float32)
     pos_count = conv_out_shape[0] * conv_out_shape[1]
     _SILU[(pos_count, (conv_dim + 255) // 256)](qkv_post_conv, qkv_silu, C=conv_dim)
 
-    # 4. The conv already emits (B, S, C) — split q/k/v directly off dim 2 (the
-    # channel dim), no transpose. Each slice's `.contiguous()` extracts its
-    # contiguous (B*S, feat) sub-tensor; those are M-outer copies the grid-shrink
-    # recipe shrinks to the real prompt length.
+    # 4. The conv emits (B, S, C) — split q/k/v directly off dim 2 (the channel
+    # dim). Each slice's `.contiguous()` extracts its contiguous (B*S, feat)
+    # sub-tensor; those are M-outer copies the grid-shrink recipe shrinks to
+    # the real prompt length.
     qkv_bsc = qkv_silu.reshape(conv_out_shape)
     actual_s = conv_out_shape[1]
     q_flat = qkv_bsc.slice(2, 0, key_dim).contiguous().reshape((batch_size * actual_s, key_dim))
@@ -313,28 +301,24 @@ def _linear_attention_update_handler(
         .reshape((batch_size * actual_s, value_dim))
     )
 
-    # 5. L2-normalise q, k along head_dim. Buffers must be passed flat
-    # (1D) — the 2D-view reshape pattern produces zero output through
-    # this dispatch path.
+    # 5. L2-normalise q, k along head_dim. Buffers must be passed flat (1D) —
+    # the 2D-view reshape pattern produces zero output through this dispatch
+    # path.
     M_qk = batch_size * actual_s * num_k_heads
     N_qk = M_qk * head_k_dim
     q_l2 = _alloc_scratch((N_qk,), float32)
     k_l2 = _alloc_scratch((N_qk,), float32)
-    # 2D grid (B*S, num_k_heads): position on axis-0 so the grid-shrunk chunk prefill recipe
-    # shrinks the launch to the real prompt length (1D (M_qk,) buried M and stayed
-    # at the padded max). buffer row = pos*num_k_heads + head, computed in-kernel.
+    # 2D grid (B*S, num_k_heads): position on axis-0 so the grid-shrunk chunk
+    # prefill recipe shrinks the launch to the real prompt length (1D (M_qk,)
+    # buried M at the padded max). buffer row = pos*num_k_heads + head.
     bs = batch_size * actual_s
     _L2NORM[(bs, num_k_heads)](q_flat.reshape((N_qk,)), q_l2, N=head_k_dim, HEADS=num_k_heads)
     _L2NORM[(bs, num_k_heads)](k_flat.reshape((N_qk,)), k_l2, N=head_k_dim, HEADS=num_k_heads)
 
-    # GVA-style head repeat is handled INSIDE the recurrent kernel via
-    # the NK constexpr — keeping q/k at NK-headed size avoids an
-    # expand+contiguous on every layer, which would add new buffer
-    # operations to the plan and disrupt the alloy backend's slot
-    # tracking for the kernel's recurrent_state mutation (the smaller
-    # qwen3.5 sizes work precisely because they don't trigger this
-    # path; doing the repeat at the kernel level matches their
-    # plan structure exactly).
+    # GVA-style head repeat is handled inside the recurrent kernel via the NK
+    # constexpr — keeping q/k at NK-headed size avoids an expand+contiguous on
+    # every layer, which would add buffer operations to the plan and disrupt
+    # slot tracking for the kernel's recurrent_state mutation.
 
     # 6. Pre-scale q by 1/sqrt(DK) (lazy multiply).
     scale = 1.0 / (head_k_dim**0.5)
@@ -343,9 +327,8 @@ def _linear_attention_update_handler(
     # 7. Gate and beta.
     M_g = batch_size * actual_s * num_v_heads
     # Bypass the alloy `delta_net_gate_compute` kernel — it returns wrong g for
-    # S>1 (verified: collapsing the chain into it diverges at token 1). Compute
-    # g, beta via direct AlloyBuffer element-wise ops, which dispatch through
-    # kernels specialized per call shape.
+    # S>1 (collapsing the chain into it diverges at token 1). Compute g, beta
+    # via direct AlloyBuffer element-wise ops.
     # g = -exp(A_log) * softplus(a + dt_bias)
     # beta = sigmoid(b)
     # A_log, dt_bias are (num_v_heads,) — broadcast over (B, S, NV).
@@ -361,27 +344,26 @@ def _linear_attention_update_handler(
     g = g_3d.reshape((M_g,))
     beta = beta_3d.reshape((M_g,))
 
-    # 8. Recurrent delta rule. During padded prefill (real_len given,
-    # S > 1) the recurrence runs the full bucket length but must save
-    # `recurrent_state` after only the REAL tokens — otherwise the carried
-    # state is polluted by the padding tokens and the following decode step
-    # degenerates. Pass real_len + HAS_REAL_LEN so the kernel saves at the
-    # real boundary. Decode (S == 1) and exact-length prefill keep the
-    # unconditional post-loop save (real_len_t is then an unused placeholder).
+    # 8. Recurrent delta rule. During padded prefill (real_len given, S > 1)
+    # the recurrence runs the full bucket length but must save
+    # `recurrent_state` after only the real tokens — otherwise the carried
+    # state is polluted by padding tokens and the following decode degenerates.
+    # Pass real_len + HAS_REAL_LEN so the kernel saves at the real boundary.
+    # Decode (S == 1) and exact-length prefill keep the unconditional post-loop
+    # save (real_len_t is then an unused placeholder).
     has_real_len = real_len is not None and seq_len > 1
     real_len_arg = real_len.reshape((1,)) if has_real_len else g
     N_attn = batch_size * actual_s * num_v_heads * head_v_dim
     core_attn = _alloc_scratch((N_attn,), float32)
     # Prefill uses the 2-stage chunked delta rule when the length is a whole
-    # number of chunks. The spec verify does NOT — the chunked T-inverse's
-    # f32 deviation (~1e-2 on ill-conditioned repetitive rows) flips gate
-    # near-ties at ~6× the rate budget — it dispatches the DV-blocked SERIAL
-    # save kernel instead: op-for-op the serial kernel's numerics, with the
-    # k/q row loads (the serial kernel's dominant cost: one program per
-    # (head, dv) re-reads 1KB per step ≈ 96MB/dispatch at S=16) amortized
-    # across 8 columns per program. Decode (S == 1) and non-chunk-aligned
-    # verify widths (MTP/PLD at small m — kept on the proven slot-bank path;
-    # the dvblock kernel itself is S-agnostic) stay on the serial kernel.
+    # number of chunks. The spec verify does not — the chunked T-inverse's f32
+    # deviation (~1e-2 on ill-conditioned repetitive rows) flips gate near-ties
+    # at ~6× the rate budget — it dispatches the DV-blocked serial save kernel
+    # instead: op-for-op the serial kernel's numerics, with the k/q row loads
+    # (one program per (head, dv) re-reads 1KB per step ≈ 96MB/dispatch at
+    # S=16) amortized across 8 columns per program. Decode (S == 1) and
+    # non-chunk-aligned verify widths (MTP/PLD at small m) stay on the serial
+    # kernel.
     use_chunked = (
         actual_s > 1
         and actual_s % _GDR_C == 0
@@ -389,13 +371,12 @@ def _linear_attention_update_handler(
     )
     if use_chunked and compile_window.spec_save_steps:
         # Spec verify: leaves recurrent_state untouched (slot 0 stays the
-        # PRE-round live state) and tees k_l2/g/beta/v IN-KERNEL into the
-        # layer's stable registry buffers — bound directly, the conv-tape
-        # contract. Separate lazy copy ops do NOT work here: extern-root
-        # copies materialize outside the captured verify plan and never
-        # replay (measured: registry frozen at pin-time bytes; spec output
-        # cycling). The session's per-round gdr_state_reconstruct dispatch
-        # advances slot 0 by the committed count.
+        # pre-round live state) and tees k_l2/g/beta/v in-kernel into the
+        # layer's stable registry buffers, bound directly. Separate lazy copy
+        # ops do not work here: extern-root copies materialize outside the
+        # captured verify plan and never replay. The session's per-round
+        # gdr_state_reconstruct dispatch advances slot 0 by the committed
+        # count.
         prealloc_gdr_round_bufs(
             recurrent_state.base_ptr, actual_s,
             num_v_heads, head_k_dim, head_v_dim, num_k_heads, batch_size,

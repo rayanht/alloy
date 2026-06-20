@@ -5,8 +5,7 @@ their forward through the `alloy.gguf_q*_mm` / `gguf_q*_embedding` Metal kernels
 All four formats share two table-driven bases (`GGUFQuantLinear` /
 `GGUFQuantEmbedding`): a `QuantFormat` declares the format's buffers (name, dtype,
 column count) + kernel ops, and the eight public class names are thin subclasses
-that pin one `FORMAT`. The names are kept (not collapsed) so `isinstance` checks,
-`mtp.py`, and embedding-tying stay unchanged.
+that pin one `FORMAT`.
 
 The `replace_*` helpers swap an HF `Linear`/`Embedding` for the matching quantized
 module at load time; `tie_quantized_output_embeddings` mirrors the input embedding
@@ -361,8 +360,8 @@ def replace_embedding_with_quantized(
     if not isinstance(child, torch.nn.Embedding):
         raise TypeError(f"Expected Embedding at {module_path}, got {type(child).__name__}")
     # Gemma3's input embedding multiplies the lookup by sqrt(hidden_size) via
-    # `Gemma3TextScaledWordEmbedding.scalar_embed_scale`. Preserve it so the
-    # quantized replacement keeps the model arithmetically faithful.
+    # `Gemma3TextScaledWordEmbedding.scalar_embed_scale`. Preserve it on the
+    # quantized replacement.
     embed_scale = float(child.scalar_embed_scale) if hasattr(child, "scalar_embed_scale") else 1.0
 
     if quantization == "q4_k":
@@ -437,10 +436,8 @@ def split_q5_0_weight(
                                 of the byte).
       scales [N, K/32] fp16  — one fp16 scale per 32-element block.
 
-    Storage cost: 8.5 bits/elem (vs 5.5 bits/elem wire). The slack is
-    in qhigh's nibbles (only 1 of 4 bits per nibble is used). Worth
-    it for the simple kernel — bit-packing harder would mean a custom
-    vec4-shuffle primitive in the DSL.
+    Storage cost: 8.5 bits/elem (vs 5.5 bits/elem wire); the slack is in qhigh's
+    nibbles (1 of 4 bits used), trading it for a simpler kernel.
     """
     if weights.dtype != np.uint8:
         raise TypeError(f"Q5_0 weights must be uint8 bytes, got {weights.dtype}")

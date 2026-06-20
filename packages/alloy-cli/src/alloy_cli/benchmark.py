@@ -1,9 +1,8 @@
-"""Focused in-process benchmark for Alloy local LLM inference.
+"""In-process benchmark for Alloy local LLM inference.
 
-Skips the server + HTTP lifecycle entirely. Loads the model directly via
-`load_native_causal_lm`, builds an `AlloyGenerator`, runs
-`eager_compile_all` so no measurement eats compile cost, then drives the
-generator from Python.
+Loads the model directly via `load_native_causal_lm`, builds an
+`AlloyGenerator`, runs `eager_compile_all` so no measurement eats compile cost,
+then drives the generator from Python.
 
 Three workloads, selected via `--dataset`:
 
@@ -20,9 +19,6 @@ Three workloads, selected via `--dataset`:
   embeddings — an encoder model (e.g. nomic-embed-text) through the in-process
     alloy `EmbeddingModel.embed`: tok/s per batch/seq regime, median over
     `--reps`.
-
-Driven by `alloy bench` (see `alloy bench --help`); `main(argv)` is the
-argparse entrypoint that the typer command delegates to.
 """
 
 from __future__ import annotations
@@ -63,9 +59,8 @@ class DepthPoint:
 
 
 def _synthetic_token_ids(vocab_size: int, n_tokens: int, *, seed: int) -> torch.Tensor:
-    """Reproducible token ids drawn from a safe mid-range slice of the
-    vocab so we steer clear of special tokens (<256) and reserved upper
-    ids."""
+    """Reproducible token ids from a mid-range vocab slice, avoiding special
+    tokens (<256) and reserved upper ids."""
     gen = torch.Generator().manual_seed(seed)
     return torch.randint(1024, max(1025, vocab_size - 256), (1, n_tokens), generator=gen, dtype=torch.long)
 
@@ -89,17 +84,15 @@ def run_depths_alloy(
 ) -> list[DepthPoint]:
     """Alloy depth sweep on the native cache. Per depth: prefill `depth`
     synthetic tokens (pp) then decode `gen_tokens` (tg), median throughput over
-    `reps` (one warmup rep discarded). Synthetic tokens are content-independent
-    for throughput at temperature 0 (verified: prose vs random within ~1%).
-    `ignore_eos` forces the full `gen_tokens` decode so a random prompt that
-    trips an early EOS can't shorten — and corrupt — the tg measurement."""
+    `reps` (one warmup rep discarded). `ignore_eos` forces the full `gen_tokens`
+    decode so an early EOS can't shorten — and corrupt — the tg measurement."""
     out: list[DepthPoint] = []
     for d in depths:
         pp: list[float] = []
         tg: list[float] = []
         for rep in range(reps + 1):
             # Fresh tokens per rep so the prefix cache can't hit across reps
-            # (a hit would zero out the prefill and explode pp).
+            # (a hit would zero the prefill and explode pp).
             ids = _synthetic_token_ids(vocab_size, d, seed=(0xD000 ^ d) + rep)
             alloy_gen.reset_prefix_state()
             for _ in alloy_gen.run(Sequence(
@@ -147,13 +140,11 @@ def run_llama_bench_alloy(
 # Multimodal (vision) workload — image + prompt
 # ---------------------------------------------------------------------------
 #
-# The depth sweep above measures token-only generation. A vision request has
-# one extra phase the user waits on: the image is run through the vision tower
-# (alloy's ViT → pooler → projector) BEFORE any text token is prefilled. So the
-# primary metric here is TTFT measured as wall-clock from the request to the first
-# decoded token — which INCLUDES the vision encode. Every rep runs cold (no warm
-# prefix) so it pays the full vision + prefill cost. Alloy's vision-encode time
-# is also reported on its own as a diagnostic (the slice the offline tuner moves).
+# A vision request runs the image through the vision tower (ViT → pooler →
+# projector) BEFORE any text token is prefilled. The primary metric is TTFT —
+# wall-clock from request to first decoded token, which INCLUDES the vision
+# encode. Every rep runs cold (no warm prefix) so it pays the full vision +
+# prefill cost. Vision-encode time is also reported on its own.
 
 _DEFAULT_MM_PROMPT = "Describe this image in detail."
 
@@ -194,9 +185,7 @@ class MultimodalStats:
 
 
 def resolve_bench_image(path: Path) -> bytes:
-    """Read an image file for the multimodal workload. We deliberately do not
-    auto-download — the caller passes a real file (the release scorecard pins a
-    fixed asset so runs are comparable across machines)."""
+    """Read an image file for the multimodal workload."""
     if not path.is_file():
         raise FileNotFoundError(f"--image is not a file: {path}")
     return path.read_bytes()
@@ -280,8 +269,7 @@ def run_multimodal_alloy(
 # In-process alloy embedding (the same `EmbeddingModel.embed` the server calls):
 # tokenize + alloy-compiled encoder forward + mean-pool + L2 normalize. Per
 # regime (batch x target tokens), tok/s = total real tokens / encoder-forward
-# time, median over reps. Inputs slice a fixed built-in word list so the bench
-# is self-contained (no corpus server).
+# time, median over reps. Inputs slice a fixed built-in word list.
 
 
 @dataclass(slots=True)
@@ -511,10 +499,10 @@ def _bench_one_model(model_name: str, args: argparse.Namespace) -> ModelResult:
         took_ms=round((time.perf_counter() - t0) * 1000.0, 1),
     )
 
-    # Match the server's prefill policy (large-chunk grid-shrunk prefill) so the
-    # bench measures the same plans production dispatches. Hand the vision
-    # front-end (if any) to the generator only for the multimodal workload so
-    # eager_compile_all warms its plans without paying for them on a depth sweep.
+    # Match the server's prefill policy so the bench measures the same plans
+    # production dispatches. Hand the vision front-end to the generator only for
+    # the multimodal workload so eager_compile_all warms its plans without paying
+    # for them on a depth sweep.
     alloy_gen = AlloyGenerator.from_model(
         loaded.model.eval(),
         cache_dtype=torch.float16,

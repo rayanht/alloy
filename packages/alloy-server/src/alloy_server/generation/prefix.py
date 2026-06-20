@@ -82,19 +82,19 @@ class PrefixCache:
         # True when the chat template inserts assistant-turn markers the model
         # itself must emit during generation (e.g. Qwen3's auto
         # `<think>\n\n</think>\n\n`); decode tokens then don't round-trip
-        # through the next turn's re-render, so the LCP harmlessly stops at
-        # the prompt boundary.
+        # through the next turn's re-render, so the LCP stops at the prompt
+        # boundary.
         self.auto_injects = auto_injects
         # Warm-prefill state: (cache_len, full_token_ids, cache). On the next
         # request, the longest byte-for-byte prefix match against
         # `full_token_ids` is reused from the cache and only the suffix is
-        # prefilled. Single slot — serving is single-user.
+        # prefilled. Single slot.
         self.state: tuple[int, list[int], StaticCache] | None = None
         # Multi-slice conversation table (paged mode): LRU-ordered resumable
         # conversations, each with its own KV slice. `bound` is the entry the
         # cache object's storages currently point at; `state`/`bookmarks`
-        # mirror it so all the single-slot logic below operates unchanged on
-        # whichever conversation is bound.
+        # mirror it so the single-slot logic below operates on whichever
+        # conversation is bound.
         self.conversations: list[Conversation] = []
         self.bound: Conversation | None = None
         # Pre-warmed spare slices (paged): allocated + dispatch-wired at startup
@@ -137,10 +137,9 @@ class PrefixCache:
         reusing a decode plan whose pinned dispatch shape no longer matches
         the new request (the pin is shape-specific).
 
-        Multi-slice mode keeps the conversation table: "not a continuation
-        of the LAST conversation" is exactly the case the table exists for —
-        the next request matches whichever conversation it actually extends
-        (exact token LCP, same coincidence risk as the single slot)."""
+        Multi-slice mode keeps the conversation table: "not a continuation of
+        the LAST conversation" is the case the table exists for — the next
+        request matches whichever conversation it actually extends."""
         self.state = None
         self.plans.clear_decode_state()
 
@@ -172,17 +171,15 @@ class PrefixCache:
         prev_cache = state[2]
         prev_len = len(prev_tokens)
 
-        # Cold-but-cache-reuse path. Same-shape cache we already own —
-        # reset cumulative_length and hand it back to prefill. Avoids the
-        # buf_alloc + memmove pass through the alloy backend's input-slot
-        # conversion of the full K/V storage on every cache-miss request.
-        # Prefill overwrites positions [0..bucket) before decode reads
-        # them, so stale K/V doesn't leak.
+        # Cold-but-cache-reuse path. Reset cumulative_length on the same-shape
+        # cache we already own and hand it back to prefill, avoiding the
+        # buf_alloc + memmove pass over the full K/V storage on every
+        # cache-miss request. Prefill overwrites [0..bucket) before decode
+        # reads it, so stale K/V doesn't leak.
         def reset_and_reuse() -> tuple[StaticCache, int]:
-            # Full cold reset, mirroring acquire(): linear-attention state is
-            # order-dependent and carries the ENTIRE history — not resetting it
-            # leaks the previous conversation's DeltaNet residue into the new
-            # prefill.
+            # Full cold reset, mirroring acquire(): linear-attention state
+            # carries the ENTIRE history — not resetting it leaks the previous
+            # conversation's DeltaNet residue into the new prefill.
             for layer in prev_cache.layers:
                 layer.cumulative_length.fill_(0)
                 if isinstance(layer, AlloyLinearAttentionLayer):
@@ -195,13 +192,11 @@ class PrefixCache:
         if prev_len < MIN_PREFIX:
             return reset_and_reuse()
         new_row = input_ids[0].tolist()
-        # Find the longest exact-match prefix between saved tokens and the
-        # new input. We then reuse the saved cache up to that point and
-        # prefill only the suffix. Capped at prompt_len - 1 so there's
-        # always at least one token for the suffix prefill to produce a
-        # next-token logit. If the LCP doesn't reach MIN_PREFIX, the
-        # bookkeeping isn't worth it and we fall back to cold — but still
-        # reuse the cache storage.
+        # Longest exact-match prefix between saved tokens and the new input;
+        # reuse the saved cache up to there and prefill only the suffix. Capped
+        # at prompt_len - 1 so the suffix prefill always has at least one token
+        # to produce a next-token logit. An LCP short of MIN_PREFIX falls back
+        # to cold (but still reuses the cache storage).
         max_check = min(prev_len, prompt_len - 1)
         lcp = 0
         while lcp < max_check and int(new_row[lcp]) == prev_tokens[lcp]:
@@ -294,12 +289,11 @@ class PrefixCache:
         cache: StaticCache,
         cache_len: int,
     ) -> tuple[StaticCache, int]:
-        """A request that DIVERGES from `src` before its end must never
-        resume in place — truncation hijacks src (the post-generation save()
-        rewrites its lineage and the prefill overwrites its tail rows), which
-        destroyed interleaved sessions' warmth in production. Fork instead:
-        copy the shared rows into a fresh conversation and resume there; src
-        stays intact and resumable.
+        """A request that DIVERGES from `src` before its end must never resume
+        in place — truncation hijacks src (the post-generation save() rewrites
+        its lineage and the prefill overwrites its tail rows), destroying
+        interleaved sessions' warmth. Fork instead: copy the shared rows into a
+        fresh conversation and resume there; src stays intact and resumable.
 
         Resume point: hybrids carry position-bound DeltaNet state that only
         exists at a saved end — a bookmark at or before the divergence sets
@@ -374,9 +368,9 @@ class PrefixCache:
         full VA on first encoder use (~14ms/GB), and a paged slice is
         native-context-VA — so a fresh conversation's first prefill otherwise
         eats that stall (~100ms on qwen3.5:4b). Dispatch-wiring (NOT
-        requestResidency) keeps it OFF phys_footprint, so the demand-paged
-        memory win is fully preserved. The construction storages are
-        conversation 0; create MAX_SLICES-1 spares."""
+        requestResidency) keeps it OFF phys_footprint, preserving the
+        demand-paged memory win. The construction storages are conversation 0;
+        create MAX_SLICES-1 spares."""
         if not self.kv.supports_slices():
             return
         for _ in range(MAX_SLICES - 1 - len(self.free_slices)):
@@ -457,13 +451,12 @@ class PrefixCache:
     ) -> int:
         """Copy a bookmark's position-bound state back into the live cache and
         return its resume position. Caller has already validated the rows.
-        Attribute names come from the same `vars(layer)` walk that saved them,
-        so the dict lookup resolves the identical live tensors. Slim entries
-        (prefix marks: spec slot 0 only) narrow-copy into the leading slots;
-        slots past the copy are stale, which is sound — spec verify writes
-        its slots before reading them. The restored state is primed, so the
-        linear layers' has_previous_state flips True (a fork binds a fresh
-        slice where it starts False)."""
+        Attribute names come from the same `vars(layer)` walk that saved them.
+        Slim entries (prefix marks: spec slot 0 only) narrow-copy into the
+        leading slots; slots past the copy are stale, which is sound — spec
+        verify writes its slots before reading them. The restored state is
+        primed, so the linear layers' has_previous_state flips True (a fork
+        binds a fresh slice where it starts False)."""
         _, tokens, layers = bookmark
         for layer, entry in zip(cache.layers, layers):
             live = vars(layer)
@@ -531,10 +524,8 @@ class PrefixCache:
         """
         if self.kv.supports_slices():
             # Multi-slice mode needs no snapshot: the side request opens (or
-            # LCP-matches) its own conversation slice via `match_paged`,
-            # and the main conversation's slice is simply rebound on its
-            # next turn. The policy gate upstream becomes moot — every side
-            # call is isolated for free.
+            # LCP-matches) its own conversation slice via `match_paged`, and
+            # the main conversation's slice is rebound on its next turn.
             yield
             return
         state = self.state

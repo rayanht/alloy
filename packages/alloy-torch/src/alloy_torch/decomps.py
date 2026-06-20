@@ -13,8 +13,8 @@ PRESERVED_OPS = {
     torch.ops.aten.gelu.default,
     torch.ops.aten._scaled_dot_product_flash_attention_for_cpu.default,
     # Keep select_backward intact so the handler dispatches a direct
-    # slice-scatter-into-zeros rather than the default eq/where/add chain,
-    # which mis-scatters on small head_dim SDPA backward paths.
+    # slice-scatter-into-zeros; the default eq/where/add chain mis-scatters
+    # on small head_dim SDPA backward paths.
     torch.ops.aten.select_backward.default,
 }
 
