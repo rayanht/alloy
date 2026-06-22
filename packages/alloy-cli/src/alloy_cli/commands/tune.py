@@ -343,6 +343,10 @@ def tune(
         set_taps_enabled(bool(drafter.taps.layer_ids))
         compile_window.q_start_pos = chunk
         try:
+            # record_only: extract shapes without holding the full verify-forward
+            # activations against the native cache; the per-kernel benchmark
+            # synthesizes its own buffers. q_start_pos re-injects the warm offset
+            # record_only drops from the live snapshot.
             alloy.tune(
                 verify,
                 {
@@ -350,6 +354,8 @@ def tune(
                     "past_key_values": spec_cache,
                     "cache_position": torch.arange(chunk, chunk + b, dtype=torch.int32),
                 },
+                record_only=True,
+                q_start_pos=chunk,
                 **only_kw, **out_kw,
             )
         finally:
@@ -359,9 +365,9 @@ def tune(
             compile_window.q_start_pos = 0
         console.print(f"  [green]done[/] spec verify (M={b}, {spec})")
         tune_targets = drafter.tune_targets() if spec == "dflash" else []
-        for spec_label, module, inputs in tune_targets:
+        for spec_label, module, inputs, rec_only in tune_targets:
             console.print(f"  [cyan]tuning[/] {spec_label} …")
-            alloy.tune(module, inputs, **only_kw, **out_kw)
+            alloy.tune(module, inputs, record_only=rec_only, **only_kw, **out_kw)
             console.print(f"  [green]done[/] {spec_label}")
 
     # Modality front-ends expose their tunable forwards via capture_targets().

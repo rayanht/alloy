@@ -1180,13 +1180,16 @@ def _attention_kv_update_multi_bidir_handler(
     k_cache: AlloyBuffer,
     v_cache: AlloyBuffer,
     scale: float = -1.0,
+    sliding_window: int = 0,
 ) -> AlloyBuffer:
-    """DFlash draft block attention. Fused KV write of
-    the block rows + attention where every row sees the whole block plus the
-    full context KV."""
+    """DFlash draft block attention. Fused KV write of the block rows +
+    attention where every row sees the whole block plus the context KV.
+    sliding_window > 0: the ctx cache is a circular ring of that size (the
+    draft's sliding cross-context layers), reads/writes map to pos %
+    sliding_window; 0 = full linear context (the draft's full-attention layer)."""
     return _attention_kv_update_multi_handler(
         q, new_k, new_v, cache_pos, k_cache, v_cache, scale,
-        sliding_window=0, bidir_block=True,
+        sliding_window=sliding_window, bidir_block=True,
     )
 
 
@@ -1196,13 +1199,16 @@ def _spec_kv_write_handler(
     cache_pos: AlloyBuffer,
     k_cache: AlloyBuffer,
     v_cache: AlloyBuffer,
+    sliding_window: int = 0,
 ) -> AlloyBuffer:
     """Write-only KV row store for the DFlash observe/fusion plan: M rows of
     (B, KV_H, M, D) k/v land in the (B, KV_H, S, D) caches at
     [cache_pos, cache_pos+M). Returns k unchanged to keep the dispatch live in
     the lazy collector. The cache writes are side effects nothing in-plan
     reads, so they must be registered as extern roots or the collector DCEs
-    the dispatch."""
+    the dispatch. sliding_window > 0: the cache is a circular ring of that
+    size, writes map to pos % sliding_window (M <= window, so every row hits a
+    distinct slot — the -1 bound writes all rows)."""
     # Register the ROOT buffers: the kernel writes roots, and materialize_many
     # on a view does not chase root writes.
     note_extern_kv_write(k_cache)
@@ -1225,7 +1231,7 @@ def _spec_kv_write_handler(
         _root_flat_buf(k),
         _root_flat_buf(v),
         pos_buf,
-        _no_bound_buf(),  # unused at SLIDING_WINDOW=0
+        _no_bound_buf(),  # -1 sentinel: write all rows (M <= window, no collision)
         k_cache,
         v_cache,
         HEADS_PER_BATCH=kv_heads,
@@ -1241,7 +1247,7 @@ def _spec_kv_write_handler(
         KC_SEQ_STRIDE=kc_strides[2],
         VC_HEAD_STRIDE=vc_strides[1],
         VC_SEQ_STRIDE=vc_strides[2],
-        SLIDING_WINDOW=0,
+        SLIDING_WINDOW=sliding_window,
     )
     return k
 

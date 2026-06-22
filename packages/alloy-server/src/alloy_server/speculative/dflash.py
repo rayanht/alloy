@@ -1,26 +1,28 @@
 """DFlash block-diffusion drafter; arXiv 2602.06036:
 
-The draft is a small qwen3-style transformer (z-lab checkpoint: 5 layers at
-the target's hidden size, full attention with q/k head-norms, full rope at its
-own theta) that predicts a whole block in ONE forward: input = [anchor,
-mask × (block-1)], attention is bidirectional within the block and full over
-the *context KV* — per-layer K/V projections of the fused target features
-(`hidden_norm(fc(cat(5 target-layer hiddens)))`), cached per committed
-position. Mask-slot j's output IS the token at its own position (diffusion
-convention), read through the target's shared lm_head.
+The draft is a small qwen3-style transformer (z-lab checkpoint: a few layers at
+the target's hidden size, q/k head-norms, full rope at its own theta) that
+predicts a whole block in ONE forward: input = [anchor, mask × (block-1)],
+attention is bidirectional within the block and attends the *context KV*
+through each layer's cross-context window — per-layer K/V projections of the
+fused target features (`hidden_norm(fc(cat(target-layer hiddens)))`), cached per
+committed position. Mask-slot j's output IS the token at its own position
+(diffusion convention), read through the target's shared lm_head.
 
 alloy mapping (everything position-aligned, dead rows by overwrite):
-- ctx KV cache: per draft layer, (1, KV_H, S_native, D) fp16 alloy buffers —
-  slot i == absolute position i. `observe()` appends feature K/V rows for ALL
-  forwarded rows; the committed pointer makes overshoot rows dead, and the
-  next round's append overwrites them.
-- propose plan: block embeds → 5 layers (attention via
-  `attention_kv_update_multi_bidir`: fused block-KV write at
-  [pos, pos+B) + every row attends [0, pos+B)) → final norm → shared lm_head
+- ctx KV cache: per draft layer, fp16 alloy buffers. `full_attention` layers are
+  native-sized and linear (slot i == absolute position i); `sliding_attention`
+  layers are a circular ring of `sliding_window` rows (slot == position % window).
+  `observe()` writes feature K/V rows for ALL forwarded rows; the committed
+  pointer makes overshoot rows dead, and the next round's write overwrites them.
+- propose plan: block embeds → draft layers (attention via
+  `attention_kv_update_multi_bidir`: fused block-KV write at [pos, pos+B) + every
+  row attends the in-window context plus the block) → final norm → shared lm_head
   on the B-1 mask rows → in-plan argmax. The block's own KV rows land in the
   ctx cache but die by the same overwrite rule.
-- observe plan: 5 tap tensors → fc → hidden_norm → per-layer
-  k_norm(k_proj)/v_proj + rope at absolute positions → `spec_kv_write`.
+- observe plan: tap tensors → fc → hidden_norm → per-layer
+  k_norm(k_proj)/v_proj + rope at absolute positions → `spec_kv_write` (ring-wrapped
+  on the sliding layers).
 - rope: the draft's own full-head-dim tables (theta from its config — NOT the
   target's partial-rope tables), staged per call from host like the MTP
   drafter; in-plan rope derivation constant-folds and breaks positions.
@@ -50,21 +52,43 @@ if TYPE_CHECKING:
     from alloy_server.generation.generator import AlloyGenerator
 
 
+DFLASH_DRAFTS: dict[str, tuple[str, ...]] = {
+    "z-lab/Qwen3.5-4B-DFlash": ("qwen3.5:4b", "Qwen3.5-4B"),
+    "z-lab/Qwen3.5-9B-DFlash": ("qwen3.5:9b", "Qwen3.5-9B"),
+    "z-lab/Qwen3.5-27B-DFlash": ("qwen3.5:27b", "Qwen3.5-27B"),
+    "z-lab/Qwen3.5-35B-A3B-DFlash": ("qwen3.5:35b", "Qwen3.5-35B-A3B"),
+    "z-lab/Qwen3.5-122B-A10B-DFlash": ("qwen3.5:122b", "Qwen3.5-122B-A10B"),
+    "z-lab/Qwen3.6-27B-DFlash": ("qwen3.6:27b", "Qwen3.6-27B"),
+    "z-lab/Qwen3.6-35B-A3B-DFlash": ("qwen3.6:35b", "Qwen3.6-35B-A3B"),
+}
+
+
+def dflash_alias_key(ref: str) -> str:
+    """Normalize a model reference to its DFlash lookup key. An HF ref keeps only
+    its model identity (org, `-GGUF` suffix, and `:quant` tag dropped); an Ollama
+    tag (`name:size`, no `/`) is matched verbatim."""
+    ref = ref.strip().lower()
+    if "/" in ref:
+        ref = ref.rsplit("/", 1)[1].partition(":")[0]
+        if ref.endswith("-gguf"):
+            ref = ref[: -len("-gguf")]
+    return ref
+
+
 DFLASH_CHECKPOINTS = {
-    "qwen3.5:4b": "z-lab/Qwen3.5-4B-DFlash",
-    "qwen3.5:9b": "z-lab/Qwen3.5-9B-DFlash",
-    "qwen3.6:35b": "z-lab/Qwen3.5-35B-A3B-DFlash",
+    dflash_alias_key(alias): repo
+    for repo, aliases in DFLASH_DRAFTS.items()
+    for alias in aliases
 }
 
 
 def resolve_dflash_checkpoint(model_name: str) -> Path:
-    """z-lab draft checkpoint directory for a served model name."""
-    repo = DFLASH_CHECKPOINTS.get(model_name)
+    """z-lab draft checkpoint directory for a served model reference (Ollama tag
+    or HF repo, any GGUF mirror)."""
+    repo = DFLASH_CHECKPOINTS.get(dflash_alias_key(model_name))
     if repo is None:
-        raise ValueError(
-            f"no DFlash draft known for {model_name!r}; known: "
-            f"{', '.join(sorted(DFLASH_CHECKPOINTS))}"
-        )
+        known = ", ".join(aliases[0] for aliases in DFLASH_DRAFTS.values())
+        raise ValueError(f"no DFlash draft known for {model_name!r}; known: {known}")
     try:
         path = snapshot_download(repo, local_files_only=True)
     except Exception as exc:
@@ -97,11 +121,12 @@ class DFlashAttention(nn.Module):
     """Draft self-attention: Q from the block, KV = [ctx cache ++ block] via
     the fused bidirectional multi-token op."""
 
-    def __init__(self, hidden: int, heads: int, kv_heads: int, head_dim: int, eps: float) -> None:
+    def __init__(self, hidden: int, heads: int, kv_heads: int, head_dim: int, eps: float, sliding_window: int = 0) -> None:
         super().__init__()
         self.heads = heads
         self.kv_heads = kv_heads
         self.head_dim = head_dim
+        self.sliding_window = sliding_window
         self.q_proj = nn.Linear(hidden, heads * head_dim, bias=False)
         self.k_proj = nn.Linear(hidden, kv_heads * head_dim, bias=False)
         self.v_proj = nn.Linear(hidden, kv_heads * head_dim, bias=False)
@@ -123,16 +148,16 @@ class DFlashAttention(nn.Module):
         k = (k * cos_b) + (_rotate_half(k) * sin_b)
         attn = torch.ops.alloy.attention_kv_update_multi_bidir(
             q.to(ctx_k.dtype), k.to(ctx_k.dtype), v.to(ctx_k.dtype),
-            cache_pos, ctx_k, ctx_v, float(self.head_dim) ** -0.5,
+            cache_pos, ctx_k, ctx_v, float(self.head_dim) ** -0.5, self.sliding_window,
         )
         return self.o_proj(attn.transpose(1, 2).reshape(b, m, -1))
 
 
 class DFlashLayer(nn.Module):
-    def __init__(self, hidden: int, inter: int, heads: int, kv_heads: int, head_dim: int, eps: float) -> None:
+    def __init__(self, hidden: int, inter: int, heads: int, kv_heads: int, head_dim: int, eps: float, sliding_window: int = 0) -> None:
         super().__init__()
         self.input_layernorm = DFlashRMSNorm(hidden, eps)
-        self.self_attn = DFlashAttention(hidden, heads, kv_heads, head_dim, eps)
+        self.self_attn = DFlashAttention(hidden, heads, kv_heads, head_dim, eps, sliding_window)
         self.post_attention_layernorm = DFlashRMSNorm(hidden, eps)
         self.mlp = nn.ModuleDict(dict(
             gate_proj=nn.Linear(hidden, inter, bias=False),
@@ -150,8 +175,8 @@ class DFlashLayer(nn.Module):
 
 
 class DFlashDraftModel(nn.Module):
-    """The z-lab draft: fc (5H→H) + hidden_norm for the context features, N
-    qwen3-style layers, final norm. Embedding + lm_head are the TARGET's
+    """The z-lab draft: fc (n_taps·H→H) + hidden_norm for the context features,
+    N qwen3-style layers, final norm. Embedding + lm_head are the TARGET's
     (tied/quantized) modules, bound at drafter.bind()."""
 
     def __init__(self, cfg: dict) -> None:
@@ -161,12 +186,19 @@ class DFlashDraftModel(nn.Module):
         self.n_taps = len(cfg["dflash_config"]["target_layer_ids"])
         self.fc = nn.Linear(self.n_taps * h, h, bias=False)
         self.hidden_norm = DFlashRMSNorm(h, eps)
+        # Per-layer cross-context window (the checkpoint's trained config):
+        # `sliding_attention` layers cross-attend the most recent `sliding_window`
+        # target features through a circular ring of that size (qwen3.6: 4096 on
+        # 5/6 layers); `full_attention` layers see all of it (window 0, linear cache).
+        layer_types = cfg.get("layer_types") or []
+        sw = int(cfg.get("sliding_window") or 0)
         self.layers = nn.ModuleList(
             DFlashLayer(
                 h, cfg["intermediate_size"], cfg["num_attention_heads"],
                 cfg["num_key_value_heads"], cfg["head_dim"], eps,
+                sw if i < len(layer_types) and layer_types[i] == "sliding_attention" else 0,
             )
-            for _ in range(cfg["num_hidden_layers"])
+            for i in range(cfg["num_hidden_layers"])
         )
         self.norm = DFlashRMSNorm(h, eps)
 
@@ -205,9 +237,12 @@ class DFlashObserve(nn.Module):
         super().__init__()
         self.draft = draft
 
-    def forward(self, t0, t1, t2, t3, t4, cos, sin, cache_pos, *ctx):
+    def forward(self, *args):
+        nt = self.draft.n_taps
+        taps, cos, sin, cache_pos = args[:nt], args[nt], args[nt + 1], args[nt + 2]
+        ctx = args[nt + 3 :]
         n = len(ctx) // 2
-        h = self.draft.fuse([t0, t1, t2, t3, t4])
+        h = self.draft.fuse(list(taps))
         b, m, _ = h.shape
         outs = []
         cos_b = cos.unsqueeze(1)
@@ -218,7 +253,7 @@ class DFlashObserve(nn.Module):
             v = attn.v_proj(h).view(b, m, attn.kv_heads, attn.head_dim).transpose(1, 2)
             k = (k * cos_b) + (_rotate_half(k) * sin_b)
             outs.append(torch.ops.alloy.spec_kv_write(
-                k.to(ck.dtype), v.to(ck.dtype), cache_pos, ck, cv,
+                k.to(ck.dtype), v.to(ck.dtype), cache_pos, ck, cv, attn.sliding_window,
             ))
         return tuple(outs)
 
@@ -236,10 +271,14 @@ class DFlashDrafter:
         self._blob_path = blob_path
         cfg = json.loads((self._ckpt / "config.json").read_text())
         self._cfg = cfg
-        self.block_size = int(block_size if block_size is not None else cfg["block_size"])
+        dfc = cfg["dflash_config"]
+        # block_size lives under dflash_config (qwen3.6 drafts) or at top level
+        # (qwen3.5 drafts).
+        default_block = cfg.get("block_size", dfc.get("block_size"))
+        self.block_size = int(block_size if block_size is not None else default_block)
         self.max_draft_tokens = self.block_size - 1
-        self.mask_token_id = int(cfg["dflash_config"]["mask_token_id"])
-        self.taps = TargetTaps(layer_ids=tuple(cfg["dflash_config"]["target_layer_ids"]))
+        self.mask_token_id = int(dfc["mask_token_id"])
+        self.taps = TargetTaps(layer_ids=tuple(dfc["target_layer_ids"]))
         self._gen: "AlloyGenerator | None" = None
         self._draft: DFlashDraftModel | None = None
         self._pins: dict | None = None
@@ -269,17 +308,22 @@ class DFlashDrafter:
         for p in draft.parameters():
             p.requires_grad_(False)
         self._draft = draft
-        # ctx KV caches: slot == absolute position, native-sized.
+        # ctx KV caches, per layer: full-attention layers are native-sized and
+        # linear (slot == absolute position); sliding layers are a circular ring
+        # of `sliding_window` rows (slot == position % window), matching the
+        # attention/write kernels' wrap. The ring keeps the cross-context at the
+        # trained window and shrinks the resident KV (~6.4 GB → ~1 GB at qwen3.6).
         kvh, hd = cfg["num_key_value_heads"], cfg["head_dim"]
         s_max = gen.kv.max_cache_len
         self._ctx_arrs = []
         self._ctx_k_t: list[torch.Tensor] = []
         self._ctx_v_t: list[torch.Tensor] = []
-        for _ in range(cfg["num_hidden_layers"]):
+        for layer in draft.layers:
+            rows = layer.self_attn.sliding_window or s_max
             for views in (self._ctx_k_t, self._ctx_v_t):
-                arr = _alloc_aligned((1, kvh, s_max, hd), float16)
+                arr = _alloc_aligned((1, kvh, rows, hd), float16)
                 t = make_tensor_from_ptr(
-                    arr.base_ptr, (1, kvh, s_max, hd), float16,
+                    arr.base_ptr, (1, kvh, rows, hd), float16,
                     total_nbytes=arr.metal_nbytes,
                 )
                 self._ctx_arrs.append(arr)
@@ -347,9 +391,11 @@ class DFlashDrafter:
         rows = min(rows, self._ctx_len)
         if rows <= 0:
             return None
+        # Per-cache row count: full layers slice [0, rows); ring layers cap at
+        # their window (the whole ring is live once ctx_len >= window).
         return (
-            [t[:, :, :rows].clone() for t in self._ctx_k_t],
-            [t[:, :, :rows].clone() for t in self._ctx_v_t],
+            [t[:, :, : min(rows, t.shape[2])].clone() for t in self._ctx_k_t],
+            [t[:, :, : min(rows, t.shape[2])].clone() for t in self._ctx_v_t],
             self._ctx_len,
         )
 
@@ -357,18 +403,19 @@ class DFlashDrafter:
         if snap is None:
             return
         ks, vs, ctx_len = snap
-        rows = ks[0].shape[2]
         for t, s in zip(self._ctx_k_t, ks):
-            t[:, :, :rows].copy_(s)
+            t[:, :, : s.shape[2]].copy_(s)
         for t, s in zip(self._ctx_v_t, vs):
-            t[:, :, :rows].copy_(s)
+            t[:, :, : s.shape[2]].copy_(s)
         self._ctx_len = ctx_len
 
     def tune_targets(self) -> list:
-        """(label, module, inputs) tuples for `alloy tune --spec dflash` —
-        the draft's propose and observe forwards at production shapes, so
-        their GEMM/norm kernels get tuned configs like every other forward
-        (the vision capture_targets() pattern). Requires bind()."""
+        """(label, module, inputs, record_only) tuples for `alloy tune --spec
+        dflash` — the draft's propose and observe forwards at production shapes,
+        so their GEMM/norm kernels get tuned configs like every other forward
+        (the vision capture_targets() pattern). `record_only` is True for the
+        large-M (chunk-width) observe target so its extraction doesn't hold the
+        full activation graph. Requires bind()."""
         cfg = self._cfg
         h = cfg["hidden_size"]
         hd = cfg["head_dim"]
@@ -391,8 +438,8 @@ class DFlashDrafter:
                 self.inner = inner
                 self._ctx_bufs = ctx_bufs
 
-            def forward(self, t0, t1, t2, t3, t4, cos, sin, cache_pos):
-                return self.inner(t0, t1, t2, t3, t4, cos, sin, cache_pos, *self._ctx_bufs)
+            def forward(self, *args):
+                return self.inner(*args, *self._ctx_bufs)
 
         targets = [(
             f"dflash propose (block {b})",
@@ -403,17 +450,20 @@ class DFlashDrafter:
                 "sin": torch.zeros((1, b, hd), dtype=torch.float16),
                 "cache_pos": torch.arange(b, dtype=torch.long),
             },
+            False,  # small-M (block width): keep realistic snapshots
         )]
         for m in (b, gen.chunk_prefill_size):
+            obs_inputs = (
+                *(torch.zeros((1, m, h), dtype=torch.float16) for _ in range(self._draft.n_taps)),
+                torch.zeros((1, m, hd), dtype=torch.float16),  # cos
+                torch.zeros((1, m, hd), dtype=torch.float16),  # sin
+                torch.arange(m, dtype=torch.long),  # cache_pos
+            )
             targets.append((
                 f"dflash observe (M={m})",
                 ObserveShim(DFlashObserve(self._draft), ctx),
-                {
-                    **{f"t{i}": torch.zeros((1, m, h), dtype=torch.float16) for i in range(5)},
-                    "cos": torch.zeros((1, m, hd), dtype=torch.float16),
-                    "sin": torch.zeros((1, m, hd), dtype=torch.float16),
-                    "cache_pos": torch.arange(m, dtype=torch.long),
-                },
+                obs_inputs,
+                m >= gen.chunk_prefill_size,  # large-M observe: record_only
             ))
         return targets
 
@@ -422,7 +472,9 @@ class DFlashDrafter:
     def _rope_tables(self) -> tuple[torch.Tensor, torch.Tensor]:
         cfg = self._cfg
         d = cfg["head_dim"]
-        theta = float(cfg["rope_theta"])
+        # rope_theta is top-level (qwen3.5 drafts) or under rope_parameters
+        # (qwen3.6 drafts, newer transformers config layout).
+        theta = float(cfg.get("rope_theta") or cfg["rope_parameters"]["rope_theta"])
         max_pos = self._gen.kv.max_cache_len
         inv = 1.0 / (theta ** (torch.arange(0, d, 2, dtype=torch.float32) / d))
         t = torch.arange(max_pos, dtype=torch.float32)

@@ -155,15 +155,17 @@ _alloy_lib.define(
 _alloy_lib.define(
     "attention_kv_update_multi_bidir(Tensor q, Tensor new_k, Tensor new_v, "
     "Tensor cache_pos, Tensor k_cache, Tensor v_cache, "
-    "float scale=-1.0) -> Tensor"
+    "float scale=-1.0, int sliding_window=0) -> Tensor"
 )
 # Write-only KV row store for the DFlash observe/fusion plan: writes M rows of
 # (B, KV_H, M, D) k/v into the (B, KV_H, S, D) caches at
 # [cache_pos, cache_pos+M). Returns k unchanged (a token output so the lazy
 # collector keeps the dispatch live; the cache mutation is the real effect).
+# sliding_window > 0: the cache is a circular ring of that size, writes map to
+# pos % sliding_window (the draft's sliding cross-context layers).
 _alloy_lib.define(
     "spec_kv_write(Tensor k, Tensor v, Tensor cache_pos, "
-    "Tensor k_cache, Tensor v_cache) -> Tensor"
+    "Tensor k_cache, Tensor v_cache, int sliding_window=0) -> Tensor"
 )
 _alloy_lib.define(
     "cross_entropy_fwd_fused(Tensor logits, Tensor labels, int ignore_index) "
@@ -335,6 +337,7 @@ def _attention_kv_update_multi_bidir_meta(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     scale: float = -1.0,
+    sliding_window: int = 0,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -346,6 +349,7 @@ def _spec_kv_write_meta(
     cache_pos: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
+    sliding_window: int = 0,
 ) -> torch.Tensor:
     return torch.empty_like(k)
 
