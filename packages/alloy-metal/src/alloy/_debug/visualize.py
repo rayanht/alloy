@@ -184,16 +184,25 @@ def visualize(fn, path: str = "alloy_viz.html", name: str = "Model", plans=None,
     kernel_data = []  # flat list for total timing
     for pi, p in enumerate(all_plans):
         if p and p.plan_handle:
+            # Profile at the shrunk launch the run last dispatched (grid-shrink
+            # prefill), so the per-kernel μs reflect the real prompt length, not
+            # the max-length grid the plan was compiled at. Empty/None → full grid.
+            grid_updates = p._last_grid_shrink_updates or []
+            # A grid-shrink-bounded plan (truncated M-outer intermediate pool)
+            # has its dispatches REGISTERED at the full M_MAX grid but its pool
+            # sized for the bound — production always shrinks the grid per call,
+            # so the invariant holds. Profiling it at the full grid (no shrink
+            # updates) writes the M-outer GEMMs past the bounded pool: an
+            # out-of-bounds GPU fault that stalls the whole device until restart.
+            # Only profile such a plan at the shrunk grid the last run left.
+            if p._pool_trunc and not grid_updates:
+                continue
             iu = []
             for si, slot in enumerate(p.slots):
                 if isinstance(slot, IntermediateSlot):
                     arr = p.phys_arrays[slot.physical_idx]
                     if isinstance(arr, AlloyBuffer):
                         iu.append((si, arr.base_ptr, arr.metal_nbytes))
-            # Profile at the shrunk launch the run last dispatched (grid-shrink
-            # prefill), so the per-kernel μs reflect the real prompt length, not
-            # the max-length grid the plan was compiled at. Empty/None → full grid.
-            grid_updates = p._last_grid_shrink_updates or []
             try:
                 recs = _metal_ext.dispatch_plan_profiled(p.plan_handle, iu, grid_updates)
                 plan_kd = []
