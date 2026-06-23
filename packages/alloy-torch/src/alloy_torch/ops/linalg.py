@@ -731,7 +731,9 @@ def _alloy_gguf_q6_k_mm_handler(
     N = packed_weights.shape[0]
     out = _alloc_scratch((M, N), activations.dtype)
     if M == 1:
-        return _dot_q6_k_v2[(N,)](activations, packed_weights, out)
+        # NUM_SPLITS=1: split-K regresses full-model decode — the shmem-barrier
+        # K-reduction dominates at the vocab-wide lm_head.
+        return _dot_q6_k_v2[(N,)](activations, packed_weights, out, NUM_SPLITS=1)
     if M <= 4:
         return _dot_q6_k_v2_rows[(N,)](activations, packed_weights, out)
     return _dot_q6_k(activations, packed_weights, out)

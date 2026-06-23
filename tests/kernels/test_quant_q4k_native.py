@@ -7,6 +7,7 @@ blocks and must match this reference.
 """
 
 import numpy as np
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -69,6 +70,31 @@ def _dequant(blk, N, NB):
     return W
 
 
+def _dequant_f16(blk, N, NB):
+    """f16 dequant matching the tiled kernel's half bit-trick op-for-op:
+    dsc = f16(d * f16(sc)), dm = f16(dmin * f16(mn)), w = f16(f16(nib) * dsc - dm)."""
+    W = np.empty((N, NB * 256), dtype=np.float16)
+    b = blk.reshape(N, NB, 144)
+    f16 = np.float16
+    for n in range(N):
+        for ib in range(NB):
+            block = b[n, ib]
+            d = block[0:2].view(np.float16)[0]
+            dmin = block[2:4].view(np.float16)[0]
+            sc_bytes = block[4:16].astype(np.int32)
+            qs = block[16:144].astype(np.int32)
+            for g in range(8):
+                s, m = _get_scale_min_k4(g, sc_bytes)
+                dsc = f16(d * f16(s))
+                dm = f16(dmin * f16(m))
+                base = ib * 256 + g * 32
+                for l in range(32):
+                    byte = qs[(g // 2) * 32 + l]
+                    nib = (byte >> 4) if (g & 1) else (byte & 0xF)
+                    W[n, base + l] = f16(f16(f16(nib) * dsc) - dm)
+    return W
+
+
 def _ceil(a, b):
     return (a + b - 1) // b
 
@@ -119,7 +145,8 @@ def test_q4k_tiled_coop_load_matches_reference():
     materialize_many([c])
     gpu_sync()
     got = c.numpy.copy().reshape(M, N)
-    assert np.allclose(got, ref, atol=2e-1, rtol=5e-3), (
+    # f16 dequant rounds ~0.3 over large K.
+    assert np.allclose(got, ref, atol=4e-1, rtol=5e-3), (
         f"max abs {np.abs(got - ref).max():.3e}"
     )
 
@@ -221,5 +248,46 @@ def test_q4k_silu_rows_matches_reference():
     gpu_sync()
     got = c.numpy.copy().reshape(M, N)
     assert np.allclose(got, ref, atol=3e-3, rtol=3e-3), (
+        f"max abs {np.abs(got - ref).max():.3e}"
+    )
+
+
+# (M, N, K, BLOCK_M, BLOCK_N, BLOCK_K) — exercises both cooperative-load dequant
+# paths (vw=16 at full occupancy vs vw=8), partial M/N tiles (masked stores),
+# M=1 through the tiled path, and NB=1..10 superblocks per row.
+_Q4K_TILED_CASES = [
+    (64, 64, 512, 64, 64, 32),     # vec16, full tiles, NB=2
+    (48, 64, 2560, 16, 64, 64),    # vec8 (BK=64), NB=10
+    (80, 96, 512, 32, 64, 32),     # partial M (80) + partial N (96)
+    (256, 128, 256, 64, 64, 32),   # NB=1, larger tile grid
+    (130, 64, 768, 64, 64, 32),    # partial M (130), NB=3
+    (16, 128, 512, 16, 128, 32),   # BN=128
+    (1, 64, 512, 16, 64, 32),      # M=1 — only row 0 of the M-tile is valid
+    (200, 160, 512, 64, 64, 32),   # partial N (160 = 2*64 + 32)
+]
+
+
+@pytest.mark.parametrize("M,N,K,BM,BN,BK", _Q4K_TILED_CASES)
+def test_q4k_tiled_sweep_matches_f16_reference(M, N, K, BM, BN, BK):
+    """Tiled Q4_K GEMM over varied shapes and tiles (vec8/vec16, partial M/N,
+    M=1, NB=1..10) against an f16-dequant reference."""
+    NB = K // 256
+    rng = np.random.default_rng(M * 31 + N * 7 + K + BK)
+    blk = _make_blocks(N, NB, rng)
+    Wf16 = _dequant_f16(blk, N, NB).astype(np.float32)
+    A = (rng.standard_normal((M, K)) * 0.5).astype(np.float32)
+    ref = A.astype(np.float16).astype(np.float32) @ Wf16.T
+
+    a_buf = _buf(A, float32)
+    blk_buf = _buf(blk, uint8)
+    c = _alloc_aligned((M * N,), float32)
+    dot_q4_k[(_ceil(M, BM), _ceil(N, BN))](
+        a_buf, blk_buf, c, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK
+    )
+    materialize_many([c])
+    gpu_sync()
+    got = c.numpy.copy().reshape(M, N)
+    assert np.allclose(got, ref, atol=2.5e-1, rtol=1e-2), (
+        f"M={M} N={N} K={K} BM={BM} BN={BN} BK={BK} "
         f"max abs {np.abs(got - ref).max():.3e}"
     )

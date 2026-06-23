@@ -503,10 +503,67 @@ class MemoryEmitterMixin:
                     "((_qj4_q4k >> 4) | ((_qj_q4k >> 6) << 4));"
                 )
 
+            sdt_q4k = self._buf_shmem_dtype(buf_name)
+            # vw=16 decodes the Q4_K header once per 16 values, halving the
+            # per-K-iter decode latency. Only when 16 values/thread still fill
+            # the threadgroup.
+            use_vec16 = (
+                load_cols % 16 == 0
+                and sdt_q4k == "half"
+                and col_bound_var is None
+                and rows * (load_cols // 16) >= self._threads
+            )
+            if use_vec16:
+                fill = float(op.other)
+                n_vec = rows * (load_cols // 16)
+                self._emit_coop_loop_open(n_vec)
+                self._emit(f"uint _r = _idx / {load_cols // 16}u;")
+                self._emit(f"uint _cv = _idx % {load_cols // 16}u;")
+                self._emit("uint _c = _cv * 16u;")
+                self._emit(f"uint _gr = uint({row_start}) + _r;")
+                self._emit(f"uint _gc = uint({packed_col_start}){col_off} + _c;")
+                for g in range(4):
+                    self._emit(f"half4 _val{g}_q4k = half4({fill}h);")
+                guard = f"_gr < {row_bound_var}" if row_bound_var else None
+                if guard:
+                    self._emit(f"if ({guard}) {{")
+                    self._indent += 1
+                _emit_q4k_header()
+                self._emit("uint _qoff_q4k = 16u + (_sg_q4k / 2u) * 32u + _pos_q4k;")
+                self._emit("uchar _sh_q4k = uchar((_sg_q4k & 1u) * 4u);")
+                self._emit("half _dsc_q4k = as_type<half>(_d_bits_q4k) * half(_sc_q4k);")
+                self._emit("half _dm_q4k = as_type<half>(_dm_bits_q4k) * half(_mn_q4k);")
+                for g in range(4):
+                    self._emit(
+                        f"uchar4 _qb{g}_q4k = *(device const uchar4*)(_blk_q4k + _qoff_q4k + {g * 4}u);"
+                    )
+                    self._emit(
+                        f"ushort4 _hb{g}_q4k = ushort4(0x6400) | "
+                        f"ushort4((_qb{g}_q4k >> _sh_q4k) & uchar4(0x0F));"
+                    )
+                    self._emit(
+                        f"_val{g}_q4k = (as_type<half4>(_hb{g}_q4k) - 1024.0h) * _dsc_q4k - _dm_q4k;"
+                    )
+                if guard:
+                    self._indent -= 1
+                    self._emit("}")
+                for g in range(4):
+                    self._emit(
+                        f"*(threadgroup half4*)(&{buf_name}[{db_off}_r * {stride}u + _c + {g * 4}u]) = _val{g}_q4k;"
+                    )
+                self._indent -= 1
+                self._emit("}")
+                self._val_loc[name] = ValLoc("shared", buf_name, stride)
+                self._pending_tg_barrier = True
+                self._buffers_since_barrier.add(buf_name)
+                return
+
             use_vec8 = load_cols % 8 == 0 and (col_bound_var is None or cb_vec8_safe)
             use_vec4 = load_cols % 4 == 0 and (col_bound_var is None or cb_vec4_safe)
             if use_vec8 or use_vec4:
                 vw = 8 if use_vec8 else 4
+                sdt = self._buf_shmem_dtype(buf_name)
+                vec_t = f"{sdt}4"
                 n_vec = rows * (load_cols // vw)
                 self._emit_coop_loop_open(n_vec)
                 self._emit(f"uint _r = _idx / {load_cols // vw}u;")
@@ -515,9 +572,10 @@ class MemoryEmitterMixin:
                 self._emit(f"uint _gr = uint({row_start}) + _r;")
                 self._emit(f"uint _gc = uint({packed_col_start}){col_off} + _c;")
                 fill = float(op.other)
-                self._emit(f"float4 _val_lo = float4({fill}f);")
+                lit = f"{fill}h" if sdt == "half" else f"{fill}f"
+                self._emit(f"{vec_t} _val_lo = {vec_t}({lit});")
                 if vw == 8:
-                    self._emit(f"float4 _val_hi = float4({fill}f);")
+                    self._emit(f"{vec_t} _val_hi = {vec_t}({lit});")
                 guards = []
                 if row_bound_var:
                     guards.append(f"_gr < {row_bound_var}")
@@ -527,32 +585,45 @@ class MemoryEmitterMixin:
                     self._emit(f"if ({' && '.join(guards)}) {{")
                     self._indent += 1
                 _emit_q4k_header()
-                self._emit("float _dsc_q4k = _d_q4k * float(_sc_q4k);")
-                self._emit("float _dm_q4k = _dmin_q4k * float(_mn_q4k);")
                 self._emit("uint _qoff_q4k = 16u + (_sg_q4k / 2u) * 32u + _pos_q4k;")
                 self._emit("uchar _sh_q4k = uchar((_sg_q4k & 1u) * 4u);")
                 self._emit("uchar4 _qb_lo_q4k = *(device const uchar4*)(_blk_q4k + _qoff_q4k);")
-                self._emit("int4 _nib_lo_q4k = int4((_qb_lo_q4k >> _sh_q4k) & uchar4(0x0F));")
-                self._emit("_val_lo = float4(_nib_lo_q4k) * _dsc_q4k - _dm_q4k;")
                 if vw == 8:
                     self._emit("uchar4 _qb_hi_q4k = *(device const uchar4*)(_blk_q4k + _qoff_q4k + 4u);")
-                    self._emit("int4 _nib_hi_q4k = int4((_qb_hi_q4k >> _sh_q4k) & uchar4(0x0F));")
-                    self._emit("_val_hi = float4(_nib_hi_q4k) * _dsc_q4k - _dm_q4k;")
+                if sdt == "half":
+                    # Bit-trick int4->half: 0x6400|nib == 1024.0h+nib (exact, nib<16),
+                    # subtract 1024 before scaling (f16-exact). Kills the int->float
+                    # AND float->half CONVERTs (the q4_k matmul's F32-limiter).
+                    self._emit("half _dsc_q4k = as_type<half>(_d_bits_q4k) * half(_sc_q4k);")
+                    self._emit("half _dm_q4k = as_type<half>(_dm_bits_q4k) * half(_mn_q4k);")
+                    self._emit(
+                        "ushort4 _hb_lo_q4k = ushort4(0x6400) | "
+                        "ushort4((_qb_lo_q4k >> _sh_q4k) & uchar4(0x0F));"
+                    )
+                    self._emit("_val_lo = (as_type<half4>(_hb_lo_q4k) - 1024.0h) * _dsc_q4k - _dm_q4k;")
+                    if vw == 8:
+                        self._emit(
+                            "ushort4 _hb_hi_q4k = ushort4(0x6400) | "
+                            "ushort4((_qb_hi_q4k >> _sh_q4k) & uchar4(0x0F));"
+                        )
+                        self._emit("_val_hi = (as_type<half4>(_hb_hi_q4k) - 1024.0h) * _dsc_q4k - _dm_q4k;")
+                else:
+                    self._emit("float _dsc_q4k = _d_q4k * float(_sc_q4k);")
+                    self._emit("float _dm_q4k = _dmin_q4k * float(_mn_q4k);")
+                    self._emit("int4 _nib_lo_q4k = int4((_qb_lo_q4k >> _sh_q4k) & uchar4(0x0F));")
+                    self._emit("_val_lo = float4(_nib_lo_q4k) * _dsc_q4k - _dm_q4k;")
+                    if vw == 8:
+                        self._emit("int4 _nib_hi_q4k = int4((_qb_hi_q4k >> _sh_q4k) & uchar4(0x0F));")
+                        self._emit("_val_hi = float4(_nib_hi_q4k) * _dsc_q4k - _dm_q4k;")
                 if guards:
                     self._indent -= 1
                     self._emit("}")
-                sdt = self._buf_shmem_dtype(buf_name)
-                vec_t = f"{sdt}4"
-                cast_lo = "_val_lo" if sdt == "float" else f"{vec_t}(_val_lo)"
                 self._emit(
-                    f"*(threadgroup {vec_t}*)(&{buf_name}[{db_off}_r * {stride}u + _c]) "
-                    f"= {cast_lo};"
+                    f"*(threadgroup {vec_t}*)(&{buf_name}[{db_off}_r * {stride}u + _c]) = _val_lo;"
                 )
                 if vw == 8:
-                    cast_hi = "_val_hi" if sdt == "float" else f"{vec_t}(_val_hi)"
                     self._emit(
-                        f"*(threadgroup {vec_t}*)(&{buf_name}[{db_off}_r * {stride}u + _c + 4u]) "
-                        f"= {cast_hi};"
+                        f"*(threadgroup {vec_t}*)(&{buf_name}[{db_off}_r * {stride}u + _c + 4u]) = _val_hi;"
                     )
                 self._indent -= 1
                 self._emit("}")
@@ -652,9 +723,11 @@ class MemoryEmitterMixin:
                 self._emit(f"uint _gr = uint({row_start}) + _r;")
                 self._emit(f"uint _gc = uint({packed_col_start}){col_off} + _c;")
                 fill = float(op.other)
-                self._emit(f"float4 _val_lo = float4({fill}f);")
+                sdt = self._buf_shmem_dtype(buf_name)
+                vec_t = f"{sdt}4"
+                self._emit(f"{vec_t} _val_lo = {vec_t}({fill}f);")
                 if vw == 8:
-                    self._emit(f"float4 _val_hi = float4({fill}f);")
+                    self._emit(f"{vec_t} _val_hi = {vec_t}({fill}f);")
                 guards = []
                 if row_bound_var:
                     guards.append(f"_gr < {row_bound_var}")
@@ -707,13 +780,6 @@ class MemoryEmitterMixin:
                     self._emit(
                         "int4 _qh_n_hi = int4((_qh_v_hi >> _qh_shift) & uchar4(0x03));"
                     )
-                # int->float bit-trick: build 0x4B000000|u (= 8388608.0f + u) and
-                # reinterpret, dodging the int->float CONVERT pipe; the - 8388640
-                # (= 8388608 + 32) below recovers q = u - 32. Bit-identical to
-                # float4((u) - 32). u = ql | (qh<<4) in [0,63].
-                self._emit("int4 _q_lo = (_ql_n_lo | (_qh_n_lo << 4)) | int4(0x4B000000);")
-                if vw == 8:
-                    self._emit("int4 _q_hi = (_ql_n_hi | (_qh_n_hi << 4)) | int4(0x4B000000);")
                 # Sub-scale: 1 byte per 16 K; `vw` ≤ 8 from a vw-aligned
                 # start stays within one scale group.
                 self._emit("uint _sc_off = 192u + _ib_q6k / 16u;")
@@ -723,32 +789,40 @@ class MemoryEmitterMixin:
                 self._emit(
                     "ushort _d_bits = ushort(uint(_blk_q6k[208]) | (uint(_blk_q6k[209]) << 8));"
                 )
-                self._emit("float _d_q6k = float(as_type<half>(_d_bits));")
-                # Hoist `d * sub_scale` out of the per-element multiply.
-                self._emit("float _d_sc = _d_q6k * _sc_f;")
-                self._emit("_val_lo = (as_type<float4>(_q_lo) - 8388640.0) * _d_sc;")
-                if vw == 8:
-                    self._emit("_val_hi = (as_type<float4>(_q_hi) - 8388640.0) * _d_sc;")
+                if sdt == "half":
+                    # u6->half bit-trick: 0x6400|u == 1024.0h+u (exact, u<64); the
+                    # -1056 (= 1024 + 32) recovers q = u - 32. Kills int->float AND
+                    # float->half CONVERTs (matches the q4_k path).
+                    self._emit("half _d_sc = as_type<half>(_d_bits) * half(_sc_f);")
+                    self._emit(
+                        "_val_lo = (as_type<half4>(ushort4(0x6400) | "
+                        "ushort4(_ql_n_lo | (_qh_n_lo << 4))) - 1056.0h) * _d_sc;"
+                    )
+                    if vw == 8:
+                        self._emit(
+                            "_val_hi = (as_type<half4>(ushort4(0x6400) | "
+                            "ushort4(_ql_n_hi | (_qh_n_hi << 4))) - 1056.0h) * _d_sc;"
+                        )
+                else:
+                    # int->float bit-trick: 0x4B000000|u == 8388608.0f+u; the
+                    # -8388640 (= 8388608 + 32) recovers q = u - 32.
+                    self._emit("int4 _q_lo = (_ql_n_lo | (_qh_n_lo << 4)) | int4(0x4B000000);")
+                    if vw == 8:
+                        self._emit("int4 _q_hi = (_ql_n_hi | (_qh_n_hi << 4)) | int4(0x4B000000);")
+                    self._emit("float _d_q6k = float(as_type<half>(_d_bits));")
+                    self._emit("float _d_sc = _d_q6k * _sc_f;")
+                    self._emit("_val_lo = (as_type<float4>(_q_lo) - 8388640.0) * _d_sc;")
+                    if vw == 8:
+                        self._emit("_val_hi = (as_type<float4>(_q_hi) - 8388640.0) * _d_sc;")
                 if guards:
                     self._indent -= 1
                     self._emit("}")
-                # Cast the per-element vec4 to the destination shmem dtype (float
-                # for the default plan, half when promoted by the half-paired Load
-                # downcast). Hardcoding float4 corrupts a half-dtype slot — a
-                # float4 write covers 16 bytes, spanning 8 half slots, storing the
-                # wrong values.
-                sdt = self._buf_shmem_dtype(buf_name)
-                vec_t = f"{sdt}4"
-                cast_lo = "_val_lo" if sdt == "float" else f"{vec_t}(_val_lo)"
                 self._emit(
-                    f"*(threadgroup {vec_t}*)(&{buf_name}[{db_off}_r * {stride}u + _c]) "
-                    f"= {cast_lo};"
+                    f"*(threadgroup {vec_t}*)(&{buf_name}[{db_off}_r * {stride}u + _c]) = _val_lo;"
                 )
                 if vw == 8:
-                    cast_hi = "_val_hi" if sdt == "float" else f"{vec_t}(_val_hi)"
                     self._emit(
-                        f"*(threadgroup {vec_t}*)(&{buf_name}[{db_off}_r * {stride}u + _c + 4u]) "
-                        f"= {cast_hi};"
+                        f"*(threadgroup {vec_t}*)(&{buf_name}[{db_off}_r * {stride}u + _c + 4u]) = _val_hi;"
                     )
                 self._indent -= 1
                 self._emit("}")

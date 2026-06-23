@@ -240,27 +240,27 @@ Reproduce with `alloy bench <HF_OR_OLLAMA_TAG>`
 
 | model | quant | pp512 | tg128 |
 |---|---|---:|---:|
-| LFM2.5-1.2B-Instruct-GGUF | Q4_K_M | 4222 | 508 |
-| bartowski/Llama-3.2-3B-Instruct-GGUF | Q4_K_M | 2061 | 198 |
-| Qwen_Qwen3-0.6B-GGUF | Q4_K_M | 8311 | 612 |
+| LFM2.5-1.2B-Instruct-GGUF | Q4_K_M | 5727 | 510 |
+| bartowski/Llama-3.2-3B-Instruct-GGUF | Q4_K_M | 2171 | 197 |
+| Qwen_Qwen3-0.6B-GGUF | Q4_K_M | 10579 | 617 |
 
 #### Ollama Models
 
 | model | quant | pp512 | tg128 |
 |---|---|---:|---:|
-| qwen2.5:0.5b | Q4_K_M | 12102 | 505 |
-| qwen3:0.6b | Q4_K_M | 10077 | 584 |
+| qwen2.5:0.5b | Q4_K_M | 12678 | 503 |
+| qwen3:0.6b | Q4_K_M | 10581 | 575 |
 | llama3.2:1b | Q8_0 | 5653 | 324 |
 | qwen3.5:0.8b | Q8_0 | 6141 | 349 |
-| deepseek-r1:1.5b | Q4_K_M | 3295 | 274 |
-| qwen2.5:1.5b | Q4_K_M | 3295 | 270 |
+| deepseek-r1:1.5b | Q4_K_M | 4474 | 277 |
+| qwen2.5:1.5b | Q4_K_M | 4459 | 270 |
 | qwen3.5:2b | Q8_0 | 3247 | 187 |
-| gemma4:e2b | Q4_K_M | 2121 | 175 |
-| qwen2.5:3b | Q4_K_M | 1617 | 185 |
-| gemma4:e4b | Q4_K_M | 1079 | 115 |
-| qwen3.5:4b | Q4_K_M | 1098 | 122 |
-| qwen3.5:9b | Q4_K_M | 598 | 78.6 |
-| qwen3.6:35b | Q4_K_M | 988 | 121 |
+| gemma4:e2b | Q4_K_M | 2807 | 174 |
+| qwen2.5:3b | Q4_K_M | 2123 | 187 |
+| gemma4:e4b | Q4_K_M | 1406 | 117 |
+| qwen3.5:4b | Q4_K_M | 1400 | 123 |
+| qwen3.5:9b | Q4_K_M | 799 | 79.0 |
+| qwen3.6:35b | Q4_K_M | 1210 | 124 |
 
 #### MLX Models
 

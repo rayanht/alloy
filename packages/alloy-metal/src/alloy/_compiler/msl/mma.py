@@ -340,6 +340,9 @@ class MmaEmitterMixin:
                 self._emit(
                     f"simdgroup_load(_a{i}, &{lhs_buf}[{lhs_off}({sg_m} * {TM}u + {i * 8}u) * {lhs_stride}u + _dk], {lhs_stride}u);"
                 )
+        # Simd-execution barrier (no memory fence) between the load groups and
+        # the MMAs; keeps the matrix pipe from stalling on the loads.
+        self._emit("simdgroup_barrier(mem_flags::mem_none);")
 
         # Device-direct RHS (Flash-Attention K/V): stream 8x8 blocks straight
         # from device memory into the MMA — no shmem tile, no barrier. The
@@ -378,6 +381,7 @@ class MmaEmitterMixin:
                 self._emit(
                     f"simdgroup_load(_b{j}, &{rhs_buf}[{rhs_off}_dk * {rhs_stride}u + {sg_n} * {TN}u + {j * 8}u], {rhs_stride}u);"
                 )
+        self._emit("simdgroup_barrier(mem_flags::mem_none);")
 
         for i in range(reg):
             for j in range(reg):
