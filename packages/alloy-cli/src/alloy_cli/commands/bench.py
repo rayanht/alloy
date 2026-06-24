@@ -51,7 +51,7 @@ def bench(
         128, "--depth-gen", help="Decode length for the tg measurement (128 -> tg128)."
     ),
     reps: int = typer.Option(
-        3, "--reps", help="Timed repetitions per depth; median reported."
+        5, "--reps", help="Timed repetitions per depth; mean ± stddev reported (llama-bench style)."
     ),
     image: Path | None = typer.Option(
         None,

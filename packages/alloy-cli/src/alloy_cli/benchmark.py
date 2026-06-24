@@ -6,7 +6,7 @@ then drives the generator from Python.
 
 Three workloads, selected via `--dataset`:
 
-  synthetic (default) — pp/tg throughput on the native cache, median over
+  synthetic (default) — pp/tg throughput on the native cache, mean ± stddev over
     `--reps`. One depth (default 512) reports pp512 / tg128 as two independent
     empty-cache tests (pp prefills from empty; tg decodes from a 1-token seed,
     matching llama-bench). Several `--depths` run a sweep: per depth, prefill
@@ -56,6 +56,20 @@ class DepthPoint:
     gen_tokens: int
     pp_tok_per_s: float
     tg_tok_per_s: float
+    pp_tok_per_s_std: float = 0.0
+    tg_tok_per_s_std: float = 0.0
+
+
+def _avg_std(xs: list[float]) -> tuple[float, float]:
+    """Mean and sample standard deviation (n-1), matching llama-bench's t/s
+    aggregation. Std is 0 for fewer than two reps."""
+    if not xs:
+        return 0.0, 0.0
+    avg = sum(xs) / len(xs)
+    if len(xs) < 2:
+        return avg, 0.0
+    var = sum((x - avg) ** 2 for x in xs) / (len(xs) - 1)
+    return avg, var**0.5
 
 
 def _synthetic_token_ids(vocab_size: int, n_tokens: int, *, seed: int) -> torch.Tensor:
@@ -83,8 +97,8 @@ def run_depths_alloy(
     vocab_size: int, *, reps: int,
 ) -> list[DepthPoint]:
     """Alloy depth sweep on the native cache. Per depth: prefill `depth`
-    synthetic tokens (pp) then decode `gen_tokens` (tg), median throughput over
-    `reps` (one warmup rep discarded). `ignore_eos` forces the full `gen_tokens`
+    synthetic tokens (pp) then decode `gen_tokens` (tg), mean ± stddev throughput
+    over `reps` (one warmup rep discarded). `ignore_eos` forces the full `gen_tokens`
     decode so an early EOS can't shorten — and corrupt — the tg measurement."""
     out: list[DepthPoint] = []
     for d in depths:
@@ -104,7 +118,9 @@ def run_depths_alloy(
                 continue  # discard warmup (first-touch page faults, clock ramp)
             pp.append(int(t["prompt_tokens"]) / max(float(t["prefill_ms"]), 1e-9) * 1000.0)
             tg.append(int(t["decode_tokens"]) / max(float(t["decode_ms"]), 1e-9) * 1000.0)
-        out.append(DepthPoint(d, gen_tokens, _pct(pp, 0.5), _pct(tg, 0.5)))
+        pp_avg, pp_std = _avg_std(pp)
+        tg_avg, tg_std = _avg_std(tg)
+        out.append(DepthPoint(d, gen_tokens, pp_avg, tg_avg, pp_std, tg_std))
     return out
 
 
@@ -115,7 +131,8 @@ def run_llama_bench_alloy(
     """pp{pp_tokens} / tg{gen_tokens} as two independent empty-cache tests
     (llama-bench clears the cache per test): pp prefills `pp_tokens` from empty;
     tg decodes `gen_tokens` from a 1-token seed (depth ~0, not after a prefill).
-    Median over `reps`, one warmup discarded."""
+    Reported as mean ± sample stddev over `reps` (llama-bench style); one warmup
+    discarded."""
     pp: list[float] = []
     tg: list[float] = []
     for rep in range(reps + 1):
@@ -133,7 +150,9 @@ def run_llama_bench_alloy(
             continue  # discard warmup
         pp.append(int(t_pp["prompt_tokens"]) / max(float(t_pp["prefill_ms"]), 1e-9) * 1000.0)
         tg.append(int(t_tg["decode_tokens"]) / max(float(t_tg["decode_ms"]), 1e-9) * 1000.0)
-    return DepthPoint(pp_tokens, gen_tokens, _pct(pp, 0.5), _pct(tg, 0.5))
+    pp_avg, pp_std = _avg_std(pp)
+    tg_avg, tg_std = _avg_std(tg)
+    return DepthPoint(pp_tokens, gen_tokens, pp_avg, tg_avg, pp_std, tg_std)
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +368,11 @@ def _fmt_tps(x: float) -> str:
     return f"{x:.0f}" if x >= 100 else f"{x:.1f}"
 
 
+def _fmt_tps_std(avg: float, std: float) -> str:
+    """llama-bench t/s column: `avg ± stddev`, two decimals."""
+    return f"{avg:.2f} ± {std:.2f}"
+
+
 def _render_depth_table(results: list[ModelResult]) -> Table | None:
     """pp/tg throughput. One depth renders pp{depth} / tg{gen} columns (one row
     per model); several render the depth-vs-throughput sweep."""
@@ -366,7 +390,11 @@ def _render_depth_table(results: list[ModelResult]) -> Table | None:
             if not mr.alloy_depths:
                 continue
             d = mr.alloy_depths[0]
-            t.add_row(mr.model, _fmt_tps(d.pp_tok_per_s), _fmt_tps(d.tg_tok_per_s))
+            t.add_row(
+                mr.model,
+                _fmt_tps_std(d.pp_tok_per_s, d.pp_tok_per_s_std),
+                _fmt_tps_std(d.tg_tok_per_s, d.tg_tok_per_s_std),
+            )
         return t
     t = Table(title="Depth sweep — pp / tg t/s vs cache depth",
               header_style="bold cyan", show_lines=False)
@@ -376,7 +404,11 @@ def _render_depth_table(results: list[ModelResult]) -> Table | None:
     t.add_column("tg t/s", justify="right", style="green")
     for mr in results:
         for ad in mr.alloy_depths or []:
-            t.add_row(mr.model, str(ad.depth), _fmt_tps(ad.pp_tok_per_s), _fmt_tps(ad.tg_tok_per_s))
+            t.add_row(
+                mr.model, str(ad.depth),
+                _fmt_tps_std(ad.pp_tok_per_s, ad.pp_tok_per_s_std),
+                _fmt_tps_std(ad.tg_tok_per_s, ad.tg_tok_per_s_std),
+            )
     return t
 
 
@@ -438,8 +470,8 @@ def main(argv: list[str] | None = None) -> int:
                         "several (e.g. 512 4096 16384) run a depth sweep.")
     p.add_argument("--depth-gen", type=int, default=128,
                    help="Decode length for the tg measurement in the depth sweep (default 128).")
-    p.add_argument("--reps", type=int, default=3,
-                   help="Timed repetitions per depth point; median reported (default 3).")
+    p.add_argument("--reps", type=int, default=5,
+                   help="Timed repetitions per depth point; mean ± stddev reported (default 5).")
     p.add_argument("--image", type=Path, default=None,
                    help="multimodal only: path to the image file to send each request.")
     p.add_argument("--mm-prompt", type=str, default=_DEFAULT_MM_PROMPT,
