@@ -50,9 +50,7 @@ from alloy_server.models.attention import current_use_alloy_warm_op
 
 logger = get_logger("alloy_torch.graph_cache")
 
-_CACHE_VERSION = (
-    6  # v6: drop debug-provenance node.meta (stack_trace etc.) — ~5x smaller payload
-)
+_CACHE_VERSION = 7
 _CACHE_DIR = pathlib.Path(
     os.environ.get(
         "ALLOY_FX_CACHE_DIR", str(pathlib.Path.home() / ".cache" / "alloy" / "fx_graphs")
@@ -61,21 +59,33 @@ _CACHE_DIR = pathlib.Path(
 
 # Sources whose changes alter the traced ATen graph. Kernel / emitter / fusion /
 # dispatch / rewrites / ops-handler edits do NOT appear here by design.
-_FINGERPRINT_FILES = (
-    "generation.py",
-    "cache.py",
-    "multi_token_attention.py",
-    "_custom_ops.py",
-    "_decomps.py",
-    "_qwen3_5_compat.py",
-    "_gemma4_compat.py",
-    "_gemma4_audio.py",
-    "embedding.py",
-    "mtp.py",
-    "_modality.py",
+_FINGERPRINT_PATHS = (
+    "alloy_server/generation",
+    "alloy_server/models",
+    "alloy_server/cache.py",
+    "alloy_server/embedding.py",
+    "alloy_torch/custom_ops.py",
+    "alloy_torch/decomps.py",
 )
 
 _source_fp: str | None = None
+
+
+def _fingerprint_roots() -> list[pathlib.Path]:
+    src = {
+        "alloy_server": pathlib.Path(__file__).parent.parent,
+        "alloy_torch": pathlib.Path(backend.__file__).parent.parent,
+    }
+    roots: list[pathlib.Path] = []
+    for entry in _FINGERPRINT_PATHS:
+        path = src[entry.split("/", 1)[0]] / entry
+        if not path.exists():
+            raise RuntimeError(
+                f"FX-graph-cache fingerprint path {entry!r} does not exist. A stale "
+                "path silently stops invalidating the cache — update _FINGERPRINT_PATHS."
+            )
+        roots.append(path)
+    return roots
 
 
 def _source_fingerprint() -> str:
@@ -85,11 +95,10 @@ def _source_fingerprint() -> str:
         h.update(
             f"v{_CACHE_VERSION}|torch={torch.__version__}|tf={transformers.__version__}".encode()
         )
-        pkg = pathlib.Path(__file__).parent
-        for name in _FINGERPRINT_FILES:
-            p = pkg / name
-            if p.exists():
-                h.update(name.encode())
+        for root in _fingerprint_roots():
+            files = sorted(root.rglob("*.py")) if root.is_dir() else [root]
+            for p in files:
+                h.update(p.name.encode())
                 h.update(p.read_bytes())
         _source_fp = h.hexdigest()[:16]
     return _source_fp
@@ -108,8 +117,12 @@ class GraphCapture:
         self.graphs: list[torch.fx.GraphModule] = []
         self.runs: dict[int, tuple[tuple, Any]] = {}
 
-    def note_graph(self, gm: torch.fx.GraphModule) -> None:
+    def note_graph(self, gm: torch.fx.GraphModule) -> int:
+        for i, seen in enumerate(self.graphs):
+            if seen is gm:
+                return i
         self.graphs.append(gm)
+        return len(self.graphs) - 1
 
     def note_run(self, gidx: int, args: tuple, out: Any) -> None:
         if gidx not in self.runs:

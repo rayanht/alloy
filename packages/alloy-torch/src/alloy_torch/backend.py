@@ -602,8 +602,10 @@ def _sanitized_graph_copy(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
 def _compile_fx(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]):
     _compile_t0 = time.perf_counter()
+    _captured_gm = None
     if _graph_capture_stack:
-        _graph_capture_stack[-1].note_graph(_sanitized_graph_copy(gm))
+        _captured_gm = _sanitized_graph_copy(gm)
+        _graph_capture_stack[-1].note_graph(_captured_gm)
     # Clear caches keyed by data pointers — torch recycles addresses from freed models
     _mm_batched_cache.clear()
     _alloy_buf_map.clear()
@@ -804,14 +806,13 @@ def _compile_fx(gm: torch.fx.GraphModule, example_inputs: Sequence[Any]):
     # _graph_cache can serialize an input spec (params/buffers vs caller kwargs vs
     # lifted constants) and the user-output index. Inert once the scope pops.
     final_fn = compiled
-    if _graph_capture_stack:
-        _cap = _graph_capture_stack[-1]
-        _gidx = len(_cap.graphs) - 1
+    if _captured_gm is not None:
 
-        def _capturing(*args, _inner=compiled, _cap=_cap, _gidx=_gidx):
+        def _capturing(*args, _inner=compiled, _gm=_captured_gm):
             out = _inner(*args)
-            if _graph_capture_stack and _graph_capture_stack[-1] is _cap:
-                _cap.note_run(_gidx, args, out)
+            if _graph_capture_stack:
+                cap = _graph_capture_stack[-1]
+                cap.note_run(cap.note_graph(_gm), args, out)
             return out
 
         final_fn = _capturing
