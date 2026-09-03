@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import ctypes
+import weakref
+from typing import TYPE_CHECKING
 
 import torch
 
 from alloy._compiler.dtypes import DType
+from alloy._runtime import _metal_ext
 from alloy._runtime.alloy_buffer import _compute_contiguous_strides
+
+if TYPE_CHECKING:
+    import numpy as np
 
 IR_TO_TORCH: dict[str, torch.dtype] = {
     "f16": torch.float16,
@@ -76,3 +82,33 @@ def make_tensor_from_ptr(
     offset_elems = byte_offset // itemsize
     view = torch.as_strided(flat, shape, strides_elem, offset_elems)
     return view.contiguous() if make_contiguous else view
+
+
+def alloy_empty(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """Uninitialized torch tensor whose storage is an alloy-owned Metal buffer.
+    The handle is released when the tensor's storage dies."""
+    elems = 1
+    for s in shape:
+        elems *= int(s)
+    nbytes = elems * dtype.itemsize
+    handle = _metal_ext.buf_alloc(nbytes)
+    raw = (ctypes.c_uint8 * nbytes).from_address(_metal_ext.buf_ptr(handle))
+    weakref.finalize(raw, release_handle, handle)
+    return torch.frombuffer(raw, dtype=dtype, count=elems).reshape(shape)
+
+
+def release_handle(handle: int) -> None:
+    try:
+        _metal_ext.buf_release(handle)
+    except Exception:
+        pass
+
+
+def alloy_tensor_from_numpy(arr: "np.ndarray") -> torch.Tensor:
+    """Copy `arr` into an alloy-owned Metal buffer and return a torch view of it."""
+    import numpy as np
+
+    src = np.ascontiguousarray(arr)
+    out = alloy_empty(tuple(src.shape), torch.from_numpy(np.empty(0, src.dtype)).dtype)
+    np.copyto(out.numpy(), src)
+    return out

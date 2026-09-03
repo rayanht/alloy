@@ -115,6 +115,12 @@ class KernelFunction:
         self._has_non_elem: bool = (
             has_non_elem_constructs(self._ast) if not self._is_tile else False
         )
+        self._is_elem: bool = (
+            self.name not in _NON_FUSABLE_ELEM_KERNELS
+            and not self._is_tile
+            and not self._has_tg_ops
+            and not self._has_non_elem
+        )
 
         self._buf_params: list[str] = [
             p for p in self._param_names if p not in self._constexpr_params

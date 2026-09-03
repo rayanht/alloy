@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from alloy._dispatch.buf_utils import (
-    _NON_FUSABLE_ELEM_KERNELS,
     _alloc_aligned,
     _alloc_phantom,
     _alloc_ptrs_this_run,
@@ -100,12 +99,7 @@ class LazyOp:
         self.write_bufs = set()
 
     def is_elem_op(self) -> bool:
-        k = self.kernel
-        if k.name in _NON_FUSABLE_ELEM_KERNELS:
-            return False
-        if not (not k._has_tg_ops and not k._has_non_elem and not k._is_tile):
-            return False
-        return True
+        return self.kernel._is_elem
 
 
 # ===================================================================

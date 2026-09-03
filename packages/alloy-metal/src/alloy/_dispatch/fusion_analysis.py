@@ -8,7 +8,6 @@ Pipeline: _plan_fusion(ops) → list[FusionPlan]
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, field
 
 from alloy._dispatch.buf_utils import _NON_FUSABLE_ELEM_KERNELS
@@ -79,9 +78,7 @@ def _primary_input_chains(consumer_op: LazyOp, producer_op: LazyOp) -> bool:
     if producer_out is None:
         return False
 
-    # Deepcopy to avoid mutating the cached op.func.
-    func = copy.deepcopy(consumer_op.func)
-    raw = extract_ir_transform(func)
+    raw = extract_ir_transform(consumer_op.func)
     if raw is None:
         return False
     _xf_ops, _load_name, _store_value, load_ptr, _store_ptr, extras = raw
@@ -302,6 +299,56 @@ def _branches_feed_gemms(
     )
 
 
+_NO_PLANNED: frozenset[int] = frozenset()
+
+
+def _chain_step(
+    ops: list[LazyOp], consumed_by: dict[int, list[int]], cur: int
+) -> int | None:
+    """Where a prologue walk standing on `cur` continues, ignoring `planned`."""
+    nc = consumed_by.get(cur, [])
+    if len(nc) == 1:
+        return nc[0]
+    if len(nc) == 2:
+        rc = _find_reconvergence(ops, consumed_by, nc, _NO_PLANNED)
+        if rc is not None:
+            after = consumed_by.get(rc[1], [])
+            if len(after) == 1:
+                return after[0]
+    return None
+
+
+def build_prologue_preds(
+    ops: list[LazyOp], consumed_by: dict[int, list[int]]
+) -> dict[int, list[int]]:
+    """Reverse edges of the prologue walk, so an anchor's candidate chain starts
+    come from a backward reachability walk rather than a scan of every earlier op."""
+    preds: dict[int, list[int]] = {}
+    for i, op in enumerate(ops):
+        if not op.is_elem_op():
+            continue
+        nxt = _chain_step(ops, consumed_by, i)
+        if nxt is not None:
+            preds.setdefault(nxt, []).append(i)
+    return preds
+
+
+def _prologue_candidates(
+    preds: dict[int, list[int]] | None, anchor_idx: int
+) -> list[int] | range:
+    if preds is None:
+        return range(anchor_idx)
+    seen: set[int] = set()
+    frontier = [anchor_idx]
+    while frontier:
+        node = frontier.pop()
+        for p in preds.get(node, ()):
+            if p < anchor_idx and p not in seen:
+                seen.add(p)
+                frontier.append(p)
+    return sorted(seen)
+
+
 def _find_best_prologue(
     ops: list[LazyOp],
     consumed_by: dict[int, list[int]],
@@ -309,6 +356,7 @@ def _find_best_prologue(
     anchor_idx: int,
     planned: set[int],
     roots: set[int] | None = None,
+    preds: dict[int, list[int]] | None = None,
 ) -> list[int]:
     """Find the longest absorbable prologue chain ending at anchor_idx.
 
@@ -318,7 +366,7 @@ def _find_best_prologue(
     """
     roots = roots or set()
     best: list[int] = []
-    for start in range(anchor_idx):
+    for start in _prologue_candidates(preds, anchor_idx):
         if start in planned or not ops[start].is_elem_op():
             continue
         if start in roots:
@@ -554,7 +602,7 @@ class AnchorFusionPass:
 
     def propose(self, context: FusionPassContext, state: FusionPassState) -> list[FusionGroup]:
         groups: list[FusionGroup] = []
-        candidates: list[tuple[int, int]] = []
+        candidates: list[int] = []
         for i, op in enumerate(context.ops):
             if (
                 op.is_elem_op()
@@ -564,18 +612,11 @@ class AnchorFusionPass:
                 continue
             if i in state.planned:
                 continue
-            pro = _find_best_prologue(
-                context.ops,
-                context.consumed_by,
-                context.op_idx,
-                i,
-                set(),
-                context.roots,
-            )
-            candidates.append((i, len(pro)))
-        candidates.sort(key=lambda x: x[0])
+            candidates.append(i)
 
-        for anchor_idx, _ in candidates:
+        preds = build_prologue_preds(context.ops, context.consumed_by)
+
+        for anchor_idx in candidates:
             if anchor_idx in state.planned:
                 continue
 
@@ -596,6 +637,7 @@ class AnchorFusionPass:
                         anchor_idx,
                         state.planned,
                         context.roots,
+                        preds,
                     )
             else:
                 pro_chain = _find_best_prologue(
@@ -605,6 +647,7 @@ class AnchorFusionPass:
                     anchor_idx,
                     state.planned,
                     context.roots,
+                    preds,
                 )
 
             epi_chain, extra_branches = _build_multi_epi(

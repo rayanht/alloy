@@ -23,6 +23,8 @@ import numpy as np
 import torch
 from transformers.modeling_utils import PreTrainedModel
 
+from alloy_torch.tensor_bridge import alloy_empty, alloy_tensor_from_numpy
+
 GGUFQuantization = Literal["q4_k", "q5_0", "q6_k", "q8_0"]
 
 GGUF_Q8_0_MM = torch.ops.alloy.gguf_q8_0_mm.default
@@ -304,7 +306,7 @@ def replace_linear_with_quantized(
     if quantization == "q4_k":
         # GGUF Q4_K is already 144-byte superblocks (out, blocks_per_row*144);
         # store the raw bytes — the kernel decodes them natively.
-        blocks = torch.from_numpy(np.array(weights, copy=True))
+        blocks = alloy_tensor_from_numpy(weights)
         parent._modules[child_name] = GGUFQ4_KLinear(
             blocks=blocks,
             in_features=child.in_features,
@@ -326,7 +328,7 @@ def replace_linear_with_quantized(
             bias=bias,
         )
     elif quantization == "q6_k":
-        qweight = torch.from_numpy(np.array(weights, copy=True))
+        qweight = alloy_tensor_from_numpy(weights)
         parent._modules[child_name] = GGUFQ6_KLinear(
             qweight=qweight,
             in_features=child.in_features,
@@ -365,7 +367,7 @@ def replace_embedding_with_quantized(
     embed_scale = float(child.scalar_embed_scale) if hasattr(child, "scalar_embed_scale") else 1.0
 
     if quantization == "q4_k":
-        blocks = torch.from_numpy(np.array(weights, copy=True))
+        blocks = alloy_tensor_from_numpy(weights)
         parent._modules[child_name] = GGUFQ4_KEmbedding(
             blocks=blocks,
             num_embeddings=child.num_embeddings,
@@ -400,7 +402,7 @@ def replace_embedding_with_quantized(
             embed_scale=embed_scale,
         )
     elif quantization == "q6_k":
-        qweight = torch.from_numpy(np.array(weights, copy=True))
+        qweight = alloy_tensor_from_numpy(weights)
         parent._modules[child_name] = GGUFQ6_KEmbedding(
             qweight=qweight,
             num_embeddings=child.num_embeddings,
@@ -488,9 +490,9 @@ def split_q5_0_weight(
     )
 
     return (
-        torch.from_numpy(np.array(qweight, copy=True)),
-        torch.from_numpy(np.array(qhigh, copy=True)),
-        torch.from_numpy(scales),
+        alloy_tensor_from_numpy(qweight),
+        alloy_tensor_from_numpy(qhigh),
+        alloy_tensor_from_numpy(scales),
     )
 
 
@@ -518,7 +520,7 @@ def split_q8_0_weight(
     scale_bytes = np.ascontiguousarray(blocks[:, :, :2])
     scales = np.array(scale_bytes.view(np.float16).reshape(out_features, groups), copy=True)
     qweight = np.array(blocks[:, :, 2:].reshape(out_features, in_features).view(np.int8), copy=True)
-    return torch.from_numpy(qweight), torch.from_numpy(scales)
+    return alloy_tensor_from_numpy(qweight), alloy_tensor_from_numpy(scales)
 
 
 def module_for_parameter(model: torch.nn.Module, hf_name: str) -> torch.nn.Module:
@@ -544,9 +546,11 @@ def module_parent(model: torch.nn.Module, module_path: str) -> tuple[torch.nn.Mo
 
 
 def torch_tensor_from_numpy(weights: np.ndarray, *, dtype: torch.dtype | None) -> torch.Tensor:
-    tensor = torch.from_numpy(np.array(weights, copy=True))
-    if tensor.is_floating_point() and dtype is not None:
-        return tensor.to(dtype=dtype)
+    tensor = alloy_tensor_from_numpy(weights)
+    if tensor.is_floating_point() and dtype is not None and tensor.dtype != dtype:
+        out = alloy_empty(tuple(tensor.shape), dtype)
+        out.copy_(tensor)
+        return out
     return tensor
 
 

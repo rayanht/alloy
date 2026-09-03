@@ -31,6 +31,8 @@ from transformers.modeling_gguf_pytorch_utils import (
     GGUFTensor,
 )
 
+from alloy_torch.tensor_bridge import alloy_empty, alloy_tensor_from_numpy
+
 from alloy_server.gguf.quant import module_for_parameter, module_parent
 from alloy_server.gguf.transformers_compat import BYPASS_CONFIG_FIXUPS
 from alloy_server.models.base import CausalLMHandler
@@ -380,11 +382,18 @@ def install_qwen35moe_experts(
         # gate/up: GGUF-native Q4_K (E, moe_intermediate, hidden_bytes). Row-concat
         # the raw superblocks along the output rows -> (E, 2*moe_intermediate, ...).
         # Bit-exact (no requantization) since gate/up rows are independent.
-        gate_blk = torch.from_numpy(np.array(by_name[gate_name].data, copy=True))
-        up_blk = torch.from_numpy(np.array(by_name[up_name].data, copy=True))
-        gate_up_blocks = torch.cat([gate_blk, up_blk], dim=1)
+        gate_np = np.ascontiguousarray(by_name[gate_name].data)
+        up_np = np.ascontiguousarray(by_name[up_name].data)
+        gate_rows = gate_np.shape[1]
+        gate_up_blocks = alloy_empty(
+            (gate_np.shape[0], gate_rows + up_np.shape[1], *gate_np.shape[2:]),
+            torch.from_numpy(np.empty(0, gate_np.dtype)).dtype,
+        )
+        concat_view = gate_up_blocks.numpy()
+        np.copyto(concat_view[:, :gate_rows], gate_np)
+        np.copyto(concat_view[:, gate_rows:], up_np)
         # down: Q6_K raw blocks (E, hidden, moe_intermediate_bytes), stacked as-is.
-        down_qweight = torch.from_numpy(np.array(by_name[down_name].data, copy=True))
+        down_qweight = alloy_tensor_from_numpy(by_name[down_name].data)
         experts = GGUFQwen35MoeExperts(
             gate_up_blocks=gate_up_blocks,
             down_qweight=down_qweight,

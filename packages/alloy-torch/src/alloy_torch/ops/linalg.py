@@ -4,6 +4,8 @@ from collections.abc import Sequence
 import ctypes
 from typing import cast
 
+import numpy as np
+
 from alloy._compiler.dtypes import float32
 from alloy._dispatch.buf_utils import _alloc_aligned, _alloc_scratch
 from alloy._dispatch.dispatch import _engine
@@ -806,17 +808,14 @@ def _pack_weight(w: AlloyBuffer, block_n: int, block_k: int) -> AlloyBuffer:
     """Repack (N, K) weight so each (BLOCK_N, BLOCK_K) tile is contiguous."""
     rows, cols = w.shape
     packed = _alloc_aligned((rows, cols), w.dtype)
-    src = w.data_ptr
-    dst = packed.data_ptr
     itemsize = w.dtype.itemsize
-    col_tiles = cols // block_k
-    row_bytes = block_k * itemsize
-    for tile_n in range(rows // block_n):
-        for tile_k in range(col_tiles):
-            dst_off = (tile_n * col_tiles + tile_k) * block_n * block_k * itemsize
-            for lane_n in range(block_n):
-                src_off = ((tile_n * block_n + lane_n) * cols + tile_k * block_k) * itemsize
-                ctypes.memmove(dst + dst_off + lane_n * row_bytes, src + src_off, row_bytes)
+    src = np.frombuffer(
+        (ctypes.c_uint8 * (rows * cols * itemsize)).from_address(w.data_ptr), dtype=np.uint8
+    ).reshape(rows // block_n, block_n, cols // block_k, block_k * itemsize)
+    dst = np.frombuffer(
+        (ctypes.c_uint8 * (rows * cols * itemsize)).from_address(packed.data_ptr), dtype=np.uint8
+    ).reshape(rows // block_n, cols // block_k, block_n, block_k * itemsize)
+    np.copyto(dst, src.transpose(0, 2, 1, 3))
     return packed
 
 
