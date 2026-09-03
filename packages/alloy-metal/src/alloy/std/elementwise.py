@@ -1,11 +1,15 @@
 """Generated elementwise kernels."""
 
+from collections.abc import Callable
+from typing import Any
+
 import alloy as al
+from alloy._dispatch.kernel import KernelFunction
 
 # --- Elementwise kernel templates ---
 
 
-def _make_elementwise_binary(name, op_fn):
+def _make_elementwise_binary(name: str, op_fn: Callable[[Any, Any], Any]) -> KernelFunction:
     @al.kernel
     def k(x, y, out: al.output, N: al.constexpr, BLOCK_SIZE: al.constexpr = 1024):
         pid = al.program_id(0)
@@ -20,7 +24,7 @@ def _make_elementwise_binary(name, op_fn):
     return k
 
 
-def _make_elementwise_unary(name, op_fn):
+def _make_elementwise_unary(name: str, op_fn: Callable[[Any], Any]) -> KernelFunction:
     @al.kernel
     def k(x, out: al.output, N: al.constexpr, BLOCK_SIZE: al.constexpr = 1024):
         pid = al.program_id(0)

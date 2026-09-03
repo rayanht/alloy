@@ -1,8 +1,8 @@
 """Linear algebra handlers for torch op lowering."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import ctypes
-from typing import cast
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -18,7 +18,6 @@ from alloy.std.quant import (
     dot_dequant,
     dot_dequant_silu,
     dot_q4_k,
-    dot_q4_k_silu,
     dot_q4_k_silu_v2,
     dot_q4_k_gelu_v2,
     dot_q4_k_silu_v2_rows,
@@ -34,7 +33,6 @@ from alloy.std.quant import (
     dot_q6_k_v2,
     dot_q6_k_v2_rows,
     dot_q8_0,
-    dot_q8_0_silu,
     dot_q8_0_silu_v2,
     dot_q8_0_silu_v2_rows,
     dot_q8_0_v2,
@@ -50,41 +48,6 @@ from alloy_torch.ops.concat import _cat
 from alloy_torch.ops.creation import _full
 from alloy_torch.ops.views import _select_int
 
-_dot = cast(KernelFunction, dot)
-_dot_dequant = cast(KernelFunction, dot_dequant)
-_dot_dequant_silu = cast(KernelFunction, dot_dequant_silu)
-_dot_q4_k = cast(KernelFunction, dot_q4_k)
-_dot_q4_k_silu = cast(KernelFunction, dot_q4_k_silu)
-_dot_q4_k_silu_v2 = cast(KernelFunction, dot_q4_k_silu_v2)
-_dot_q4_k_gelu_v2 = cast(KernelFunction, dot_q4_k_gelu_v2)
-_dot_q4_k_silu_v2_rows = cast(KernelFunction, dot_q4_k_silu_v2_rows)
-_dot_q4_k_v2 = cast(KernelFunction, dot_q4_k_v2)
-_dot_q4_k_v2_rows = cast(KernelFunction, dot_q4_k_v2_rows)
-_dot_mlx_q4 = cast(KernelFunction, dot_mlx_q4)
-_dot_mlx_q4_silu_v2 = cast(KernelFunction, dot_mlx_q4_silu_v2)
-_dot_mlx_q4_v2 = cast(KernelFunction, dot_mlx_q4_v2)
-_dot_mlx_q4_v2_rows = cast(KernelFunction, dot_mlx_q4_v2_rows)
-_dot_q5_0 = cast(KernelFunction, dot_q5_0)
-_dot_q5_0_v2 = cast(KernelFunction, dot_q5_0_v2)
-_dot_q6_k = cast(KernelFunction, dot_q6_k)
-_dot_q6_k_v2 = cast(KernelFunction, dot_q6_k_v2)
-_dot_q6_k_v2_rows = cast(KernelFunction, dot_q6_k_v2_rows)
-_dot_q8_0 = cast(KernelFunction, dot_q8_0)
-_dot_q8_0_silu = cast(KernelFunction, dot_q8_0_silu)
-_silu_mul = cast(KernelFunction, silu_mul)
-_gelu_tanh_mul = cast(KernelFunction, gelu_tanh_mul)
-_dot_q8_0_silu_v2 = cast(KernelFunction, dot_q8_0_silu_v2)
-_dot_q8_0_silu_v2_rows = cast(KernelFunction, dot_q8_0_silu_v2_rows)
-_dot_q8_0_v2 = cast(KernelFunction, dot_q8_0_v2)
-_dot_q8_0_v2_rows = cast(KernelFunction, dot_q8_0_v2_rows)
-_embedding_q4_k = cast(KernelFunction, embedding_q4_k)
-_embedding_mlx_q4 = cast(KernelFunction, embedding_mlx_q4)
-_embedding_q5_0 = cast(KernelFunction, embedding_q5_0)
-_embedding_q6_k = cast(KernelFunction, embedding_q6_k)
-_embedding_q8_0 = cast(KernelFunction, embedding_q8_0)
-_dot_transpose_lhs = cast(KernelFunction, dot_transpose_lhs)
-_dot_transpose_rhs = cast(KernelFunction, dot_transpose_rhs)
-_dot_transpose_rhs_silu = cast(KernelFunction, dot_transpose_rhs_silu)
 _mm_batched_cache: dict[tuple[int, ...], tuple[AlloyBuffer, list[int]]] = {}
 
 BatchedMMBiases = Sequence[AlloyBuffer | None] | None
@@ -198,7 +161,7 @@ def _alloy_batched_mm_handler(
         _mm_batched_cache[cache_key] = (concat_buf, sizes)
 
     out = _alloc_scratch((x.shape[0], concat_buf.shape[0]), x.dtype)
-    result = _dot_transpose_rhs(x, concat_buf, out)
+    result = dot_transpose_rhs(x, concat_buf, out)
     total_cols = sum(sizes)
 
     if biases is not None and any(bias is not None for bias in biases):
@@ -233,7 +196,7 @@ def _alloy_dequant_mm_handler(
     group_size: int,
 ) -> AlloyBuffer:
     out = _alloc_scratch((activations.shape[0], packed_weights.shape[0]), activations.dtype)
-    return _dot_dequant(
+    return dot_dequant(
         activations,
         packed_weights,
         scales,
@@ -270,7 +233,7 @@ def _alloy_batched_dequant_mm_handler(
         ctypes.memmove(concat_scales.data_ptr + byte_offset, scale.data_ptr, row_bytes)
         byte_offset += row_bytes
 
-    result = _dot_dequant(
+    result = dot_dequant(
         activations,
         concat_packed,
         concat_scales,
@@ -300,23 +263,23 @@ def _alloy_dot_silu_handler(
         up_out = _mm(x, up_weight)
         # silu_mul = silu(g)*up, NOT sigmoid(g)*up — keep the `g *` factor.
         fused_out = _alloc_scratch(gate_out.shape, gate_out.dtype)
-        return _silu_mul(gate_out, up_out, fused_out, N=gate_out.size).reshape(gate_out.shape)
+        return silu_mul(gate_out, up_out, fused_out, N=gate_out.size).reshape(gate_out.shape)
 
     rows = x.shape[0]
     gate_cols = gate_base.shape[0]
     out = _alloc_scratch((rows, gate_cols), x.dtype)
     if rows <= 8:
         # GEMV regime: the fused kernel's shared activation load wins.
-        return _dot_transpose_rhs_silu(x, gate_base, up_base, out, N_GATE=gate_cols)
+        return dot_transpose_rhs_silu(x, gate_base, up_base, out, N_GATE=gate_cols)
     # Tiled: two singles + silu_mul beat the fused dual-accumulator kernel
     # (1.05-1.07x at M=512/4096 — 3-shmem-tile + 2× acc-register occupancy cost).
     # The explicit silu_mul out keeps the handler's output dtype (auto-alloc
     # would promote f16 to f32).
     gate_out = _alloc_scratch((rows, gate_cols), x.dtype)
     silu_out = _alloc_scratch((rows, gate_cols), x.dtype)
-    g = _dot_transpose_rhs(x, gate_base, gate_out)
-    u = _dot_transpose_rhs(x, up_base, out)
-    return _silu_mul(g, u, silu_out, N=rows * gate_cols).reshape((rows, gate_cols))
+    g = dot_transpose_rhs(x, gate_base, gate_out)
+    u = dot_transpose_rhs(x, up_base, out)
+    return silu_mul(g, u, silu_out, N=rows * gate_cols).reshape((rows, gate_cols))
 
 
 def _alloy_dequant_silu_handler(
@@ -331,7 +294,7 @@ def _alloy_dequant_silu_handler(
     rows = x.shape[0]
     gate_cols = gate_packed.shape[0]
     out = _alloc_scratch((rows, gate_cols), x.dtype)
-    return _dot_dequant_silu(
+    return dot_dequant_silu(
         x,
         gate_packed,
         gate_scales,
@@ -345,212 +308,229 @@ def _alloy_dequant_silu_handler(
     )
 
 
-def _alloy_gguf_q8_0_mm_handler(
-    activations: AlloyBuffer,
-    qweight: AlloyBuffer,
-    scales: AlloyBuffer,
-) -> AlloyBuffer:
-    N = qweight.shape[0]
-    M = activations.shape[0]
-    out = _alloc_scratch((M, N), activations.dtype)
-    if M == 1:
-        nr0 = 4 if N % 4 == 0 else (2 if N % 2 == 0 else 1)
-        return _dot_q8_0_v2[(N // nr0,)](activations, qweight, scales, out, NR0=nr0)
-    if M <= 4 and qweight.shape[1] % 256 == 0:
-        # Small-M (MTP propose): dequant once, read weights once, all rows. At
-        # M >= 8 the tiled GEMM wins (rows is issue-bound: one program per
-        # output column).
-        return _dot_q8_0_v2_rows[(N,)](activations, qweight, scales, out)
-    return _dot_q8_0(activations, qweight, scales, out)
+Launch = Callable[[int], tuple[tuple[int, ...], dict[str, int]]]
+Weights = tuple[AlloyBuffer, ...]
 
 
-def _alloy_gguf_q8_0_silu_handler(
-    activations: AlloyBuffer,
-    gate_qweight: AlloyBuffer,
-    gate_scales: AlloyBuffer,
-    up_qweight: AlloyBuffer,
-    up_scales: AlloyBuffer,
-) -> AlloyBuffer:
-    N = gate_qweight.shape[0]
-    M = activations.shape[0]
-    out = _alloc_scratch((M, N), activations.dtype)
-    if M == 1:
-        nr0 = 4 if N % 4 == 0 else (2 if N % 2 == 0 else 1)
-        return _dot_q8_0_silu_v2[(N // nr0,)](
-            activations,
-            gate_qweight, gate_scales,
-            up_qweight, up_scales,
-            out,
-            NR0=nr0,
-        )
-    if M <= 4 and gate_qweight.shape[1] % 256 == 0:
-        # Small-M (MTP propose): dequant gate+up once, read each set once.
-        return _dot_q8_0_silu_v2_rows[(N,)](
-            activations,
-            gate_qweight, gate_scales,
-            up_qweight, up_scales,
-            out,
-        )
-    # Tiled prefill path: two SINGLE GEMMs + silu-mul beat the fused
-    # dual-accumulator kernel by ~9% (M=512: 2×1349 vs 2955µs; M=4096:
-    # 2×10192 vs 22826µs, 13.5 vs 12.0 TFLOPS) — the fused form holds 3 shmem
-    # tiles + 2× the acc registers, costing more in occupancy than the shared A
-    # pass saves. The GEMV paths above keep the fusion (the shared activation
-    # load dominates at M ≤ 8).
-    gate_out = _alloc_scratch((M, N), activations.dtype)
-    g = _dot_q8_0(activations, gate_qweight, gate_scales, gate_out)
-    u = _dot_q8_0(activations, up_qweight, up_scales, out)
-    return _silu_mul(g, u, N=M * N).reshape((M, N))
+def nr0_for(N: int) -> int:
+    return 4 if N % 4 == 0 else (2 if N % 2 == 0 else 1)
 
 
-def _alloy_gguf_q8_0_embedding_handler(
-    input_ids: AlloyBuffer,
-    qweight: AlloyBuffer,
-    scales: AlloyBuffer,
-) -> AlloyBuffer:
-    index_buf = input_ids.contiguous()
-    out = _alloc_scratch(input_ids.shape + (qweight.shape[1],), float32)
-    return _embedding_q8_0(
-        index_buf,
-        qweight,
-        scales,
-        out,
-        NUM_INDICES=index_buf.size,
-        WIDTH=qweight.shape[1],
-    )
+def launch_nr0(N: int) -> tuple[tuple[int, ...], dict[str, int]]:
+    nr0 = nr0_for(N)
+    return (N // nr0,), {"NR0": nr0}
 
 
-def _alloy_gguf_q5_0_mm_handler(
-    activations: AlloyBuffer,
-    qweight: AlloyBuffer,
-    qhigh: AlloyBuffer,
-    scales: AlloyBuffer,
-) -> AlloyBuffer:
-    M = activations.shape[0]
-    N = scales.shape[0]
-    out = _alloc_scratch((M, N), activations.dtype)
-    if M == 1:
-        # Decode: single-row split-K matvec with NR0 column-amortization.
-        nr0 = 4 if N % 4 == 0 else (2 if N % 2 == 0 else 1)
-        return _dot_q5_0_v2[(N // nr0, M)](
-            activations, qweight, qhigh, scales, out, NR0=nr0,
-        )
-    # Prefill chunks (M>1): tiled GEMM so the dequantized weight tile is read
-    # once and reused across all BLOCK_M rows (the matvec reloads the full
-    # weight matrix per row).
-    return _dot_q5_0(activations, qweight, qhigh, scales, out)
+def launch_q5_0(N: int) -> tuple[tuple[int, ...], dict[str, int]]:
+    nr0 = nr0_for(N)
+    return (N // nr0, 1), {"NR0": nr0}
 
 
-def _alloy_gguf_q5_0_embedding_handler(
-    input_ids: AlloyBuffer,
-    qweight: AlloyBuffer,
-    qhigh: AlloyBuffer,
-    scales: AlloyBuffer,
-) -> AlloyBuffer:
-    index_buf = input_ids.contiguous()
-    width = qweight.shape[1] * 2
-    out = _alloc_scratch(input_ids.shape + (width,), float32)
-    return _embedding_q5_0(
-        index_buf,
-        qweight,
-        qhigh,
-        scales,
-        out,
-        NUM_INDICES=index_buf.size,
-        WIDTH=width,
-    )
-
-
-def _q4k_matvec_cfg(N: int) -> tuple[int, int]:
+def launch_q4_k(N: int) -> tuple[tuple[int, ...], dict[str, int]]:
     """(NSG, NR0) for the native Q4_K decode matvec — N % (NSG*NR0) must be 0.
     Default NR0=2/NSG=2 (M4 Max)."""
-    if N % 4 == 0:
-        return 2, 2
-    if N % 2 == 0:
-        return 2, 1
-    return 1, 1
+    nsg, nr0 = (2, 2) if N % 4 == 0 else ((2, 1) if N % 2 == 0 else (1, 1))
+    return (N // (nsg * nr0),), {"NSG": nsg, "NR0": nr0}
 
 
-def _q4k_fused_cfg(N: int) -> tuple[int, int]:
+def launch_q4_k_fused(N: int) -> tuple[tuple[int, ...], dict[str, int]]:
     """(NSG, NR0) for the native Q4_K gate+up fused matvec (silu/gelu) —
     default NR0=1/NSG=2."""
-    if N % 2 == 0:
-        return 2, 1
-    return 1, 1
+    nsg, nr0 = (2, 1) if N % 2 == 0 else (1, 1)
+    return (N // (nsg * nr0),), {"NSG": nsg, "NR0": nr0}
 
 
-def _alloy_gguf_q4_k_mm_handler(
-    activations: AlloyBuffer,
-    blocks: AlloyBuffer,
-) -> AlloyBuffer:
-    N = blocks.shape[0]
-    M = activations.shape[0]
-    out = _alloc_scratch((M, N), activations.dtype)
-    if M == 1:
-        nsg, nr0 = _q4k_matvec_cfg(N)
-        return _dot_q4_k_v2[(N // (nsg * nr0),)](
-            activations, blocks, out, NSG=nsg, NR0=nr0
-        )
-    if M <= 4:
-        # Small-M only: the rows GEMV is issue-bound (one program per output
-        # column); at the DFlash verify width (M >= 8) the tiled GEMM is
-        # 1.3-2.4x faster.
-        return _dot_q4_k_v2_rows[(N,)](activations, blocks, out)
-    return _dot_q4_k(activations, blocks, out)
+def launch_q6_k(N: int) -> tuple[tuple[int, ...], dict[str, int]]:
+    """NUM_SPLITS=1: split-K regresses full-model decode — the shmem-barrier
+    K-reduction dominates at the vocab-wide lm_head."""
+    return (N,), {"NUM_SPLITS": 1}
 
 
-def _mlx_q4_cfg(N: int) -> tuple[int, int]:
+def launch_mlx_q4(N: int) -> tuple[tuple[int, ...], dict[str, int]]:
     """(NUM_SPLITS, NR0) for the affine int4 decode matvec — N % NR0 == 0. NR0=2
     beats 4 (fewer threadgroups hurt occupancy more than the extra activation reuse
     helps); NUM_SPLITS>1 regresses (the shmem-barrier K-reduction)."""
-    if N % 2 == 0:
-        return 1, 2
-    return 1, 1
+    return (N // (2 if N % 2 == 0 else 1),), {"NUM_SPLITS": 1, "NR0": 2 if N % 2 == 0 else 1}
 
 
-def _mlx_group_size(qweight: AlloyBuffer, scales: AlloyBuffer) -> int:
+def launch_per_column(N: int) -> tuple[tuple[int, ...], dict[str, int]]:
+    return (N,), {}
+
+
+def no_constexprs(weights: Weights) -> dict[str, int]:
+    return {}
+
+
+def mlx_group_size(weights: Weights) -> dict[str, int]:
     """group_size from the qweight/scales column counts."""
-    return (qweight.shape[1] * 2) // scales.shape[1]
+    return {"GROUP_SIZE": (weights[0].shape[1] * 2) // weights[1].shape[1]}
 
 
-def _alloy_mlx_q4_mm_handler(
-    activations: AlloyBuffer,
-    qweight: AlloyBuffer,
-    scales: AlloyBuffer,
-    biases: AlloyBuffer,
-) -> AlloyBuffer:
-    N = qweight.shape[0]
+def rows_always(weights: Weights) -> bool:
+    return True
+
+
+def rows_k_multiple_of_256(weights: Weights) -> bool:
+    return weights[0].shape[1] % 256 == 0
+
+
+@dataclass(frozen=True)
+class FusedQuantGemm:
+    matvec: KernelFunction
+    matvec_launch: Launch
+    rows: KernelFunction | None
+    epilogue: KernelFunction
+
+
+@dataclass(frozen=True)
+class QuantGemm:
+    """One quantized weight format's kernel set. `n_index` is the weight arg
+    whose dim 0 is N; `rows` is the M<=4 GEMV (None = straight to tiled)."""
+
+    n_index: int
+    tiled: KernelFunction
+    matvec: KernelFunction
+    matvec_launch: Launch
+    rows: KernelFunction | None
+    rows_ok: Callable[[Weights], bool]
+    embedding: KernelFunction
+    embed_width: Callable[[Weights], int]
+    constexprs: Callable[[Weights], dict[str, int]]
+    fused: dict[str, FusedQuantGemm]
+
+
+Q8_0 = QuantGemm(
+    n_index=0,
+    tiled=(dot_q8_0),
+    matvec=(dot_q8_0_v2),
+    matvec_launch=launch_nr0,
+    rows=(dot_q8_0_v2_rows),
+    rows_ok=rows_k_multiple_of_256,
+    embedding=(embedding_q8_0),
+    embed_width=lambda w: w[0].shape[1],
+    constexprs=no_constexprs,
+    fused={
+        "silu": FusedQuantGemm(
+            (dot_q8_0_silu_v2), launch_nr0,
+            (dot_q8_0_silu_v2_rows), silu_mul,
+        ),
+    },
+)
+
+Q5_0 = QuantGemm(
+    n_index=2,
+    tiled=(dot_q5_0),
+    matvec=(dot_q5_0_v2),
+    matvec_launch=launch_q5_0,
+    rows=None,
+    rows_ok=rows_always,
+    embedding=(embedding_q5_0),
+    embed_width=lambda w: w[0].shape[1] * 2,
+    constexprs=no_constexprs,
+    fused={},
+)
+
+Q4_K = QuantGemm(
+    n_index=0,
+    tiled=(dot_q4_k),
+    matvec=(dot_q4_k_v2),
+    matvec_launch=launch_q4_k,
+    rows=(dot_q4_k_v2_rows),
+    rows_ok=rows_always,
+    embedding=(embedding_q4_k),
+    embed_width=lambda w: (w[0].shape[1] // 144) * 256,
+    constexprs=no_constexprs,
+    fused={
+        "silu": FusedQuantGemm(
+            (dot_q4_k_silu_v2), launch_q4_k_fused,
+            (dot_q4_k_silu_v2_rows), silu_mul,
+        ),
+        "gelu": FusedQuantGemm(
+            (dot_q4_k_gelu_v2), launch_q4_k_fused, None, gelu_tanh_mul,
+        ),
+    },
+)
+
+Q6_K = QuantGemm(
+    n_index=0,
+    tiled=(dot_q6_k),
+    matvec=(dot_q6_k_v2),
+    matvec_launch=launch_q6_k,
+    rows=(dot_q6_k_v2_rows),
+    rows_ok=rows_always,
+    embedding=(embedding_q6_k),
+    embed_width=lambda w: (w[0].shape[1] // 210) * 256,
+    constexprs=no_constexprs,
+    fused={},
+)
+
+MLX_Q4 = QuantGemm(
+    n_index=0,
+    tiled=(dot_mlx_q4),
+    matvec=(dot_mlx_q4_v2),
+    matvec_launch=launch_mlx_q4,
+    rows=(dot_mlx_q4_v2_rows),
+    rows_ok=rows_always,
+    embedding=(embedding_mlx_q4),
+    embed_width=lambda w: w[0].shape[1] * 2,
+    constexprs=mlx_group_size,
+    fused={
+        "silu": FusedQuantGemm(
+            (dot_mlx_q4_silu_v2), launch_per_column, None, silu_mul,
+        ),
+    },
+)
+
+
+def quant_mm(fmt: QuantGemm, activations: AlloyBuffer, *weights: AlloyBuffer) -> AlloyBuffer:
+    """M == 1 is the decode matvec; M <= 4 (MTP propose) the rows GEMV, which is
+    issue-bound (one program per output column) and loses to the tiled GEMM from
+    the DFlash verify width (M >= 8) up."""
     M = activations.shape[0]
-    gs = _mlx_group_size(qweight, scales)
+    N = weights[fmt.n_index].shape[0]
     out = _alloc_scratch((M, N), activations.dtype)
+    extra = fmt.constexprs(weights)
     if M == 1:
-        nsplits, nr0 = _mlx_q4_cfg(N)
-        return _dot_mlx_q4_v2[(N // nr0,)](
-            activations, qweight, scales, biases, out, GROUP_SIZE=gs, NUM_SPLITS=nsplits, NR0=nr0
-        )
-    if M <= 4:
-        return _dot_mlx_q4_v2_rows[(N,)](activations, qweight, scales, biases, out, GROUP_SIZE=gs)
-    return _dot_mlx_q4(activations, qweight, scales, biases, out, GROUP_SIZE=gs)
+        grid, cx = fmt.matvec_launch(N)
+        return fmt.matvec[grid](activations, *weights, out, **extra, **cx)
+    if fmt.rows is not None and M <= 4 and fmt.rows_ok(weights):
+        return fmt.rows[(N,)](activations, *weights, out, **extra)
+    return fmt.tiled(activations, *weights, out, **extra)
 
 
-def _alloy_mlx_q4_embedding_handler(
-    input_ids: AlloyBuffer,
-    qweight: AlloyBuffer,
-    scales: AlloyBuffer,
-    biases: AlloyBuffer,
+def quant_mm_fused(
+    fmt: QuantGemm, variant: str, activations: AlloyBuffer, *weights: AlloyBuffer,
 ) -> AlloyBuffer:
+    """gate+up projection with the activation epilogue. The GEMV regimes keep the
+    fused kernel (the shared activation load dominates); tiled prefill runs two
+    single GEMMs + the epilogue, which beats the fused dual-accumulator kernel by
+    ~6-9% (3 shmem tiles + 2x the acc registers cost more occupancy than the
+    shared A pass saves)."""
+    fused = fmt.fused[variant]
+    half = len(weights) // 2
+    gate, up = weights[:half], weights[half:]
+    M = activations.shape[0]
+    N = gate[fmt.n_index].shape[0]
+    out = _alloc_scratch((M, N), activations.dtype)
+    extra = fmt.constexprs(gate)
+    if M == 1:
+        grid, cx = fused.matvec_launch(N)
+        return fused.matvec[grid](activations, *gate, *up, out, **extra, **cx)
+    if fused.rows is not None and M <= 4 and fmt.rows_ok(gate):
+        return fused.rows[(N,)](activations, *gate, *up, out, **extra)
+    gate_out = _alloc_scratch((M, N), activations.dtype)
+    g = fmt.tiled(activations, *gate, gate_out, **extra)
+    u = fmt.tiled(activations, *up, out, **extra)
+    return fused.epilogue(g, u, N=M * N).reshape((M, N))
+
+
+def quant_embedding(fmt: QuantGemm, input_ids: AlloyBuffer, *weights: AlloyBuffer) -> AlloyBuffer:
     index_buf = input_ids.contiguous()
-    width = qweight.shape[1] * 2
+    width = fmt.embed_width(weights)
     out = _alloc_scratch(input_ids.shape + (width,), float32)
-    return _embedding_mlx_q4(
-        index_buf,
-        qweight,
-        scales,
-        biases,
-        out,
-        NUM_INDICES=index_buf.size,
-        WIDTH=width,
-        GROUP_SIZE=_mlx_group_size(qweight, scales),
+    return fmt.embedding(
+        index_buf, *weights, out,
+        NUM_INDICES=index_buf.size, WIDTH=width, **fmt.constexprs(weights),
     )
 
 
@@ -627,181 +607,18 @@ def _resolve_concat(
     return concats, sizes
 
 
-def _alloy_batched_gguf_q4_k_mm_handler(
-    activations: AlloyBuffer,
-    blocks_list: Sequence[AlloyBuffer],
+def quant_mm_batched(
+    fmt: QuantGemm, activations: AlloyBuffer, *weight_lists: Sequence[AlloyBuffer],
 ) -> tuple[AlloyBuffer, ...]:
-    concats, sizes = _resolve_concat(blocks_list, ())
-    (concat_blk,) = concats
-    result = _alloy_gguf_q4_k_mm_handler(activations, concat_blk)
-    return _slice_batched_result(result, activations.shape[0], sizes)
-
-
-def _alloy_batched_gguf_q8_0_mm_handler(
-    activations: AlloyBuffer,
-    qweights: Sequence[AlloyBuffer],
-    scales_list: Sequence[AlloyBuffer],
-) -> tuple[AlloyBuffer, ...]:
-    concats, sizes = _resolve_concat(qweights, (scales_list,))
-    concat_qw, concat_sc = concats
-    result = _alloy_gguf_q8_0_mm_handler(activations, concat_qw, concat_sc)
-    return _slice_batched_result(result, activations.shape[0], sizes)
-
-
-def _alloy_batched_gguf_q5_0_mm_handler(
-    activations: AlloyBuffer,
-    qweights: Sequence[AlloyBuffer],
-    qhighs: Sequence[AlloyBuffer],
-    scales_list: Sequence[AlloyBuffer],
-) -> tuple[AlloyBuffer, ...]:
-    # Primary key by scales (defines N per weight); qweight and qhigh follow.
-    concats, sizes = _resolve_concat(scales_list, (qweights, qhighs))
-    concat_sc, concat_qw, concat_qh = concats
-    result = _alloy_gguf_q5_0_mm_handler(activations, concat_qw, concat_qh, concat_sc)
-    return _slice_batched_result(result, activations.shape[0], sizes)
-
-
-def _alloy_batched_gguf_q6_k_mm_handler(
-    activations: AlloyBuffer,
-    packed_weights: Sequence[AlloyBuffer],
-) -> tuple[AlloyBuffer, ...]:
-    concats, sizes = _resolve_concat(packed_weights, ())
-    (concat_pw,) = concats
-    result = _alloy_gguf_q6_k_mm_handler(activations, concat_pw)
-    return _slice_batched_result(result, activations.shape[0], sizes)
-
-
-def _alloy_batched_mlx_q4_mm_handler(
-    activations: AlloyBuffer,
-    qweights: Sequence[AlloyBuffer],
-    scales_list: Sequence[AlloyBuffer],
-    biases_list: Sequence[AlloyBuffer],
-) -> tuple[AlloyBuffer, ...]:
-    # Primary key by qweight (defines N per weight); scales and biases follow.
-    concats, sizes = _resolve_concat(qweights, (scales_list, biases_list))
-    concat_qw, concat_sc, concat_bi = concats
-    result = _alloy_mlx_q4_mm_handler(activations, concat_qw, concat_sc, concat_bi)
-    return _slice_batched_result(result, activations.shape[0], sizes)
-
-
-def _alloy_mlx_q4_silu_handler(
-    activations: AlloyBuffer,
-    gate_qweight: AlloyBuffer,
-    gate_scales: AlloyBuffer,
-    gate_biases: AlloyBuffer,
-    up_qweight: AlloyBuffer,
-    up_scales: AlloyBuffer,
-    up_biases: AlloyBuffer,
-) -> AlloyBuffer:
-    N = gate_qweight.shape[0]
-    M = activations.shape[0]
-    gs = _mlx_group_size(gate_qweight, gate_scales)
-    out = _alloc_scratch((M, N), activations.dtype)
-    if M == 1:
-        return _dot_mlx_q4_silu_v2[(N,)](
-            activations, gate_qweight, gate_scales, gate_biases,
-            up_qweight, up_scales, up_biases, out, GROUP_SIZE=gs,
-        )
-    # Prefill: two single GEMMs + silu_mul beat the fused kernel at large M.
-    gate_out = _alloc_scratch((M, N), activations.dtype)
-    g = _dot_mlx_q4(activations, gate_qweight, gate_scales, gate_biases, gate_out, GROUP_SIZE=gs)
-    u = _dot_mlx_q4(activations, up_qweight, up_scales, up_biases, out, GROUP_SIZE=gs)
-    return _silu_mul(g, u, N=M * N).reshape((M, N))
-
-
-def _alloy_gguf_q4_k_embedding_handler(
-    input_ids: AlloyBuffer,
-    blocks: AlloyBuffer,
-) -> AlloyBuffer:
-    index_buf = input_ids.contiguous()
-    width = (blocks.shape[1] // 144) * 256
-    out = _alloc_scratch(input_ids.shape + (width,), float32)
-    return _embedding_q4_k(
-        index_buf,
-        blocks,
-        out,
-        NUM_INDICES=index_buf.size,
-        WIDTH=width,
+    others = [i for i in range(len(weight_lists)) if i != fmt.n_index]
+    concats, sizes = _resolve_concat(
+        weight_lists[fmt.n_index], tuple(weight_lists[i] for i in others),
     )
-
-
-def _alloy_gguf_q6_k_mm_handler(
-    activations: AlloyBuffer,
-    packed_weights: AlloyBuffer,
-) -> AlloyBuffer:
-    M = activations.shape[0]
-    N = packed_weights.shape[0]
-    out = _alloc_scratch((M, N), activations.dtype)
-    if M == 1:
-        # NUM_SPLITS=1: split-K regresses full-model decode — the shmem-barrier
-        # K-reduction dominates at the vocab-wide lm_head.
-        return _dot_q6_k_v2[(N,)](activations, packed_weights, out, NUM_SPLITS=1)
-    if M <= 4:
-        return _dot_q6_k_v2_rows[(N,)](activations, packed_weights, out)
-    return _dot_q6_k(activations, packed_weights, out)
-
-
-def _alloy_gguf_q6_k_embedding_handler(
-    input_ids: AlloyBuffer,
-    packed_weights: AlloyBuffer,
-) -> AlloyBuffer:
-    index_buf = input_ids.contiguous()
-    width = (packed_weights.shape[1] // 210) * 256
-    out = _alloc_scratch(input_ids.shape + (width,), float32)
-    return _embedding_q6_k(
-        index_buf,
-        packed_weights,
-        out,
-        NUM_INDICES=index_buf.size,
-        WIDTH=width,
-    )
-
-
-def _alloy_gguf_q4_k_silu_handler(
-    activations: AlloyBuffer,
-    gate_blocks: AlloyBuffer,
-    up_blocks: AlloyBuffer,
-) -> AlloyBuffer:
-    N = gate_blocks.shape[0]
-    M = activations.shape[0]
-    out = _alloc_scratch((M, N), activations.dtype)
-    if M == 1:
-        nsg, nr0 = _q4k_fused_cfg(N)
-        return _dot_q4_k_silu_v2[(N // (nsg * nr0),)](
-            activations, gate_blocks, up_blocks, out, NSG=nsg, NR0=nr0
-        )
-    if M <= 4:
-        # Small-M only — see the q4_k mm route note above.
-        return _dot_q4_k_silu_v2_rows[(N,)](activations, gate_blocks, up_blocks, out)
-    # Tiled prefill path: two single GEMMs + silu_mul beat the fused
-    # dual-accumulator kernel (1.06-1.09x at M=512/4096) — same occupancy
-    # mechanism as the q8_0 unfuse above.
-    gate_out = _alloc_scratch((M, N), activations.dtype)
-    g = _dot_q4_k(activations, gate_blocks, gate_out)
-    u = _dot_q4_k(activations, up_blocks, out)
-    return _silu_mul(g, u, N=M * N).reshape((M, N))
-
-
-def _alloy_gguf_q4_k_gelu_handler(
-    activations: AlloyBuffer,
-    gate_blocks: AlloyBuffer,
-    up_blocks: AlloyBuffer,
-) -> AlloyBuffer:
-    # gelu_tanh mirror of _alloy_gguf_q4_k_silu_handler: gate+up GEMV with the
-    # gelu(gate)*up epilogue fused inline (no gate_up materialization).
-    N = gate_blocks.shape[0]
-    M = activations.shape[0]
-    out = _alloc_scratch((M, N), activations.dtype)
-    if M == 1:
-        nsg, nr0 = _q4k_fused_cfg(N)
-        return _dot_q4_k_gelu_v2[(N // (nsg * nr0),)](
-            activations, gate_blocks, up_blocks, out, NSG=nsg, NR0=nr0
-        )
-    # Prefill / M>1: two single GEMMs + gelu_tanh_mul (same rationale as silu).
-    gate_out = _alloc_scratch((M, N), activations.dtype)
-    g = _dot_q4_k(activations, gate_blocks, gate_out)
-    u = _dot_q4_k(activations, up_blocks, out)
-    return _gelu_tanh_mul(g, u, N=M * N).reshape((M, N))
+    weights: list[AlloyBuffer] = list(concats)
+    for i, concat in zip([fmt.n_index, *others], concats):
+        weights[i] = concat
+    result = quant_mm(fmt, activations, *weights)
+    return _slice_batched_result(result, activations.shape[0], sizes)
 
 
 def _pack_weight(w: AlloyBuffer, block_n: int, block_k: int) -> AlloyBuffer:
@@ -868,7 +685,7 @@ def _mm(lhs: AlloyBuffer, rhs: AlloyBuffer) -> AlloyBuffer:
         lhs_t_base, orig_rows = _pad_m_to_tile(lhs_t_base, 1)
         rows = lhs_t_base.shape[1]
         out = _alloc_scratch((rows, cols), lhs.dtype)
-        result = _dot_transpose_lhs(lhs_t_base, rhs, out)
+        result = dot_transpose_lhs(lhs_t_base, rhs, out)
         if rows != orig_rows:
             result = result.slice(0, 0, orig_rows)
         if squeeze_result:
@@ -908,14 +725,14 @@ def _mm(lhs: AlloyBuffer, rhs: AlloyBuffer) -> AlloyBuffer:
                 packed = _pack_weight(rhs_t_base, block_n, block_k)
                 _engine.untrack_alloc(packed.base_ptr)
         if packed is not None:
-            result = _dot_transpose_rhs(lhs, packed, out, _PACKED=1)
+            result = dot_transpose_rhs(lhs, packed, out, _PACKED=1)
         elif rows == 1:
             # M=1 decode: the tiled path tiles only N (32 threadgroups for a
             # 1024-wide projection) and starves the GPU. The matvec body is one
             # program per output column → grid (N,1,1), well-occupied at bandwidth.
-            result = _dot_transpose_rhs(lhs, rhs_t_base, out, _matvec=1)
+            result = dot_transpose_rhs(lhs, rhs_t_base, out, _matvec=1)
         else:
-            result = _dot_transpose_rhs(lhs, rhs_t_base, out)
+            result = dot_transpose_rhs(lhs, rhs_t_base, out)
         if rows != orig_rows:
             result = result.slice(0, 0, orig_rows)
     else:
@@ -935,7 +752,7 @@ def _mm(lhs: AlloyBuffer, rhs: AlloyBuffer) -> AlloyBuffer:
         bn = cfg.get("BLOCK_N", 64)
         bk = cfg.get("BLOCK_K", 16)
         grid = ((rows + bm - 1) // bm, (cols + bn - 1) // bn)
-        result = _dot[grid](lhs, rhs, out, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
+        result = dot[grid](lhs, rhs, out, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk)
         if rows != orig_rows:
             result = result.slice(0, 0, orig_rows)
 

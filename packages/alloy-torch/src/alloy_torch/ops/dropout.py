@@ -6,14 +6,12 @@ once per forward (so `torch.manual_seed` controls the masks), written by
 `refresh_dropout_seed`.
 """
 
-from typing import cast
 
 import torch
 
 from alloy._compiler.dtypes import int32
 from alloy._dispatch.buf_utils import _alloc_aligned, _alloc_scratch
 from alloy._dispatch.dispatch import _engine
-from alloy._dispatch.kernel import KernelFunction
 from alloy._runtime.alloy_buffer import AlloyBuffer
 from alloy.std.sampling import dropout_mask_apply
 
@@ -21,7 +19,6 @@ from alloy_torch.ops.casting import _to_copy
 from alloy_torch.ops.common import _numel
 from alloy_torch.ops.creation import _full
 
-_dropout_kernel = cast(KernelFunction, dropout_mask_apply)
 
 # One shared seed buffer for every dropout site, refreshed each forward.
 _DROPOUT_SEED: AlloyBuffer | None = None
@@ -62,7 +59,7 @@ def _native_dropout(
     out = _alloc_scratch(x.shape, x.dtype)
     mask = _alloc_scratch(x.shape, x.dtype)
     grid = ((n + 1023) // 1024,)
-    _dropout_kernel[grid](
+    dropout_mask_apply[grid](
         x.contiguous(), _dropout_seed_buffer(), out, mask,
         P=float(p), SCALE=1.0 / (1.0 - p), OFFSET=offset, N=n,
     )

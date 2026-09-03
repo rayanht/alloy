@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-from typing import cast
 
 from alloy._compiler.dtypes import float32
 from alloy._dispatch.buf_utils import _alloc_aligned, _alloc_scratch
-from alloy._dispatch.kernel import KernelFunction
 from alloy._runtime.alloy_buffer import AlloyBuffer
 from alloy.std.rope import (
     rms_norm_rope_strided,
@@ -20,12 +18,6 @@ from alloy_torch.ops.common import _root_flat_buf
 from alloy_torch.ops.concat import _cat
 from alloy_torch.ops.norms import _fused_rms_norm
 
-_ROPE_APPLY_KERNEL = cast(KernelFunction, rope_apply)
-_ROPE_APPLY_STRIDED_KERNEL = cast(KernelFunction, rope_apply_strided)
-_RMS_NORM_ROPE_STRIDED_KERNEL = cast(KernelFunction, rms_norm_rope_strided)
-_ROPE_APPLY_BACKWARD_KERNEL = cast(KernelFunction, rope_apply_backward)
-_ROPE_APPLY_BACKWARD_STRIDED_KERNEL = cast(KernelFunction, rope_apply_backward_strided)
-_ROPE_COS_SIN_KERNEL = cast(KernelFunction, rope_cos_sin)
 
 
 def _rope_table(
@@ -39,7 +31,7 @@ def _rope_table(
     inv_flat = inv_freq.reshape((half_d,))
     cos = _alloc_scratch((1, seq_len, half_d), float32)
     sin = _alloc_scratch((1, seq_len, half_d), float32)
-    _ROPE_COS_SIN_KERNEL[(seq_len,)](cp, inv_flat, cos, sin, HALF_D=half_d)
+    rope_cos_sin[(seq_len,)](cp, inv_flat, cos, sin, HALF_D=half_d)
     return cos, sin
 
 
@@ -98,7 +90,7 @@ def _fused_rms_norm_rope_canonical(
         cos_rows = cos_seq if cos_seq != rows else 0
 
         out_buf = _alloc_scratch((total_heads * seq_len, head_dim), x.dtype)
-        result = _RMS_NORM_ROPE_STRIDED_KERNEL[(seq_len, total_heads)](
+        result = rms_norm_rope_strided[(seq_len, total_heads)](
             base_buf,
             weight,
             flat_cos,
@@ -215,7 +207,7 @@ def _fused_rope_apply_canonical(
         total_heads = batch * heads
         out_buf = _alloc_scratch((total_heads * seq_len, head_dim), x.dtype)
         grid = (seq_len, total_heads)
-        result = _ROPE_APPLY_STRIDED_KERNEL[grid](
+        result = rope_apply_strided[grid](
             base_buf,
             flat_cos,
             flat_sin,
@@ -232,7 +224,7 @@ def _fused_rope_apply_canonical(
         )
     else:
         flat_x = x.reshape((rows, head_dim))
-        result = _ROPE_APPLY_KERNEL(flat_x, flat_cos, flat_sin, COS_ROWS=cos_rows)
+        result = rope_apply(flat_x, flat_cos, flat_sin, COS_ROWS=cos_rows)
 
     if len(shape) > 2:
         result = result.reshape(shape)
@@ -268,7 +260,7 @@ def _fused_rope_apply_backward(
         total_heads = batch * heads
         out_buf = _alloc_aligned((total_heads * seq_len, head_dim), dout.dtype)
         grid = (seq_len, total_heads)
-        result = _ROPE_APPLY_BACKWARD_STRIDED_KERNEL[grid](
+        result = rope_apply_backward_strided[grid](
             base_buf,
             flat_cos,
             flat_sin,
@@ -286,7 +278,7 @@ def _fused_rope_apply_backward(
         result = result.reshape((batch, seq_len, heads, head_dim)).transpose(1, 2)
     else:
         flat_dout = dout.reshape((rows, head_dim))
-        result = _ROPE_APPLY_BACKWARD_KERNEL(flat_dout, flat_cos, flat_sin, COS_ROWS=cos_rows)
+        result = rope_apply_backward(flat_dout, flat_cos, flat_sin, COS_ROWS=cos_rows)
         if len(shape) > 2:
             result = result.reshape(shape)
     return result

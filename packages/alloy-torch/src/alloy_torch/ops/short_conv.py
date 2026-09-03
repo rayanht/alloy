@@ -10,12 +10,10 @@ activation and the recurrent rule.
 
 from __future__ import annotations
 
-from typing import cast
 
 
 from alloy._compiler.dtypes import float32
 from alloy._dispatch.buf_utils import _alloc_scratch
-from alloy._dispatch.kernel import KernelFunction
 from alloy._runtime.alloy_buffer import AlloyBuffer
 from alloy.std.delta_net import (
     causal_conv1d_gated_decode,
@@ -25,10 +23,6 @@ from alloy.std.delta_net import (
 )
 from alloy_torch.ops.delta_net import _tape_dummy
 
-_CONV1D_PREFILL = cast(KernelFunction, causal_conv1d_with_state_prefill)
-_CONV1D_DECODE = cast(KernelFunction, causal_conv1d_with_state_decode)
-_CONV1D_GATED_DECODE = cast(KernelFunction, causal_conv1d_gated_decode)
-_CONV_STATE_REAL = cast(KernelFunction, conv_state_save_real_pos)
 
 
 def _short_conv_gated_handler(
@@ -48,7 +42,7 @@ def _short_conv_gated_handler(
     w_squeezed = conv1d_w.reshape((conv_dim, K))
     n_conv = batch_size * conv_dim
     out = _alloc_scratch((n_conv,), float32)
-    _CONV1D_GATED_DECODE[((n_conv + 255) // 256,)](
+    causal_conv1d_gated_decode[((n_conv + 255) // 256,)](
         bcx.reshape((batch_size * c3,)),
         w_squeezed.reshape((conv_dim * K,)),
         conv_state,
@@ -87,7 +81,7 @@ def _short_conv_update_handler(
     if has_previous_state and seq_len == 1:
         N_conv = batch_size * conv_dim
         out = _alloc_scratch((N_conv,), float32)
-        _CONV1D_DECODE[((N_conv + 255) // 256,)](
+        causal_conv1d_with_state_decode[((N_conv + 255) // 256,)](
             bx.reshape((N_conv,)),
             w_squeezed.reshape((conv_dim * K,)),
             conv_state,
@@ -102,7 +96,7 @@ def _short_conv_update_handler(
     out = _alloc_scratch((N_conv,), float32)
     # 2D grid (B*S, ceil(C/256)): position on axis-0 so the grid-shrink recipe
     # shrinks the conv to the real prompt length; axis-1 tiles the channels.
-    _CONV1D_PREFILL[(batch_size * seq_len, (conv_dim + 255) // 256)](
+    causal_conv1d_with_state_prefill[(batch_size * seq_len, (conv_dim + 255) // 256)](
         bx.reshape((N_conv,)),
         w_squeezed.reshape((conv_dim * K,)),
         _tape_dummy(),
@@ -120,7 +114,7 @@ def _short_conv_update_handler(
     # bytes). real_len is always supplied for prefill (computed from the layer
     # pad mask), so the conv state is carried to the next chunk / decode.
     if real_len is not None and seq_len > 1:
-        _CONV_STATE_REAL[((batch_size * conv_dim * K + 255) // 256,)](
+        conv_state_save_real_pos[((batch_size * conv_dim * K + 255) // 256,)](
             bx.reshape((N_conv,)),
             real_len.reshape((1,)),
             out,

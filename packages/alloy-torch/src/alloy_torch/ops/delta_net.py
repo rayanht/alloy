@@ -9,7 +9,6 @@ AOT autograd lifts the `.copy_()` and decode reads zero state).
 
 from __future__ import annotations
 
-from typing import cast
 
 import numpy as np
 import torch
@@ -17,16 +16,13 @@ import torch
 from alloy._compiler.dtypes import float32
 from alloy._dispatch.buf_utils import _alloc_aligned, _alloc_scratch
 from alloy._dispatch.dispatch import _engine
-from alloy._dispatch.kernel import KernelFunction
 from alloy._runtime.alloy_buffer import AlloyBuffer
 from alloy.std.delta_net import (
-    _conv_state_finalize_prefill,
     causal_conv1d_with_state_decode,
     causal_conv1d_with_state_prefill,
     chunked_gdr_stage1,
     chunked_gdr_stage2,
     conv_state_save_real_pos,
-    delta_net_gate_compute,
     l2norm_last_dim,
     recurrent_gated_delta_rule,
     recurrent_gdr_dvblock_save,
@@ -143,25 +139,13 @@ def gdr_verify_uses_reconstruct(s: int, dv: int) -> bool:
     return s > 1 and s % _GDR_C == 0 and dv % _GDR_DVB == 0
 
 
-_CONV1D_PREFILL = cast(KernelFunction, causal_conv1d_with_state_prefill)
-_CONV1D_FINALIZE = cast(KernelFunction, _conv_state_finalize_prefill)
-_CONV1D_DECODE = cast(KernelFunction, causal_conv1d_with_state_decode)
-_CONV_STATE_REAL = cast(KernelFunction, conv_state_save_real_pos)
-_SILU = cast(KernelFunction, silu_inplace)
-_L2NORM = cast(KernelFunction, l2norm_last_dim)
-_GATE = cast(KernelFunction, delta_net_gate_compute)
-_RECURRENT = cast(KernelFunction, recurrent_gated_delta_rule)
-_GDR_STAGE1 = cast(KernelFunction, chunked_gdr_stage1)
-_GDR_STAGE2 = cast(KernelFunction, chunked_gdr_stage2)
-_GDR_DVBLOCK_SAVE = cast(KernelFunction, recurrent_gdr_dvblock_save)
-_RMSGATED = cast(KernelFunction, rms_norm_gated)
 
 # Chunked (2-stage FLA) delta rule for prefill: ~2x the serial recurrent kernel
 # at qwen3.5's dims (DK=DV=128, NV=16). Stage 1 is fully parallel over NC×NV
 # chunks; stage 2 is the DV-blocked serial scan. Used when the prefill bucket is
 # a multiple of the chunk size. Decode (S=1) and small spec-verify widths
-# (MTP/PLD) stay on _RECURRENT; chunk-aligned verify widths (DFlash block 16)
-# dispatch _GDR_DVBLOCK_SAVE (serial numerics + reconstruct tees).
+# (MTP/PLD) stay on recurrent_gated_delta_rule; chunk-aligned verify widths (DFlash block 16)
+# dispatch recurrent_gdr_dvblock_save (serial numerics + reconstruct tees).
 _GDR_C = 8
 _GDR_DVB = 8
 
@@ -224,7 +208,7 @@ def _linear_attention_update_handler(
         qkv_post_conv = _alloc_scratch((N_conv,), float32)
         # Decode: mixed_qkv (B,1,C) flattens to (B*C,), the layout the decode
         # conv reads.
-        _CONV1D_DECODE[((N_conv + 255) // 256,)](
+        causal_conv1d_with_state_decode[((N_conv + 255) // 256,)](
             mixed_qkv.reshape((N_conv,)),
             w_squeezed.reshape((conv_dim * conv_kernel_size,)),
             conv_state,
@@ -246,7 +230,7 @@ def _linear_attention_update_handler(
             save_tape = 0
         # 2D grid (B*S, ceil(C/256)): position on axis-0 so the grid-shrink recipe
         # shrinks the conv to the real prompt length; axis-1 tiles the channels.
-        _CONV1D_PREFILL[(batch_size * seq_len, (conv_dim + 255) // 256)](
+        causal_conv1d_with_state_prefill[(batch_size * seq_len, (conv_dim + 255) // 256)](
             mixed_qkv.reshape((N_conv,)),
             w_squeezed.reshape((conv_dim * conv_kernel_size,)),
             tape,
@@ -263,7 +247,7 @@ def _linear_attention_update_handler(
         # schedule this after the conv kernel (otherwise topo-sort puts it
         # first → conv's pre-context reads pick up real-position bytes).
         if real_len is not None and seq_len > 1:
-            _CONV_STATE_REAL[((batch_size * conv_dim * conv_kernel_size + 255) // 256,)](
+            conv_state_save_real_pos[((batch_size * conv_dim * conv_kernel_size + 255) // 256,)](
                 mixed_qkv.reshape((N_conv,)),
                 real_len.reshape((1,)),
                 qkv_post_conv,
@@ -281,7 +265,7 @@ def _linear_attention_update_handler(
     # conv output so the grid-shrink recipe shrinks it.
     qkv_silu = _alloc_scratch((N_conv,), float32)
     pos_count = conv_out_shape[0] * conv_out_shape[1]
-    _SILU[(pos_count, (conv_dim + 255) // 256)](qkv_post_conv, qkv_silu, C=conv_dim)
+    silu_inplace[(pos_count, (conv_dim + 255) // 256)](qkv_post_conv, qkv_silu, C=conv_dim)
 
     # 4. The conv emits (B, S, C) — split q/k/v directly off dim 2 (the channel
     # dim). Each slice's `.contiguous()` extracts its contiguous (B*S, feat)
@@ -312,8 +296,8 @@ def _linear_attention_update_handler(
     # prefill recipe shrinks the launch to the real prompt length (1D (M_qk,)
     # buried M at the padded max). buffer row = pos*num_k_heads + head.
     bs = batch_size * actual_s
-    _L2NORM[(bs, num_k_heads)](q_flat.reshape((N_qk,)), q_l2, N=head_k_dim, HEADS=num_k_heads)
-    _L2NORM[(bs, num_k_heads)](k_flat.reshape((N_qk,)), k_l2, N=head_k_dim, HEADS=num_k_heads)
+    l2norm_last_dim[(bs, num_k_heads)](q_flat.reshape((N_qk,)), q_l2, N=head_k_dim, HEADS=num_k_heads)
+    l2norm_last_dim[(bs, num_k_heads)](k_flat.reshape((N_qk,)), k_l2, N=head_k_dim, HEADS=num_k_heads)
 
     # GVA-style head repeat is handled inside the recurrent kernel via the NK
     # constexpr — keeping q/k at NK-headed size avoids an expand+contiguous on
@@ -382,7 +366,7 @@ def _linear_attention_update_handler(
             num_v_heads, head_k_dim, head_v_dim, num_k_heads, batch_size,
         )
         rb = _GDR_ROUND_BUFS[recurrent_state.base_ptr]
-        _GDR_DVBLOCK_SAVE[(batch_size * num_v_heads * (head_v_dim // _GDR_DVB),)](
+        recurrent_gdr_dvblock_save[(batch_size * num_v_heads * (head_v_dim // _GDR_DVB),)](
             q_scaled.reshape((N_qk,)),
             k_l2.reshape((N_qk,)),
             v_flat.reshape((N_attn,)),
@@ -413,7 +397,7 @@ def _linear_attention_update_handler(
         # 2D grid (NC, B*NV): chunk on axis-0 so the grid-shrink recipe shrinks the
         # intra-chunk launch to ceil(real_len/C) chunks (the parallel stage-1
         # counterpart of stage-2's runtime NC loop bound).
-        _GDR_STAGE1[(NC, batch_size * num_v_heads)](
+        chunked_gdr_stage1[(NC, batch_size * num_v_heads)](
             q_scaled.reshape((N_qk,)),
             k_l2.reshape((N_qk,)),
             g,
@@ -433,7 +417,7 @@ def _linear_attention_update_handler(
             C=_GDR_C,
             HAS_REAL_LEN=1 if has_real_len else 0,
         )
-        _GDR_STAGE2[(batch_size * num_v_heads * (head_v_dim // _GDR_DVB),)](
+        chunked_gdr_stage2[(batch_size * num_v_heads * (head_v_dim // _GDR_DVB),)](
             v_flat.reshape((N_attn,)),
             beta,
             g,
@@ -455,7 +439,7 @@ def _linear_attention_update_handler(
             HAS_REAL_LEN=1 if has_real_len else 0,
         )
     else:
-        _RECURRENT[(batch_size * num_v_heads * head_v_dim,)](
+        recurrent_gated_delta_rule[(batch_size * num_v_heads * head_v_dim,)](
             q_scaled.reshape((N_qk,)),
             k_l2.reshape((N_qk,)),
             v_flat.reshape((N_attn,)),
@@ -479,7 +463,7 @@ def _linear_attention_update_handler(
     M_rg = batch_size * actual_s * num_v_heads
     N_rg = M_rg * head_v_dim
     out = _alloc_scratch((N_rg,), float32)
-    _RMSGATED[(batch_size * actual_s, num_v_heads)](
+    rms_norm_gated[(batch_size * actual_s, num_v_heads)](
         core_attn,
         z.contiguous().reshape((N_rg,)),
         norm_w.reshape((head_v_dim,)),

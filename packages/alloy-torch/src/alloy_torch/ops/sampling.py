@@ -6,11 +6,9 @@ decode plan's final kernel can be the sampler instead of `argmax_last_dim`.
 """
 
 import math
-from typing import cast
 
 from alloy._compiler.dtypes import float32, int64
 from alloy._dispatch.buf_utils import _alloc_aligned, _alloc_scratch
-from alloy._dispatch.kernel import KernelFunction
 from alloy._runtime.alloy_buffer import AlloyBuffer
 from alloy.std.sampling import (
     SAMPLE_SPLITS,
@@ -18,8 +16,6 @@ from alloy.std.sampling import (
     sample_categorical_split,
 )
 
-_sample_split = cast(KernelFunction, sample_categorical_split)
-_sample_combine = cast(KernelFunction, sample_categorical_combine)
 
 
 def _sample_categorical_handler(
@@ -40,6 +36,6 @@ def _sample_categorical_handler(
     partial_val = _alloc_scratch((rows, SAMPLE_SPLITS), float32)
     partial_idx = _alloc_scratch((rows, SAMPLE_SPLITS), float32)
     out = _alloc_aligned((rows,), int64)
-    _sample_split[(rows, SAMPLE_SPLITS)](flat, position, seed, params, partial_val, partial_idx)
-    result = _sample_combine[(rows,)](partial_val, partial_idx, out)
+    sample_categorical_split[(rows, SAMPLE_SPLITS)](flat, position, seed, params, partial_val, partial_idx)
+    result = sample_categorical_combine[(rows,)](partial_val, partial_idx, out)
     return result.reshape(logits.shape[:-1])

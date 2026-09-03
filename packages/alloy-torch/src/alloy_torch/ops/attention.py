@@ -43,36 +43,6 @@ from alloy_torch.extern_kv import note_extern_kv_write
 from alloy_torch.ops.casting import _to_copy
 from alloy_torch.ops.common import _expand_lazy_buffer, _root_flat_buf
 
-_ATTENTION_KV_UPDATE_KERNEL = cast(KernelFunction, attention_kv_update)
-_ATTENTION_KV_UPDATE_SPLIT_KERNEL = cast(KernelFunction, attention_kv_update_split)
-_ATTENTION_KV_UPDATE_SPLIT_MULTI_KERNEL = cast(KernelFunction, attention_kv_update_split_multi)
-_ATTENTION_KV_UPDATE_VECTOR_SPLIT_MULTI_KERNEL = cast(KernelFunction, attention_kv_update_vector_split_multi)
-_ATTENTION_DECODE_COMBINE_VECTOR_MULTI_KERNEL = cast(KernelFunction, attention_decode_combine_vector_multi)
-_ATTENTION_KV_WRITE_KERNEL = cast(KernelFunction, attention_kv_write)
-_ATTENTION_DECODE_VECTOR_SPLIT_KERNEL = cast(KernelFunction, attention_decode_vector_split)
-_ATTENTION_DECODE_COMBINE_KERNEL = cast(KernelFunction, attention_decode_combine)
-_ATTENTION_DECODE_COMBINE_VECTOR_KERNEL = cast(KernelFunction, attention_decode_combine_vector)
-_ATTENTION_DECODE_COMBINE_VECTOR_PAR_KERNEL = cast(KernelFunction, attention_decode_combine_vector_par)
-_ATTENTION_DECODE_COMBINE_MULTI_KERNEL = cast(KernelFunction, attention_decode_combine_multi)
-_ATTENTION_STRIDED_KERNEL = cast(KernelFunction, attention_strided)
-_ATTENTION_STRIDED_RUNTIME_POS_KERNEL = cast(KernelFunction, attention_strided_runtime_pos)
-_ATTENTION_STRIDED_RUNTIME_POS_SPLIT_KERNEL = cast(
-    KernelFunction, attention_strided_runtime_pos_split
-)
-_ATTENTION_COMBINE_SPLITS_KERNEL = cast(KernelFunction, attention_combine_splits)
-_ATTENTION_STRIDED_LSE_KERNEL = cast(KernelFunction, attention_strided_logsumexp)
-_ATTENTION_STRIDED_MASKED_LSE_KERNEL = cast(
-    KernelFunction, attention_strided_masked_by_batch_with_lse
-)
-_ATTENTION_DELTA_KERNEL = cast(KernelFunction, attention_compute_delta_strided)
-_ATTENTION_BACKWARD_DQ_KERNEL = cast(KernelFunction, attention_strided_backward_dq)
-_ATTENTION_BACKWARD_DKDV_KERNEL = cast(KernelFunction, attention_strided_backward_dkdv)
-_ATTENTION_BACKWARD_DQ_MASKED_KERNEL = cast(
-    KernelFunction, attention_strided_backward_dq_masked_by_batch
-)
-_ATTENTION_BACKWARD_DKDV_MASKED_KERNEL = cast(
-    KernelFunction, attention_strided_backward_dkdv_masked_by_batch
-)
 
 AttentionConstexprs = dict[str, int | float]
 AttentionBuffers = list[tuple[str, AlloyBuffer]]
@@ -447,7 +417,7 @@ def _gpu_sdpa(
 
     if mask_arr is None:
         strided_kwargs = _with_blocks(
-            _ATTENTION_STRIDED_KERNEL,
+            attention_strided,
             [
                 ("Q", q_flat),
                 ("K", k_flat),
@@ -455,7 +425,7 @@ def _gpu_sdpa(
                 ("O", out_buf),
             ],
         )
-        out = _ATTENTION_STRIDED_KERNEL(
+        out = attention_strided(
             q_flat,
             k_flat,
             v_flat,
@@ -466,12 +436,12 @@ def _gpu_sdpa(
             # Training / CPU-export path: emit lse via a second full attention
             # pass. Inference sets `need_lse=False` and skips this — lse on the
             # no-mask path costs one full extra K-loop per attention layer.
-            log_sum_exp = _ATTENTION_STRIDED_LSE_KERNEL(
+            log_sum_exp = attention_strided_logsumexp(
                 q_flat,
                 k_flat,
                 log_sum_exp_buf,
                 **_with_blocks(
-                    _ATTENTION_STRIDED_LSE_KERNEL,
+                    attention_strided_logsumexp,
                     [("Q", q_flat), ("K", k_flat), ("log_sum_exp", log_sum_exp_buf)],
                 ),
             )
@@ -479,7 +449,7 @@ def _gpu_sdpa(
             log_sum_exp = None
     else:
         masked_kwargs = _with_blocks(
-            _ATTENTION_STRIDED_MASKED_LSE_KERNEL,
+            attention_strided_masked_by_batch_with_lse,
             [
                 ("Q", q_flat),
                 ("K", k_flat),
@@ -491,7 +461,7 @@ def _gpu_sdpa(
         )
         out, log_sum_exp = cast(
             tuple[AlloyBuffer, AlloyBuffer],
-            _ATTENTION_STRIDED_MASKED_LSE_KERNEL(
+            attention_strided_masked_by_batch_with_lse(
                 q_flat,
                 k_flat,
                 v_flat,
@@ -722,7 +692,7 @@ def _gpu_sdpa_backward(
 
     delta = _alloc_aligned((total_q_heads * q_len,), float32)
     delta_grid = ((q_len + block - 1) // block, total_q_heads)
-    _ATTENTION_DELTA_KERNEL[delta_grid](
+    attention_compute_delta_strided[delta_grid](
         go_flat,
         out_flat,
         delta,
@@ -748,8 +718,8 @@ def _gpu_sdpa_backward(
     }
 
     if mask_arr is None:
-        dq_kernel = _ATTENTION_BACKWARD_DQ_KERNEL
-        dkdv_kernel = _ATTENTION_BACKWARD_DKDV_KERNEL
+        dq_kernel = attention_strided_backward_dq
+        dkdv_kernel = attention_strided_backward_dkdv
         dq_buf_args = [
             ("dO", go_flat),
             ("Q", q_flat),
@@ -770,8 +740,8 @@ def _gpu_sdpa_backward(
             ("dV", dv_root),
         ]
     else:
-        dq_kernel = _ATTENTION_BACKWARD_DQ_MASKED_KERNEL
-        dkdv_kernel = _ATTENTION_BACKWARD_DKDV_MASKED_KERNEL
+        dq_kernel = attention_strided_backward_dq_masked_by_batch
+        dkdv_kernel = attention_strided_backward_dkdv_masked_by_batch
         dq_buf_args = [
             ("dO", go_flat),
             ("Q", q_flat),
@@ -1034,7 +1004,7 @@ def _attention_kv_update_handler(
     if use_vector:
         partial_o = _alloc_scratch((total_heads, splits, head_dim), q.dtype)
         partial_lse = _alloc_scratch((total_heads, splits), q.dtype)
-        _ATTENTION_DECODE_VECTOR_SPLIT_KERNEL[(total_heads, splits)](
+        attention_decode_vector_split[(total_heads, splits)](
             q_base,
             nk_base,
             nv_base,
@@ -1067,7 +1037,7 @@ def _attention_kv_update_handler(
         # (>=32 ⇒ multiple of 32, the par kernel's lane tiling); otherwise the
         # serial one-TG-per-head combine.
         if splits >= 32:
-            result = _ATTENTION_DECODE_COMBINE_VECTOR_PAR_KERNEL[(total_heads, head_dim // 4)](
+            result = attention_decode_combine_vector_par[(total_heads, head_dim // 4)](
                 partial_o,
                 partial_lse,
                 out,
@@ -1077,7 +1047,7 @@ def _attention_kv_update_handler(
                 SPLITS=splits,
             )
         else:
-            result = _ATTENTION_DECODE_COMBINE_VECTOR_KERNEL[(total_heads,)](
+            result = attention_decode_combine_vector[(total_heads,)](
                 partial_o,
                 partial_lse,
                 out,
@@ -1097,7 +1067,7 @@ def _attention_kv_update_handler(
         block_m = 8
         partial_o = _alloc_scratch((total_heads, splits, block_m, head_dim), q.dtype)
         partial_lse = _alloc_scratch((total_heads, splits, block_m), q.dtype)
-        _ATTENTION_KV_UPDATE_SPLIT_KERNEL[(total_heads, splits)](
+        attention_kv_update_split[(total_heads, splits)](
             q_base,
             nk_base,
             nv_base,
@@ -1126,7 +1096,7 @@ def _attention_kv_update_handler(
             SLIDING_WINDOW=sliding_window,
             CUSTOM_SCALE=custom_scale,
         )
-        result = _ATTENTION_DECODE_COMBINE_KERNEL[(total_heads,)](
+        result = attention_decode_combine[(total_heads,)](
             partial_o,
             partial_lse,
             out,
@@ -1139,7 +1109,7 @@ def _attention_kv_update_handler(
         return result.reshape((batch, seq_len, heads, head_dim)).transpose(0, 2, 1, 3)
 
     grid = ((seq_len + 31) // 32, total_heads)
-    result = _ATTENTION_KV_UPDATE_KERNEL[grid](
+    result = attention_kv_update[grid](
         q_base,
         nk_base,
         nv_base,
@@ -1227,7 +1197,7 @@ def _spec_kv_write_handler(
     pos_buf = cache_pos
     if pos_buf._dtype.itemsize != 4:
         pos_buf = _to_copy(pos_buf, dtype=torch.int32)
-    _ATTENTION_KV_WRITE_KERNEL[(seq_len, kv_heads)](
+    attention_kv_write[(seq_len, kv_heads)](
         _root_flat_buf(k),
         _root_flat_buf(v),
         pos_buf,
@@ -1339,7 +1309,7 @@ def _attention_kv_update_multi_handler(
         # HEAD_DIM, not the row count — see attention_decode_combine_vector_multi.
         partial_o = _alloc_scratch((total_heads, K_INPUT, splits, head_dim), q.dtype)
         partial_lse = _alloc_scratch((total_heads, K_INPUT, splits), q.dtype)
-        _ATTENTION_KV_UPDATE_VECTOR_SPLIT_MULTI_KERNEL[(total_heads, splits)](
+        attention_kv_update_vector_split_multi[(total_heads, splits)](
             q_base,
             nk_base,
             nv_base,
@@ -1372,7 +1342,7 @@ def _attention_kv_update_multi_handler(
             CUSTOM_SCALE=custom_scale,
             BIDIR_BLOCK=1 if bidir_block else 0,
         )
-        result = _ATTENTION_DECODE_COMBINE_VECTOR_MULTI_KERNEL[(total_heads, K_INPUT)](
+        result = attention_decode_combine_vector_multi[(total_heads, K_INPUT)](
             partial_o,
             partial_lse,
             out,
@@ -1397,7 +1367,7 @@ def _attention_kv_update_multi_handler(
     partial_o = _alloc_scratch((total_heads, splits, block_m, head_dim), q.dtype)
     partial_lse = _alloc_scratch((total_heads, splits, block_m), q.dtype)
 
-    _ATTENTION_KV_UPDATE_SPLIT_MULTI_KERNEL[(total_heads, splits)](
+    attention_kv_update_split_multi[(total_heads, splits)](
         q_base,
         nk_base,
         nv_base,
@@ -1430,7 +1400,7 @@ def _attention_kv_update_multi_handler(
         SLIDING_WINDOW=sliding_window,
         CUSTOM_SCALE=custom_scale,
     )
-    result = _ATTENTION_DECODE_COMBINE_MULTI_KERNEL[(total_heads, K_INPUT)](
+    result = attention_decode_combine_multi[(total_heads, K_INPUT)](
         partial_o,
         partial_lse,
         out,
@@ -1495,7 +1465,7 @@ def _attention_prefill_cold_handler(
     if pos_buf._dtype.itemsize != 4:
         pos_buf = _to_copy(pos_buf, dtype=torch.int32)
 
-    _ATTENTION_KV_WRITE_KERNEL[(seq_len, kv_heads)](
+    attention_kv_write[(seq_len, kv_heads)](
         nk_base,
         nv_base,
         pos_buf,
@@ -1541,7 +1511,7 @@ def _attention_prefill_cold_handler(
         )
         tk_head_stride = seq_len * head_dim
         tk_seq_stride = head_dim
-        _ATTENTION_KV_WRITE_KERNEL[(seq_len, kv_heads)](
+        attention_kv_write[(seq_len, kv_heads)](
             nk_base,
             nv_base,
             pos_buf,
@@ -1620,7 +1590,7 @@ def _attention_prefill_cold_handler(
         "K_WRAP": 0,
     }
     block_m, block_n = _resolved_blocks_for_attention(
-        _ATTENTION_STRIDED_KERNEL,
+        attention_strided,
         strided_kwargs,
         [
             ("Q", q_base),
@@ -1632,7 +1602,7 @@ def _attention_prefill_cold_handler(
     )
     strided_kwargs["BLOCK_M"] = block_m
     strided_kwargs["BLOCK_N"] = block_n
-    _ATTENTION_STRIDED_KERNEL(
+    attention_strided(
         q_base,
         k_buf,
         v_buf,
@@ -1721,7 +1691,7 @@ def _attention_prefill_warm_handler(
     # layers own no K/V projection and attend the source layer's already-written
     # cache, so new_k/new_v are a throwaway shape-only view.
     if write_kv:
-        _ATTENTION_KV_WRITE_KERNEL[(K_INPUT, kv_heads)](
+        attention_kv_write[(K_INPUT, kv_heads)](
             nk_base,
             nv_base,
             pos_buf,
@@ -1797,7 +1767,7 @@ def _attention_prefill_warm_handler(
         "K_WRAP": sliding_window,
     }
     block_m, block_n = _resolved_blocks_for_attention(
-        _ATTENTION_STRIDED_RUNTIME_POS_KERNEL,
+        attention_strided_runtime_pos,
         strided_kwargs,
         [
             ("Q", q_base),
@@ -1840,7 +1810,7 @@ def _attention_prefill_warm_handler(
         partial_lse = _alloc_scratch((splits, total_heads, seq_len), f32)
         split_kwargs: AttentionConstexprs = {**strided_kwargs, "SPLITS": splits}
         sblock_m, sblock_n = _resolved_blocks_for_attention(
-            _ATTENTION_STRIDED_RUNTIME_POS_SPLIT_KERNEL,
+            attention_strided_runtime_pos_split,
             split_kwargs,
             [
                 ("Q", q_base),
@@ -1855,7 +1825,7 @@ def _attention_prefill_warm_handler(
         split_kwargs["BLOCK_M"] = sblock_m
         split_kwargs["BLOCK_N"] = sblock_n
         split_q_blocks = (seq_len + sblock_m - 1) // sblock_m
-        _ATTENTION_STRIDED_RUNTIME_POS_SPLIT_KERNEL[(split_q_blocks, total_heads, splits)](
+        attention_strided_runtime_pos_split[(split_q_blocks, total_heads, splits)](
             q_base,
             kc_base,
             vc_base,
@@ -1864,7 +1834,7 @@ def _attention_prefill_warm_handler(
             partial_lse,
             **split_kwargs,
         )
-        _ATTENTION_COMBINE_SPLITS_KERNEL[(seq_len, total_heads)](
+        attention_combine_splits[(seq_len, total_heads)](
             partial_o,
             partial_lse,
             out,
@@ -1875,7 +1845,7 @@ def _attention_prefill_warm_handler(
             SPLITS=splits,
         )
     else:
-        _ATTENTION_STRIDED_RUNTIME_POS_KERNEL(
+        attention_strided_runtime_pos(
             q_base,
             kc_base,
             vc_base,

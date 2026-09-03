@@ -2,14 +2,12 @@
 
 from collections.abc import Sequence
 import math
-from typing import cast
 
 import numpy as np
 import torch
 
 from alloy._compiler.dtypes import float32, from_torch_dtype, int64
 from alloy._dispatch.buf_utils import _alloc_aligned
-from alloy._dispatch.kernel import KernelFunction
 from alloy._runtime.alloy_buffer import AlloyBuffer
 from alloy._runtime.buffer_ops import _compare_nd, k_ne_nd
 from alloy.std.reductions import (
@@ -28,14 +26,6 @@ from alloy_torch.ops.linalg import _mm
 
 ReductionDim = int | Sequence[int] | None
 
-_mean = cast(KernelFunction, mean)
-_cross_entropy_fwd = cast(KernelFunction, cross_entropy_fused_fwd)
-_cross_entropy_bwd = cast(KernelFunction, cross_entropy_fused_bwd)
-_argmax_last_dim = cast(KernelFunction, argmax_last_dim)
-_reduce_any = cast(KernelFunction, reduce_any)
-_reduce_sum = cast(KernelFunction, reduce_sum)
-_reduce_max = cast(KernelFunction, reduce_max)
-_softmax_kernel = cast(KernelFunction, softmax)
 _cumsum_tril_cache: dict[tuple[int, str], AlloyBuffer] = {}
 
 
@@ -58,12 +48,12 @@ def _softmax(x: AlloyBuffer, dim: int = -1, half_to_float: bool = False) -> Allo
         return out.transpose(*inverse)
 
     if x.ndim == 1:
-        out = _softmax_kernel(x.reshape((1, x.shape[0])))
+        out = softmax(x.reshape((1, x.shape[0])))
         return out.reshape(x.shape)
 
     flat_rows = math.prod(x.shape[:-1])
     cols = x.shape[-1]
-    out = _softmax_kernel(x.reshape((flat_rows, cols)))
+    out = softmax(x.reshape((flat_rows, cols)))
     return out.reshape(x.shape)
 
 
@@ -76,7 +66,7 @@ def _argmax(x: AlloyBuffer, dim: int | None = None, keepdim: bool = False) -> Al
     if dim is None:
         flat = x.reshape((1, x.size))
         out = _alloc_aligned((1,), int64)
-        result = _argmax_last_dim(flat, out)
+        result = argmax_last_dim(flat, out)
         return result.reshape((1,)) if keepdim else result.reshape(())
 
     dim = _normalize_dim(dim, x.ndim)
@@ -86,7 +76,7 @@ def _argmax(x: AlloyBuffer, dim: int | None = None, keepdim: bool = False) -> Al
     outer = math.prod(x.shape[:-1]) if x.ndim > 1 else 1
     flat = x.reshape((outer, x.shape[-1]))
     out = _alloc_aligned((outer,), int64)
-    result = _argmax_last_dim(flat, out)
+    result = argmax_last_dim(flat, out)
     if keepdim:
         return result.reshape(x.shape[:-1] + (1,))
     return result.reshape(x.shape[:-1] if x.ndim > 1 else ())
@@ -104,7 +94,7 @@ def _mean_dim(
     ndim = len(shape)
     if dim is None:
         flat = x.reshape((x.size,))
-        return _mean(flat)
+        return mean(flat)
     if isinstance(dim, Sequence) and not isinstance(dim, str):
         if len(dim) != 1:
             raise RuntimeError(f"Alloy mean: multi-dim reduction {dim} not supported on GPU")
@@ -120,7 +110,7 @@ def _mean_dim(
     else:
         axes = [i for i in range(ndim) if i != dim] + [dim]
         flat = x.transpose(*axes).reshape((outer, dim_size))
-    reduced = _mean(flat, axis=1)
+    reduced = mean(flat, axis=1)
     out_shape = list(shape)
     if keepdim:
         out_shape[dim] = 1
@@ -176,7 +166,7 @@ def _sum_dim(
     shape = x.shape
     if dim is None or (isinstance(dim, Sequence) and not isinstance(dim, str) and len(dim) == 0):
         flat = x.reshape(1, x.size)
-        result = _reduce_sum(flat)
+        result = reduce_sum(flat)
         if not keepdim:
             return result.reshape(())
         return result.reshape(tuple(1 for _ in shape))
@@ -204,7 +194,7 @@ def _sum_dim(
             perm.append(perm.pop(reduce_dim))
             result = result.transpose(*perm)
         flat = result.reshape((remaining, reduced_size))
-        summed = _reduce_sum(flat, axis=1)
+        summed = reduce_sum(flat, axis=1)
         if keepdim:
             new_shape = current_shape[:reduce_dim] + (1,) + current_shape[reduce_dim + 1 :]
         else:
@@ -218,7 +208,7 @@ def _amax_dim(x: AlloyBuffer, dim: ReductionDim = None, keepdim: bool = False) -
     shape = x.shape
     if dim is None or (isinstance(dim, Sequence) and not isinstance(dim, str) and len(dim) == 0):
         flat = x.reshape(1, x.size)
-        result = _reduce_max(flat)
+        result = reduce_max(flat)
         return result.reshape(tuple(1 for _ in shape)) if keepdim else result.reshape(())
     if isinstance(dim, Sequence) and not isinstance(dim, str):
         dims = sorted((_normalize_dim(int(d), len(shape)) for d in dim), reverse=True)
@@ -239,7 +229,7 @@ def _amax_dim(x: AlloyBuffer, dim: ReductionDim = None, keepdim: bool = False) -
             perm.append(perm.pop(reduce_dim))
             result = result.transpose(*perm)
         flat = result.reshape((remaining, reduced_size))
-        reduced = _reduce_max(flat, axis=1)
+        reduced = reduce_max(flat, axis=1)
         if keepdim:
             new_shape = current_shape[:reduce_dim] + (1,) + current_shape[reduce_dim + 1 :]
         else:
@@ -262,7 +252,7 @@ def _any_dim(x: AlloyBuffer, dim: int, keepdim: bool = False) -> AlloyBuffer:
     else:
         axes = [i for i in range(ndim) if i != dim] + [dim]
         flat = x.transpose(*axes).reshape((outer, dim_size))
-    reduced = _reduce_any(flat, axis=1)
+    reduced = reduce_any(flat, axis=1)
     out_shape = list(shape)
     if keepdim:
         out_shape[dim] = 1
@@ -342,7 +332,7 @@ def _alloy_cross_entropy_fwd_fused_handler(
 
     per_row = _alloc_aligned((rows,), f32)
     lse = _alloc_aligned((rows,), f32)
-    _cross_entropy_fwd(
+    cross_entropy_fused_fwd(
         logits_2d,
         labels_1d,
         per_row,
@@ -383,7 +373,7 @@ def _alloy_cross_entropy_bwd_fused_handler(
     grad_scale = (grad_loss_flat / n_valid_flat).reshape((1,))
 
     d_logits = _alloc_aligned((rows, vocab), f32)
-    _cross_entropy_bwd(
+    cross_entropy_fused_bwd(
         logits_2d,
         labels_1d,
         lse,

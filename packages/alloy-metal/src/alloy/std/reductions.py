@@ -1,13 +1,21 @@
 """Reduction, softmax, and cross-entropy kernels."""
 
+from collections.abc import Callable
+from typing import Any
+
 import alloy as al
 from alloy._compiler.op_registry import (
     _reduce_num_groups,
     resolve_reduction_variant,
 )
-from alloy._compiler.trace import _active as _trace_active
+from alloy._compiler.trace import _active
+from alloy._dispatch.kernel import KernelFunction
 from alloy._runtime.alloy_buffer import AlloyBuffer
 from alloy._runtime.convert import to_alloy_buffer
+
+ReduceFn = Callable[[Any, Any], Any]
+FinalizeFn = Callable[[Any], Any]
+ReduceDispatch = Callable[..., AlloyBuffer]
 
 
 @al.tunable(BLOCK_SIZE=[128, 256, 512, 1024])
@@ -168,7 +176,10 @@ def cross_entropy_fused_bwd(
 # --- Reduction kernel templates (closure-based, no string exec) ---
 
 
-def _make_flat_reduce(name, init_val, combine_fn, finalize_fn, other_val=0.0, mean=False):
+def _make_flat_reduce(
+    name: str, init_val: float, combine_fn: ReduceFn, finalize_fn: FinalizeFn,
+    other_val: float = 0.0, mean: bool = False,
+) -> KernelFunction:
     @al.kernel
     def k(
         x,
@@ -195,7 +206,10 @@ def _make_flat_reduce(name, init_val, combine_fn, finalize_fn, other_val=0.0, me
     return k
 
 
-def _make_row_reduce(name, init_val, combine_fn, finalize_fn, other_val=0.0, mean=False):
+def _make_row_reduce(
+    name: str, init_val: float, combine_fn: ReduceFn, finalize_fn: FinalizeFn,
+    other_val: float = 0.0, mean: bool = False,
+) -> KernelFunction:
     @al.kernel
     def k(x, out: al.output, M: al.constexpr, N: al.constexpr, BLOCK_SIZE: al.constexpr = 256):
         row = al.program_id(0)
@@ -215,7 +229,10 @@ def _make_row_reduce(name, init_val, combine_fn, finalize_fn, other_val=0.0, mea
     return k
 
 
-def _make_col_reduce(name, init_val, combine_fn, finalize_fn, other_val=0.0, mean=False):
+def _make_col_reduce(
+    name: str, init_val: float, combine_fn: ReduceFn, finalize_fn: FinalizeFn,
+    other_val: float = 0.0, mean: bool = False,
+) -> KernelFunction:
     @al.kernel
     def k(x, out: al.output, M: al.constexpr, N: al.constexpr, BLOCK_SIZE: al.constexpr = 256):
         col = al.program_id(0)
@@ -237,7 +254,7 @@ def _make_col_reduce(name, init_val, combine_fn, finalize_fn, other_val=0.0, mea
 
 # --- Reduction kernel instances ---
 
-_reduction_kernels = {
+_reduction_kernels: dict[str, KernelFunction] = {
     "reduce_sum": _make_flat_reduce("reduce_sum", 0.0, lambda a, v: a + v, lambda a: al.sum(a)),
     "reduce_max": _make_flat_reduce(
         "reduce_max", -1e30, lambda a, v: al.maximum(a, v), lambda a: al.max(a), -1e30
@@ -284,12 +301,14 @@ def _mean_div(x_ptr, out_ptr: al.output, N_DIV: al.constexpr):
     al.store(out_ptr + offs, v / N_DIV)
 
 
-def _make_reduce_dispatch(op_name):
+def _make_reduce_dispatch(op_name: str) -> ReduceDispatch:
     """Create a dispatch function for a reduction op (e.g. al.reduce_sum)."""
 
-    def dispatch(x, *, axis=None, BLOCK_SIZE=256, **kwargs):
+    def dispatch(
+        x: Any, *, axis: int | None = None, BLOCK_SIZE: int = 256, **kwargs: int | float | bool,
+    ) -> AlloyBuffer:
         # Inside a trace: call the variant kernel directly for inlining
-        if _trace_active():
+        if _active():
             M = None if axis is None else 1  # just needs non-None to trigger row/col
             variant = resolve_reduction_variant(op_name, M=M, axis=axis if axis is not None else 1)
             return _reduction_kernels[variant](x, **kwargs)

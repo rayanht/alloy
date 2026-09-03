@@ -3,22 +3,22 @@
 from __future__ import annotations
 
 import math
-from typing import cast
 
 import torch
 
 from alloy._compiler.dtypes import float16, uint32
 from alloy._dispatch.buf_utils import _alloc_scratch
-from alloy._dispatch.kernel import KernelFunction
 from alloy._runtime.alloy_buffer import AlloyBuffer
+from alloy.std.attention import (
+    attention_decode_combine_vector,
+    attention_decode_combine_vector_par,
+)
 from alloy.std.kv_quant import (
     attention_decode_vector_split_q8,
     kv_dequant_q8_range,
     kv_quantize_q8_range,
 )
 from alloy_torch.ops.attention import (
-    _ATTENTION_DECODE_COMBINE_VECTOR_KERNEL,
-    _ATTENTION_DECODE_COMBINE_VECTOR_PAR_KERNEL,
     _attention_cache_handler,
     _choose_flash_decoding_splits,
     _no_bound_buf,
@@ -26,10 +26,6 @@ from alloy_torch.ops.attention import (
 from alloy_torch.extern_kv import note_extern_kv_write
 from alloy_torch.ops.casting import _to_copy
 from alloy_torch.ops.common import _root_flat_buf
-
-_KV_QUANTIZE_Q8_RANGE_KERNEL = cast(KernelFunction, kv_quantize_q8_range)
-_KV_DEQUANT_Q8_RANGE_KERNEL = cast(KernelFunction, kv_dequant_q8_range)
-_ATTENTION_DECODE_VECTOR_SPLIT_Q8_KERNEL = cast(KernelFunction, attention_decode_vector_split_q8)
 
 
 def _strides_elems(buf: AlloyBuffer) -> tuple[tuple[int, ...], int]:
@@ -104,7 +100,7 @@ def _attention_cache_q8_handler(
             (new_v, v_codes_root, v_scales_root),
         ):
             n_strides, n_offset = _strides_elems(new)
-            _KV_QUANTIZE_Q8_RANGE_KERNEL[(kv_heads, seq_len)](
+            kv_quantize_q8_range[(kv_heads, seq_len)](
                 _root_flat_buf(new),
                 pos_buf,
                 last_real if last_real is not None else _no_bound_buf(),
@@ -138,7 +134,7 @@ def _attention_cache_q8_handler(
             (k_codes_root, k_scales_root, k_scratch),
             (v_codes_root, v_scales_root, v_scratch),
         ):
-            _KV_DEQUANT_Q8_RANGE_KERNEL[(kv_heads, (s_max + 63) // 64)](
+            kv_dequant_q8_range[(kv_heads, (s_max + 63) // 64)](
                 codes_root,
                 scales_root,
                 pos_buf,
@@ -193,7 +189,7 @@ def _attention_cache_q8_handler(
     partial_lse = _alloc_scratch((total_heads, splits), q.dtype)
 
     codes_u32 = head_dim // 32 == 16  # PER_LANE==16 (D=512): uint4-packed loads
-    _ATTENTION_DECODE_VECTOR_SPLIT_Q8_KERNEL[(total_heads, splits)](
+    attention_decode_vector_split_q8[(total_heads, splits)](
         _root_flat_buf(q),
         _root_flat_buf(new_k),
         _root_flat_buf(new_v),
@@ -232,9 +228,9 @@ def _attention_cache_q8_handler(
         CODES_U32=1 if codes_u32 else 0,
     )
     combine = (
-        _ATTENTION_DECODE_COMBINE_VECTOR_PAR_KERNEL
+        attention_decode_combine_vector_par
         if splits >= 32
-        else _ATTENTION_DECODE_COMBINE_VECTOR_KERNEL
+        else attention_decode_combine_vector
     )
     grid = (total_heads, head_dim // 4) if splits >= 32 else (total_heads,)
     result = combine[grid](

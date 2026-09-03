@@ -1,15 +1,12 @@
 """Convolution handlers for torch op lowering."""
 
 from collections.abc import Sequence
-from typing import cast
 
 from alloy._dispatch.buf_utils import _alloc_aligned
-from alloy._dispatch.kernel import KernelFunction
 from alloy._runtime.alloy_buffer import AlloyBuffer
 from alloy.std.gemm import dot_transpose_rhs
 from alloy.std.indexing import depthwise_conv1d, im2col_1d, im2col_2d
 
-_dot_transpose_rhs = cast(KernelFunction, dot_transpose_rhs)
 
 
 def _convolution(
@@ -99,7 +96,7 @@ def _convolution(
         col = col_lazy.reshape((batch * out_len, channel_kernel))
 
         flat_w = weight.reshape((out_c, channel_kernel))
-        gemm_out = _dot_transpose_rhs(flat_w, col)
+        gemm_out = dot_transpose_rhs(flat_w, col)
 
         if batch == 1:
             result = gemm_out.reshape((1, out_c, out_len))
@@ -156,7 +153,7 @@ def _convolution(
 
         flat_w = weight.reshape((out_c, channel_kernel))
         out = _alloc_aligned((out_c, batch * out_h * out_w), x.dtype)
-        gemm_out = _dot_transpose_rhs(flat_w, col, out)
+        gemm_out = dot_transpose_rhs(flat_w, col, out)
 
         if batch == 1:
             result = gemm_out.reshape((1, out_c, out_h, out_w))

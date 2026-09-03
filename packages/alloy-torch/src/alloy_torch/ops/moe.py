@@ -31,11 +31,9 @@ _producer is overwritten by the GEMM, so the zero would otherwise be dead-code-e
 and a pool-recycled y would start as garbage) and orders it before the accumulation.
 """
 
-from typing import cast
 
 from alloy._compiler.dtypes import float32, int32
 from alloy._dispatch.buf_utils import _alloc_scratch
-from alloy._dispatch.kernel import KernelFunction
 from alloy._runtime.alloy_buffer import AlloyBuffer
 from alloy.std.moe import (
     moe_combine_rows,
@@ -55,21 +53,6 @@ from alloy.std.moe import (
     moe_zero_f32,
 )
 
-_MOE_ROUTER_TOPK = cast(KernelFunction, moe_router_topk)
-_MOE_GATE_UP_SILU = cast(KernelFunction, moe_gate_up_silu)
-_MOE_DOWN_COMBINE = cast(KernelFunction, moe_down_combine)
-_MOE_GATE_UP_GROUPED = cast(KernelFunction, moe_gate_up_grouped)
-_MOE_DOWN_GROUPED = cast(KernelFunction, moe_down_grouped)
-_MOE_DOWN_GROUPED_PARTIAL = cast(KernelFunction, moe_down_grouped_partial)
-_MOE_COMBINE_ROWS = cast(KernelFunction, moe_combine_rows)
-_MOE_COUNT_FROM_BLOCKS = cast(KernelFunction, moe_sort_count_from_blocks)
-_MOE_SORT_OFFSETS = cast(KernelFunction, moe_sort_offsets)
-_MOE_TILE_EXPERT = cast(KernelFunction, moe_tile_expert)
-_MOE_BLOCK_COUNT = cast(KernelFunction, moe_sort_block_count)
-_MOE_BLOCK_OFF = cast(KernelFunction, moe_sort_block_off)
-_MOE_PERM_SCAN = cast(KernelFunction, moe_sort_perm_scan)
-_MOE_ROW_TOKENS = cast(KernelFunction, moe_row_tokens)
-_MOE_ZERO_F32 = cast(KernelFunction, moe_zero_f32)
 
 # Grouped-GEMM tile rows == sort padding granularity. 8 = MMA floor (lowest padding
 # at the ~4 tokens/expert of a 128-token chunk). MUST equal moe_*_grouped's BLOCK_M.
@@ -129,7 +112,7 @@ def _gguf_moe_routed_handler(
     idx = _alloc_scratch((R,), int32)
     weights = _alloc_scratch((R,), float32)
     active = _alloc_scratch((1,), int32)
-    _MOE_ROUTER_TOPK[(T,)](
+    moe_router_topk[(T,)](
         router_logits, idx, weights, active,
         NUM_EXPERTS=num_experts, TOP_K=top_k, BLOCK=_next_pow2(num_experts),
     )
@@ -137,12 +120,12 @@ def _gguf_moe_routed_handler(
     if T == 1:
         # Decode: gathered GEMV (no token grouping to exploit).
         h = _alloc_scratch((R, I), float32)
-        _MOE_GATE_UP_SILU[(R, I)](
+        moe_gate_up_silu[(R, I)](
             hidden, gate_up_blocks, idx, h,
             K=H, MOE_INTER=I, TOP_K=top_k,
         )
         y = _alloc_scratch((T, H), float32)
-        _MOE_DOWN_COMBINE[(T, H)](
+        moe_down_combine[(T, H)](
             h, down_qweight, idx, weights, y,
             HID=H, MOE_INTER=I, TOP_K=top_k,
         )
@@ -161,22 +144,22 @@ def _gguf_moe_routed_handler(
     # is O(R²) — 25.3 ms/layer at the 4096-chunk, 23% of qwen3.6:35b prefill).
     nb = _cdiv(R, _SORT_B)
     block_count = _alloc_scratch((nb * num_experts,), int32)
-    _MOE_BLOCK_COUNT[(nb * num_experts,)](
+    moe_sort_block_count[(nb * num_experts,)](
         idx, active, block_count,
         R_TOTAL=R, SORT_B=_SORT_B, NUM_EXPERTS=num_experts, TOP_K=top_k,
     )
     count = _alloc_scratch((num_experts,), int32)
-    _MOE_COUNT_FROM_BLOCKS[(num_experts,)](
+    moe_sort_count_from_blocks[(num_experts,)](
         block_count, active, count,
         R_TOTAL=R, SORT_B=_SORT_B, NUM_EXPERTS=num_experts, TOP_K=top_k,
     )
     row_off = _alloc_scratch((num_experts,), int32)
     total = _alloc_scratch((1,), int32)
-    _MOE_SORT_OFFSETS[(1,)](count, row_off, total, NUM_EXPERTS=num_experts, PAD_M=pad)
+    moe_sort_offsets[(1,)](count, row_off, total, NUM_EXPERTS=num_experts, PAD_M=pad)
     tile_e = _alloc_scratch((max_tiles,), int32)
-    _MOE_TILE_EXPERT[(max_tiles,)](row_off, count, tile_e, NUM_EXPERTS=num_experts, PAD_M=pad)
+    moe_tile_expert[(max_tiles,)](row_off, count, tile_e, NUM_EXPERTS=num_experts, PAD_M=pad)
     block_off = _alloc_scratch((nb * num_experts,), int32)
-    _MOE_BLOCK_OFF[(num_experts,)](
+    moe_sort_block_off[(num_experts,)](
         block_count, row_off, block_off, NB=nb, NUM_EXPERTS=num_experts,
     )
     perm = _alloc_scratch((max_rows,), int32)   # only active positions written; pad rows unread
@@ -186,14 +169,14 @@ def _gguf_moe_routed_handler(
     # from the fully-overwritten COUNT/ROW_OFF/TOTAL_ROWS, never trusting pad garbage) into the
     # two per-row gather/scatter index buffers the grouped GEMMs consume.
     row_token = _alloc_scratch((max_rows,), int32)
-    _MOE_PERM_SCAN[(R,)](
+    moe_sort_perm_scan[(R,)](
         idx, block_off, perm, inv, row_token,
         TOP_K=top_k, SORT_B=_SORT_B, NUM_EXPERTS=num_experts,
     )
     tok_ld = _alloc_scratch((max_rows,), int32)  # gather-load index: pads clamped to row 0
     tok_st = _alloc_scratch((max_rows,), int32)  # scatter-store index: pads = sentinel >= T
     w_row = _alloc_scratch((max_rows,), float32)  # routing weight per sorted row: pads = 0
-    _MOE_ROW_TOKENS[(_cdiv(max_rows, 256),)](
+    moe_row_tokens[(_cdiv(max_rows, 256),)](
         row_token, perm, weights, tile_e, row_off, count, total, tok_ld, tok_st, w_row,
         PAD_M=pad, MAX_ROWS=max_rows, R_TOTAL=R, BLOCK=256,
     )
@@ -205,7 +188,7 @@ def _gguf_moe_routed_handler(
     # (gave 6 of max_tiles), so the grid is set here from max_tiles and the (fixed) BLOCK_N.
     bn, bk = _GROUPED_BN, _GROUPED_BK
     h = _alloc_scratch((max_rows, I), float32)
-    _MOE_GATE_UP_GROUPED[(max_tiles, _cdiv(I, bn))](
+    moe_gate_up_grouped[(max_tiles, _cdiv(I, bn))](
         hidden, gate_up_blocks, perm, tok_ld, tile_e, total,
         w_row, h,
         K=H, MOE_INTER=I, BLOCK_M=pad, BLOCK_N=bn, BLOCK_K=bk,
@@ -217,13 +200,13 @@ def _gguf_moe_routed_handler(
     # reads.
     if T <= _DET_COMBINE_MAX_T:
         partial = _alloc_scratch((max_rows, H), float32)
-        _MOE_DOWN_GROUPED_PARTIAL[(max_tiles, _cdiv(H, bn))](
+        moe_down_grouped_partial[(max_tiles, _cdiv(H, bn))](
             h, down_qweight, perm, tile_e, total, partial,
             HID=H, MOE_INTER=I, MAX_ROWS=max_rows,
             BLOCK_M=pad, BLOCK_N=bn, BLOCK_K=bk,
         )
         y = _alloc_scratch((T, H), float32)
-        _MOE_COMBINE_ROWS[(T, _cdiv(H, 256))](
+        moe_combine_rows[(T, _cdiv(H, 256))](
             partial, inv, y, HID=H, TOP_K=top_k, BLOCK=256,
         )
         return y
@@ -232,7 +215,7 @@ def _gguf_moe_routed_handler(
     # Y[TOK_ST[rm]] (reduce="add" scatter-accumulate epilogue) — no global (MAX_ROWS, H)
     # partial buffer (the other 17GB at native) and no separate combine pass.
     y = _alloc_scratch((T, H), float32)
-    _MOE_ZERO_F32[(_cdiv(T * H, 1024),)](y, N=T * H, BLOCK=1024)
+    moe_zero_f32[(_cdiv(T * H, 1024),)](y, N=T * H, BLOCK=1024)
     # Y_DEP must be a VIEW taken AFTER the zero: the down call overwrites y's _producer,
     # so passing y itself as the dep would make the zero unreachable from the output walk
     # (DCE — it only "worked" because fresh Metal pages happen to be zero; a pooled run-1
@@ -242,7 +225,7 @@ def _gguf_moe_routed_handler(
     y_dep = y.slice(0, 0, 1)
     # y passed BOTH as Y_DEP (input — the atomic scatter is a read-modify-write; the
     # declared read orders the zero before the GEMM) and as Y_OUT (the accumulated output).
-    _MOE_DOWN_GROUPED[(max_tiles, _cdiv(H, bn))](
+    moe_down_grouped[(max_tiles, _cdiv(H, bn))](
         h, down_qweight, perm, tok_st, tile_e, total, y_dep, y,
         HID=H, MOE_INTER=I, T_ROWS=T, MAX_ROWS=max_rows, BLOCK_M=pad, BLOCK_N=bn, BLOCK_K=bk,
     )

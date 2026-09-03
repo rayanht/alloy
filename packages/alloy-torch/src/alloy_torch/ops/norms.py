@@ -4,13 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import math
-from typing import cast
 
 import torch
 
 from alloy._compiler.dtypes import from_torch_dtype
 from alloy._dispatch.buf_utils import _alloc_aligned, _alloc_scratch
-from alloy._dispatch.kernel import KernelFunction
 from alloy._runtime.alloy_buffer import AlloyBuffer
 from alloy.std.gemm import dot_transpose_rhs
 from alloy.std.norm import layernorm, rms_norm, rms_norm_backward
@@ -23,11 +21,6 @@ from alloy_torch.ops.linalg import _addmm, _mm
 NormalizedShape = int | Sequence[int]
 LayerNormArg = NormalizedShape | AlloyBuffer | None
 
-_LAYER_NORM_KERNEL = cast(KernelFunction, layernorm)
-_MEAN_KERNEL = cast(KernelFunction, mean)
-_DOT_TRANSPOSE_RHS_KERNEL = cast(KernelFunction, dot_transpose_rhs)
-_RMS_NORM_KERNEL = cast(KernelFunction, rms_norm)
-_RMS_NORM_BACKWARD_KERNEL = cast(KernelFunction, rms_norm_backward)
 
 
 def _normalize_layer_shape(value: LayerNormArg) -> tuple[int, ...]:
@@ -69,7 +62,7 @@ def _native_group_norm(
 
     ones = _full((elems_per_group,), 1, dtype=x._dtype.to_torch_dtype())
     zeros_buf = _full((elems_per_group,), 0, dtype=x._dtype.to_torch_dtype())
-    normed = _LAYER_NORM_KERNEL(flat, ones, zeros_buf, EPS=eps)
+    normed = layernorm(flat, ones, zeros_buf, EPS=eps)
 
     normed = normed.reshape((N, C, HxW))
     if weight is not None:
@@ -105,12 +98,12 @@ def _native_layer_norm(
 
     gamma = _full((cols,), 1, dtype=x._dtype.to_torch_dtype()) if weight is None else weight
     beta = _full((cols,), 0, dtype=x._dtype.to_torch_dtype()) if bias is None else bias
-    out = _LAYER_NORM_KERNEL(flat, gamma, beta, EPS=eps)
+    out = layernorm(flat, gamma, beta, EPS=eps)
 
     # Use E[X^2] - E[X]^2 instead of mean((x - mean)^2): the broadcast-subtract
     # plus row-wise reduce chain mis-reduces at cols < 64.
-    row_mean = _MEAN_KERNEL(flat, axis=1)
-    ex2 = _MEAN_KERNEL(flat * flat, axis=1)
+    row_mean = mean(flat, axis=1)
+    ex2 = mean(flat * flat, axis=1)
     var = ex2 - row_mean * row_mean
     rstd_flat = (var.reshape(rows, 1) + eps).rsqrt()
 
@@ -167,7 +160,7 @@ def _fused_gemm_layernorm(
         res_result = gemm_out
 
     flat_res = res_result.reshape((rows, cols))
-    ln_out = _LAYER_NORM_KERNEL(flat_res, gamma, beta, EPS=eps)
+    ln_out = layernorm(flat_res, gamma, beta, EPS=eps)
     ln_result = ln_out.reshape(original_shape)
     res_result = (
         res_result.reshape(original_shape) if res_result.shape != original_shape else res_result
@@ -199,7 +192,7 @@ def _fused_gemm_rmsnorm(
         original_shape = buf_x.shape[:-1] + (cols,)
 
     out = _alloc_scratch((rows, cols), flat_x.dtype)
-    gemm_out = _DOT_TRANSPOSE_RHS_KERNEL(flat_x, buf_bt, out)
+    gemm_out = dot_transpose_rhs(flat_x, buf_bt, out)
     res_sum = gemm_out + flat_res
     rms_out, rsqrt = _fused_rms_norm(res_sum, flat_weight, eps=eps)
     rms_result = rms_out.reshape(original_shape)
@@ -250,7 +243,7 @@ def _fused_rms_norm(
     flat_w = weight.reshape((cols,))
     out_buf = _alloc_scratch((rows, cols), flat_x.dtype)
     rsqrt_buf = _alloc_scratch((rows,), f32)
-    _RMS_NORM_KERNEL(flat_x, flat_w, out_buf, rsqrt_buf, EPS=eps)
+    rms_norm(flat_x, flat_w, out_buf, rsqrt_buf, EPS=eps)
     result = out_buf
     out_dtype = weight.dtype
     if out_dtype != result._dtype:
@@ -276,7 +269,7 @@ def _fused_rms_norm_backward(
     flat_w = weight.reshape((cols,))
     flat_rrms = rrms.reshape((rows,))
     out_buf = _alloc_aligned((rows, cols), flat_dy.dtype)
-    _RMS_NORM_BACKWARD_KERNEL(flat_x, flat_dy, flat_w, flat_rrms, out_buf)
+    rms_norm_backward(flat_x, flat_dy, flat_w, flat_rrms, out_buf)
     if len(shape) > 2:
         out_buf = out_buf.reshape(shape)
     return out_buf
