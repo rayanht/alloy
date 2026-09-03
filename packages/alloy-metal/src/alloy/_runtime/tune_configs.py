@@ -187,15 +187,8 @@ _CONSERVATIVE_DEFAULTS: dict[str, StaticConfig] = {
     "rms_norm": StaticConfig({"BLOCK_SIZE": 256}),
     "cross_entropy": StaticConfig({"BLOCK_SIZE": 256}),
     "attention": StaticConfig({"BLOCK_M": 32, "BLOCK_N": 64}, {"fuse_loops": 0}),
-    "attention_masked_by_batch": StaticConfig({"BLOCK_M": 32, "BLOCK_N": 64}, {"fuse_loops": 0}),
     "attention_strided": StaticConfig({"BLOCK_M": 32, "BLOCK_N": 64}, {"fuse_loops": 0}),
-    "attention_strided_masked_by_batch": StaticConfig(
-        {"BLOCK_M": 32, "BLOCK_N": 64}, {"fuse_loops": 0}
-    ),
     "attention_strided_logsumexp": StaticConfig(
-        {"BLOCK_M": 32, "BLOCK_N": 32}, {"fuse_loops": 0}
-    ),
-    "attention_strided_logsumexp_masked_by_batch": StaticConfig(
         {"BLOCK_M": 32, "BLOCK_N": 32}, {"fuse_loops": 0}
     ),
     # Prefill attention used by the alloy serve path. Without a conservative
@@ -204,9 +197,6 @@ _CONSERVATIVE_DEFAULTS: dict[str, StaticConfig] = {
     # `_compute_reference` either fails to compile or runs the wrong code,
     # and the candidate sweep ends up validating against a poisoned reference.
     "attention_strided_masked_by_batch_with_lse": StaticConfig(
-        {"BLOCK_M": 32, "BLOCK_N": 32}, {"fuse_loops": 0}
-    ),
-    "attention_strided_with_lse": StaticConfig(
         {"BLOCK_M": 32, "BLOCK_N": 32}, {"fuse_loops": 0}
     ),
     # SDPA bwd: 8×8 is the only block size that fits f32 shmem at HEAD_DIM=128

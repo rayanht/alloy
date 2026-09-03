@@ -71,7 +71,34 @@ class ScriptedDrafter:
         pass
 
 
+class MirrorDrafter(ScriptedDrafter):
+    def __init__(self, tokens: list[int]) -> None:
+        super().__init__(tokens)
+        self.mirror: list[int] = []
+        self.snapshots = 0
+        self.restores = 0
+
+    def observe(self, tokens, taps: TapBatch | None, start: int) -> None:
+        super().observe(tokens, taps, start)
+        end = start + len(tokens)
+        if len(self.mirror) < end:
+            self.mirror.extend([0] * (end - len(self.mirror)))
+        self.mirror[start:end] = tokens
+
+    def truncate(self, length: int) -> None:
+        del self.mirror[length:]
+
+    def snapshot_head(self, rows: int):
+        self.snapshots += 1
+        return list(self.mirror[:rows])
+
+    def restore_head(self, snap) -> None:
+        self.restores += 1
+        self.mirror[: len(snap)] = snap
+
+
 PROMPT = torch.tensor([[5, 6, 7, 8] * 8], dtype=torch.long)
+SIDE_PROMPT = torch.tensor([[9, 8, 7, 6, 5, 4, 3, 2, 1, 0]], dtype=torch.long)
 
 
 def test_session_commits_exactly_max_new_tokens() -> None:
@@ -110,6 +137,24 @@ def test_session_round_bookkeeping_with_padding() -> None:
         assert r.proposed <= 2
     # proposed counts real tokens only (2/round), never the padded width.
     assert metrics.rounds == 0 or metrics.proposed <= 2 * metrics.rounds
+
+
+def test_preserved_side_call_restores_drafter_state() -> None:
+    torch._dynamo.reset()
+    torch.manual_seed(7)
+    gen = AlloyGenerator.from_model(tiny_llama())
+    gen.eager_compile_all()
+    drafter = MirrorDrafter([127] * 7)
+    gen.attach_spec(drafter)
+    list(gen.spec.run(PROMPT, max_new_tokens=6))
+    before = list(drafter.mirror)
+    assert before[: PROMPT.shape[1]] == PROMPT[0].tolist()
+    assert gen.prefix.state is not None
+    with gen.preserving_prefix(128):
+        list(gen.spec.run(SIDE_PROMPT, max_new_tokens=4))
+    assert (drafter.snapshots, drafter.restores) == (1, 1)
+    assert drafter.mirror[: len(before)] == before
+    assert gen.prefix.state is not None
 
 
 def test_pld_propose_ngram_matching() -> None:

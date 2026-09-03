@@ -52,7 +52,6 @@ members = ["packages/*"]
 alloy-metal = { workspace = true }
 alloy-torch = { workspace = true }
 alloy-server = { workspace = true }
-alloy-mlx = { workspace = true }
 alloy-cli = { workspace = true }
 
 [dependency-groups]
@@ -60,7 +59,6 @@ dev = [
     "alloy-metal",
     "alloy-torch",
     "alloy-server",
-    "alloy-mlx",
     "alloy-cli",
     "pytest>=8.0",
     "pytest-timeout>=2.3",

@@ -35,8 +35,6 @@ _COMMANDS: dict[str, tuple[str, str, str]] = {
              "Build a distributable .alloypack for on-device Apple inference."),
     "pack-publish": ("alloy_cli.commands.pack", "pack_publish",
                      "Assemble catalog.json from built packs and (optionally) publish to HuggingFace."),
-    "compile": ("alloy_cli.commands.compile_cmd", "compile_",
-                "Pre-compile a model's dispatch plan and cache it under ~/.alloy/cache/."),
     "doctor": ("alloy_cli.commands.doctor", "doctor",
                "Run diagnostics. Exit non-zero if any check fails."),
     "version": ("alloy_cli.commands.version", "version",

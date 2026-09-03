@@ -21,7 +21,6 @@ import threading
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING
 
 import uvicorn
 from starlette.applications import Starlette
@@ -38,9 +37,7 @@ from alloy_server.dialects import (
     ollama,
 )
 from alloy_server.modality import (
-    CHAT,
     DIALECT_TASKS,
-    EMBED,
     ENDPOINT_INDEX,
     TASK_NOUN,
     Endpoint,
@@ -52,11 +49,7 @@ from alloy_server.schema import (
     JsonValue,
     Rendered,
     RequestError,
-    ServedModel,
 )
-
-if TYPE_CHECKING:
-    from alloy_server.embedding import EmbeddingModel
 
 logger = get_logger("alloy_server.transport")
 
@@ -165,24 +158,6 @@ class ServedState:
     @property
     def model_name(self) -> str:
         return self.served.name  # type: ignore[attr-defined]
-
-
-def resolve_served(
-    served: object | None, modality: Modality | None,
-    chat_model: object | None, embedding_model: object | None,
-) -> tuple[object, Modality]:
-    """Normalize the served-model inputs to (served, modality). `served`/`modality`
-    is the generic seam; `chat_model`/`embedding_model` are back-compat shims that
-    map onto the CHAT / EMBED modalities."""
-    if served is not None:
-        if modality is None:
-            raise ValueError("modality is required when served is given")
-        return served, modality
-    if chat_model is not None and embedding_model is None:
-        return chat_model, CHAT
-    if embedding_model is not None and chat_model is None:
-        return embedding_model, EMBED
-    raise ValueError("exactly one served model must be given (served+modality, or one of chat_model/embedding_model)")
 
 
 def origin_allowed(origin: str, allowed: tuple[str, ...]) -> bool:
@@ -387,22 +362,18 @@ class PortCollisionError(RuntimeError):
 class AlloyServer:
     """Foreground ASGI server over a single model, fixed at startup. Binds the
     listen socket up front (so the port is known immediately and EADDRINUSE
-    surfaces as a clean `PortCollisionError`), then runs uvicorn on it. Exactly one
-    of chat_model / embedding_model is set."""
+    surfaces as a clean `PortCollisionError`), then runs uvicorn on it."""
 
     def __init__(
         self,
         host: str,
         port: int,
         *,
-        served: object | None = None,
-        modality: Modality | None = None,
-        chat_model: ServedModel | None = None,
-        embedding_model: "EmbeddingModel | None" = None,
+        served: object,
+        modality: Modality,
         spec: str | None = None,
         installed_chat_names: Callable[[], tuple[str, ...]] = lambda: (),
     ) -> None:
-        served, modality = resolve_served(served, modality, chat_model, embedding_model)
         self.host = host
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

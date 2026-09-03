@@ -8,7 +8,6 @@ the opt-in paged variant behind the same interface.
 from __future__ import annotations
 
 import ctypes
-import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
@@ -42,7 +41,6 @@ class KVStore(Protocol):
     def max_fill(self) -> int: ...
     def fit_to_budget(self, prompt_len: int, max_new_tokens: int, *, extra: int = 0) -> int: ...
     def clear_tail(self, cache: StaticCache, start: int) -> None: ...
-    def reclaim_beyond(self, cache: StaticCache, start: int) -> int: ...
     def pressure_level(self) -> int: ...
 
 
@@ -233,11 +231,6 @@ class ContiguousKV:
         cache = self.persistent_caches.get((batch_size, max_len))
         return cache if cache is not None else self.acquire(batch_size, max_len)
 
-    def reclaim_beyond(self, cache: StaticCache, start: int) -> int:
-        """Return committed KV pages at positions >= `start` to the kernel.
-        Contiguous caches have no page-level reclaim — no-op."""
-        return 0
-
     def pressure_level(self) -> int:
         """System memory-pressure level (0 normal / 1 warn / 2 critical)."""
         return 0
@@ -350,8 +343,8 @@ class PagedKV(ContiguousKV):
     """ContiguousKV with every cache tensor carved from one vm-reserved pool.
 
     Slices are virtual-contiguous, so the cache objects, kernels, and plans
-    are unchanged. The pool adds page-level reclaim (`reclaim_beyond`: dead
-    conversations hand their KV pages back to the kernel) and the
+    are unchanged. The pool adds page-level reclaim (`reclaim_slice`: an evicted
+    conversation hands its KV pages back to the kernel) and the
     memory-pressure signal. Opt-in via ALLOY_KV=paged.
     """
 
@@ -531,45 +524,3 @@ class PagedKV(ContiguousKV):
             total += _metal_ext.pool_reclaim(keepalive[1], 0, storage.nbytes())
         return total
 
-    def reclaim_beyond(self, cache: StaticCache, start: int) -> int:
-        """MADV_FREE_REUSABLE every KV row at positions >= `start`. Returns
-        bytes reclaimed. Syncs the GPU first — reclaim must never race an
-        in-flight command buffer (deferred decode waits)."""
-        if self.pool is None:
-            return 0
-        t0 = time.perf_counter()
-        _metal_ext.gpu_sync()
-        total = 0
-        ranges = 0
-        for layer in cache.layers:
-            attrs = vars(layer)
-            for name in self.KV_ROW_ATTRS:
-                t = attrs.get(name)
-                if not isinstance(t, torch.Tensor) or t.ndim != 4:
-                    continue
-                keepalive = vars(t.untyped_storage()).get("_alloy_keepalive")
-                if keepalive is None:
-                    continue
-                handle = keepalive[1]
-                batch, heads, seq = t.shape[0], t.shape[1], t.shape[2]
-                if start >= seq:
-                    continue  # sliding-window layers cap below a deep start
-                item = t.element_size()
-                base = t.data_ptr() - _metal_ext.buf_ptr(handle)
-                # (B, H, S, D) is contiguous: rows [start, seq) of each (b, h)
-                # plane are one byte range.
-                for b in range(batch):
-                    for h in range(heads):
-                        plane = base + (b * t.stride(0) + h * t.stride(1)) * item
-                        total += _metal_ext.pool_reclaim(
-                            handle,
-                            plane + start * t.stride(2) * item,
-                            (seq - start) * t.stride(2) * item,
-                        )
-                        ranges += 1
-        logger.info(
-            "kv_pages_reclaimed", start=start, ranges=ranges,
-            mb=round(total / (1 << 20), 1),
-            ms=round((time.perf_counter() - t0) * 1e3, 2),
-        )
-        return total

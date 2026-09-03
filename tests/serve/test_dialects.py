@@ -1,5 +1,5 @@
 """Per-dialect unit tests: parse (payload -> ChatCompletionRequest) and render
-(Result -> wire shape) in isolation, plus the path -> Dialect routing. No HTTP."""
+(Result -> wire shape) in isolation, plus the error-dialect routing. No HTTP."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from alloy_server.dialects import (
     OLLAMA_CHAT,
     OLLAMA_GENERATE,
     OPENAI,
-    chat_dialect_for_path,
     error_dialect_for_path,
 )
 from alloy_server.dialects.base import NotSupported
@@ -40,14 +39,6 @@ def _stub(*, reasoning: bool = False, text: str = "echo") -> ServedModel:
 
 
 # ---- routing ----
-
-def test_chat_dialect_routing():
-    assert chat_dialect_for_path("/v1/chat/completions") is OPENAI
-    assert chat_dialect_for_path("/api/chat") is OLLAMA_CHAT
-    assert chat_dialect_for_path("/api/generate") is OLLAMA_GENERATE
-    assert chat_dialect_for_path("/v1/messages") is ANTHROPIC
-    assert chat_dialect_for_path("/api/tags") is None
-
 
 def test_error_dialect_routing():
     assert error_dialect_for_path("/v1/messages") is ANTHROPIC

@@ -21,6 +21,7 @@ from alloy_server import (
     AlloyServer,
     create_server,
 )
+from alloy_server.modality import EMBED
 
 
 _DIM = 4
@@ -52,10 +53,7 @@ def _stub_embed_model(name: str = "alloy-test:embed", max_batch: int = 4) -> Emb
 
 @pytest.fixture()
 def server() -> Iterator[AlloyServer]:
-    instance = create_server(
-        "127.0.0.1", 0,
-        embedding_model=_stub_embed_model(),
-    )
+    instance = create_server("127.0.0.1", 0, served=_stub_embed_model(), modality=EMBED)
     thread = Thread(target=instance.serve_forever, daemon=True)
     thread.start()
     try:

@@ -29,4 +29,3 @@ def test_contiguous_is_single_slot():
     store = make_store(ContiguousKV)
     assert store.supports_slices() is False
     assert store.tensor_alloc() is None
-    assert store.reclaim_beyond(SimpleNamespace(layers=[]), 0) == 0

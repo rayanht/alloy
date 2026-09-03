@@ -30,7 +30,6 @@ TARGETS: list[tuple[str, str]] = [
     ("packages/alloy-metal/pyproject.toml", r'(?m)^(version = ")[^"]+(")'),
     ("packages/alloy-torch/pyproject.toml", r'(?m)^(version = ")[^"]+(")'),
     ("packages/alloy-server/pyproject.toml", r'(?m)^(version = ")[^"]+(")'),
-    ("packages/alloy-mlx/pyproject.toml", r'(?m)^(version = ")[^"]+(")'),
     ("packaging/pyproject.toml", r'(?m)^(version = ")[^"]+(")'),
     ("pyproject.toml", r'(?m)^(version = ")[^"]+(")'),
 ]

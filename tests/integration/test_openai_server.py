@@ -26,6 +26,7 @@ from alloy_server.gguf import (
     LoadedGGUFCausalLM,
     ResolvedGGUF,
 )
+from alloy_server.modality import CHAT
 from alloy_server.models import check_arch_supported
 
 JsonScalar: TypeAlias = str | int | float | bool | None
@@ -118,7 +119,10 @@ def _request_raw(
 
 
 def test_models_endpoint_returns_openai_list_shape() -> None:
-    server = create_server("127.0.0.1", 0, chat_model=ServedModel("tiny", _complete, _stream, _count_tokens))
+    server = create_server(
+        "127.0.0.1", 0,
+        served=ServedModel("tiny", _complete, _stream, _count_tokens), modality=CHAT,
+    )
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -136,7 +140,10 @@ def test_models_endpoint_returns_openai_list_shape() -> None:
 
 
 def test_chat_completion_returns_assistant_message() -> None:
-    server = create_server("127.0.0.1", 0, chat_model=ServedModel("tiny", _complete, _stream, _count_tokens))
+    server = create_server(
+        "127.0.0.1", 0,
+        served=ServedModel("tiny", _complete, _stream, _count_tokens), modality=CHAT,
+    )
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -169,7 +176,10 @@ def test_chat_completion_returns_assistant_message() -> None:
 
 
 def test_chat_completion_unknown_model_returns_structured_404() -> None:
-    server = create_server("127.0.0.1", 0, chat_model=ServedModel("tiny", _complete, _stream, _count_tokens))
+    server = create_server(
+        "127.0.0.1", 0,
+        served=ServedModel("tiny", _complete, _stream, _count_tokens), modality=CHAT,
+    )
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -196,7 +206,10 @@ def test_chat_completion_unknown_model_returns_structured_404() -> None:
 
 
 def test_chat_completion_stream_returns_sse_chunks() -> None:
-    server = create_server("127.0.0.1", 0, chat_model=ServedModel("tiny", _complete, _stream, _count_tokens))
+    server = create_server(
+        "127.0.0.1", 0,
+        served=ServedModel("tiny", _complete, _stream, _count_tokens), modality=CHAT,
+    )
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -269,13 +282,11 @@ def test_generation_served_model_decodes_only_new_tokens() -> None:
     assert "".join(chunks) == "decoded response"
 
 
-def test_parse_server_config_accepts_optional_hf_id() -> None:
+def test_parse_server_config() -> None:
     config = parse_server_config(
         (
             "--model",
             "qwen3:0.6b",
-            "--hf-id",
-            "Qwen/Qwen3-0.6B",
             "--host",
             "127.0.0.1",
             "--port",
@@ -284,27 +295,10 @@ def test_parse_server_config_accepts_optional_hf_id() -> None:
     )
 
     assert config.model == "qwen3:0.6b"
-    assert config.hf_id == "Qwen/Qwen3-0.6B"
     assert config.host == "127.0.0.1"
     assert config.port == 11435
-    # Context is not a config field: the cache is always native.
-    assert config.allow_downloads is False
-
-
-def test_parse_server_config_does_not_require_hf_id() -> None:
-    config = parse_server_config(
-        (
-            "--model",
-            "qwen3:0.6b",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "11435",
-        )
-    )
-
-    assert config.model == "qwen3:0.6b"
-    assert config.hf_id is None
+    assert config.spec is None
+    assert config.force is False
 
 
 def test_unsupported_gguf_arch_rejected_unless_forced() -> None:

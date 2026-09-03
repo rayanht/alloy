@@ -1,14 +1,9 @@
-"""Alloy-Torch: PyTorch interop and torch.compile backend registration."""
+"""Alloy-Torch: torch.compile backend registration."""
 
 import torch._dynamo
-from torch._dynamo.backends import registry as _backend_registry
+from torch._dynamo.backends import registry
 
 from alloy_torch.backend import alloy_backend
-from alloy_torch.interop import (
-    buffer_to_tensor,
-    tensor_to_buffer,
-    tensor_to_numpy,
-)
 # Static shape specialization. With `automatic_dynamic_shapes=True` a dim that
 # changes between calls (prompt_len) gets marked dynamic on the 3rd recompile and
 # Dynamo retraces with symbolic shapes, which the alloy backend mislowers to
@@ -34,12 +29,7 @@ torch._dynamo.config.specialize_int = False
 # the alloy backend lower them as runtime values in offset arithmetic.
 torch._dynamo.config.capture_scalar_outputs = False
 
-if "alloy" not in _backend_registry._COMPILER_FNS:
+if "alloy" not in registry._COMPILER_FNS:
     torch._dynamo.register_backend(alloy_backend, name="alloy")
 
-__all__ = [
-    "alloy_backend",
-    "buffer_to_tensor",
-    "tensor_to_buffer",
-    "tensor_to_numpy",
-]
+__all__ = ["alloy_backend"]

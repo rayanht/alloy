@@ -55,37 +55,6 @@ def test_attention_batched(BH, N, D):
 
 
 # ---------------------------------------------------------------------------
-# Masked attention
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("N,D", [(16, 16), (32, 32)])
-def test_attention_masked(N, D):
-    rng = np.random.default_rng(42)
-    Q = (rng.standard_normal((N, D)) * 0.1).astype(np.float32)
-    K = (rng.standard_normal((N, D)) * 0.1).astype(np.float32)
-    V = (rng.standard_normal((N, D)) * 0.1).astype(np.float32)
-    # Additive mask: zeros → no masking effect
-    mask = np.zeros((N, N), dtype=np.float32)
-    result = al.std.attention_masked_by_batch(Q, K, V, mask, BH=1,
-                                               BLOCK_M=min(N, 16), BLOCK_N=min(N, 16))
-    np.testing.assert_allclose(result, ref_attention(Q, K, V), rtol=5e-3, atol=5e-3)
-
-
-def test_attention_masked_with_causal_mask():
-    N, D = 16, 16
-    rng = np.random.default_rng(42)
-    Q = (rng.standard_normal((N, D)) * 0.1).astype(np.float32)
-    K = (rng.standard_normal((N, D)) * 0.1).astype(np.float32)
-    V = (rng.standard_normal((N, D)) * 0.1).astype(np.float32)
-    # Build causal additive mask: upper triangle = -1e30
-    mask = np.triu(np.full((N, N), -1e30, dtype=np.float32), k=1)
-    result = al.std.attention_masked_by_batch(Q, K, V, mask, BH=1,
-                                               BLOCK_M=16, BLOCK_N=16)
-    np.testing.assert_allclose(result, ref_attention(Q, K, V, causal=True),
-                               rtol=1e-3, atol=1e-3)
-
-
-# ---------------------------------------------------------------------------
 # Strided attention (4D tensor layout with explicit strides)
 # ---------------------------------------------------------------------------
 

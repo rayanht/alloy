@@ -27,6 +27,7 @@ from alloy_server import (
     ServedModel,
     check_port_collision,
 )
+from alloy_server.modality import CHAT
 
 
 class OllamaStub(BaseHTTPRequestHandler):
@@ -167,12 +168,13 @@ def test_failed_bind_raises_port_collision_not_attribute_error() -> None:
         with pytest.raises(PortCollisionError) as info:
             AlloyServer(
                 "127.0.0.1", port,
-                chat_model=ServedModel(
+                served=ServedModel(
                     name="t",
                     complete=lambda messages, max_tokens, tools=(), **kw: "",
                     stream=lambda messages, max_tokens, tools=(), **kw: iter([""]),
                     count_tokens=len,
                 ),
+                modality=CHAT,
             )
         assert f"port {port}" in str(info.value)
         assert "lsof" in str(info.value)

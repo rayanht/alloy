@@ -23,7 +23,7 @@ jobs:
       - name: Sync (dev only — skips C++ build)
         run: |
           uv sync --no-install-package alloy-metal --no-install-package alloy-torch \
-                  --no-install-package alloy-mlx --no-install-package alloy-cli
+                  --no-install-package alloy-cli
       - name: ruff check
         run: uv run ruff check .
 

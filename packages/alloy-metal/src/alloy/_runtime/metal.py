@@ -11,14 +11,12 @@ import os
 import threading
 from typing import Optional
 
-import numpy as np
 import hashlib
 import re
 import subprocess
 import tempfile
 from alloy.log import get_logger
-import alloy._runtime._metal_ext as _ext
-from alloy._runtime.alloy_buffer import AlloyBuffer
+from alloy._runtime import _metal_ext
 
 __all__ = [
     "MetalDevice",
@@ -41,7 +39,7 @@ class MetalDevice:
     @staticmethod
     def default() -> "MetalDevice":
         if MetalDevice._info is None:
-            MetalDevice._info = _ext.device_info()
+            MetalDevice._info = _metal_ext.device_info()
             logger.info(
                 "device_initialized",
                 device_name=MetalDevice._info["name"],
@@ -81,48 +79,11 @@ class MetalDevice:
 
     def _get_info(self):
         if MetalDevice._info is None:
-            MetalDevice._info = _ext.device_info()
+            MetalDevice._info = _metal_ext.device_info()
         return MetalDevice._info
 
     def __repr__(self) -> str:
         return f"MetalDevice({self.name!r}, family={self.gpu_family})"
-
-
-# --- MetalBuffer (just a numpy array wrapper for API compat) ---
-
-
-class MetalBuffer:
-    def __init__(self, device: MetalDevice, size_bytes: int) -> None:
-        self._arr = np.zeros(size_bytes, dtype=np.uint8)
-        self._bind_arr = self._arr
-        self._bind_offset = 0
-        self._np_ref: Optional[np.ndarray] = None
-
-    @classmethod
-    def from_numpy(cls, device: MetalDevice, arr) -> "MetalBuffer":
-        instance = cls.__new__(cls)
-        if isinstance(arr, AlloyBuffer):
-            # AlloyBuffer — use data_ptr/nbytes directly, no numpy needed
-            instance._arr = arr
-            instance._bind_arr = arr
-            instance._bind_offset = arr._offset
-            instance._np_ref = None
-        else:
-            arr = np.asarray(arr)
-            instance._arr = arr
-            instance._bind_arr, instance._bind_offset = _binding_array_and_offset(arr)
-            instance._np_ref = instance._bind_arr
-        return instance
-
-    def to_numpy(self, dtype, shape) -> np.ndarray:
-        return self._arr.view(np.dtype(dtype)).reshape(shape)
-
-    @property
-    def size(self) -> int:
-        return self._arr.nbytes
-
-    def __repr__(self) -> str:
-        return f"MetalBuffer({self.size} bytes)"
 
 
 # --- CompiledKernel (holds opaque int64 handle to C++ pipeline) ---
@@ -177,7 +138,7 @@ class CompiledKernel:
             kernel._msl_source = source
             _register_pso_source(kernel._handle, source, function_name)
             return kernel
-        handle = _ext.compile_msl(source, function_name)
+        handle = _metal_ext.compile_msl(source, function_name)
         _register_pso_source(handle, source, function_name)
         return cls(handle, function_name, source)
 
@@ -352,16 +313,16 @@ class CompiledKernel:
             if result.returncode != 0:
                 raise RuntimeError(f"Metallib linking failed: {result.stderr}")
 
-        handle = _ext.compile_metallib(metallib_path, function_name)
+        handle = _metal_ext.compile_metallib(metallib_path, function_name)
         return cls(handle, function_name)
 
     @property
     def max_total_threads_per_threadgroup(self) -> int:
-        return _ext.pipeline_max_threads(self._handle)
+        return _metal_ext.pipeline_max_threads(self._handle)
 
     @property
     def thread_execution_width(self) -> int:
-        return _ext.pipeline_thread_width(self._handle)
+        return _metal_ext.pipeline_thread_width(self._handle)
 
     @property
     def function_name(self) -> str:
@@ -381,33 +342,6 @@ class MetalDispatcher:
 
     def __repr__(self) -> str:
         return f"MetalDispatcher(device={self._device.name!r})"
-
-
-_STANDARD_DTYPES = frozenset(("<f4", "<f2", "<i4", "<i2", "|i1", "<u4", "<u2", "|u1", "<u8", "<i8"))
-
-
-def _ensure_standard_dtype(arr: np.ndarray) -> np.ndarray:
-    """View non-standard dtypes (bf16) as uint8 for nanobind compatibility."""
-    if arr.dtype.str not in _STANDARD_DTYPES:
-        return np.ascontiguousarray(arr).view(np.uint8)
-    return arr
-
-
-def _binding_array_and_offset(arr: np.ndarray) -> tuple[np.ndarray, int]:
-    arr = np.asarray(arr)
-    if arr.dtype.str not in _STANDARD_DTYPES:
-        return np.ascontiguousarray(arr).view(np.uint8), 0
-
-    return arr, 0
-
-
-def _to_3d(t: tuple) -> tuple[int, int, int]:
-    n = len(t)
-    if n == 1:
-        return (t[0], 1, 1)
-    if n == 2:
-        return (t[0], t[1], 1)
-    return (t[0], t[1], t[2])
 
 
 # --- Module-level singletons ---

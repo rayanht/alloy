@@ -14,7 +14,7 @@ import urllib.request
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, ContextManager, cast
+from typing import ContextManager, cast
 
 # Suppress transformers load-noise + optional sklearn/scipy imports before any
 # model class loads. Kept first so it runs ahead of the alloy_server.models import.
@@ -60,7 +60,7 @@ from alloy_server.schema import (
 from alloy_server.session import chat_template_extras
 from alloy_server.runner import ModelRunner, GenerationWorker
 from alloy_server.transport import AlloyServer, PortCollisionError
-from alloy_server.modality import TRANSCRIPTION, Modality
+from alloy_server.modality import CHAT, EMBED, TRANSCRIPTION, Modality
 from alloy_server.generation.generator import AlloyGenerator
 from alloy_server.generation.sequence import MultimodalInputs, SamplingParams, Sequence
 from alloy_server.discover import discover_all
@@ -68,19 +68,14 @@ from alloy_server.speculative.mtp import MTPDrafter
 from alloy_server.speculative.pld import PromptLookupDrafter
 from alloy_server.speculative.dflash import DFlashDrafter, resolve_dflash_checkpoint
 
-if TYPE_CHECKING:
-    from alloy_server.embedding import EmbeddingModel
-
 logger = get_logger("alloy_server")
 
 
 @dataclass(frozen=True, slots=True)
 class ServerConfig:
     model: str | None
-    hf_id: str | None
     host: str
     port: int
-    allow_downloads: bool
     spec: str | None = None
     force: bool = False
 
@@ -89,17 +84,15 @@ def create_server(
     host: str,
     port: int,
     *,
-    served: object | None = None,
-    modality: "Modality | None" = None,
-    chat_model: ServedModel | None = None,
-    embedding_model: "EmbeddingModel | None" = None,
+    served: object,
+    modality: Modality,
     spec: str | None = None,
 ) -> AlloyServer:
     def installed_chat_names() -> tuple[str, ...]:
         # The served chat model (if any) first, then GGUF models discovered on disk
         # (Ollama store / HF cache) — a catalog listing for client model pickers.
         # `discovered_chat_names` looked up dynamically so tests can monkeypatch it.
-        served_names = (chat_model.name,) if chat_model is not None else ()
+        served_names = (served.name,) if modality is CHAT else ()  # type: ignore[attr-defined]
         seen = set(served_names)
         discovered: list[str] = []
         for entry in discovered_chat_names():
@@ -110,7 +103,6 @@ def create_server(
 
     return AlloyServer(
         host, port, served=served, modality=modality,
-        chat_model=chat_model, embedding_model=embedding_model,
         spec=spec, installed_chat_names=installed_chat_names,
     )
 
@@ -720,10 +712,8 @@ def parse_server_config(argv: tuple[str, ...] | None = None) -> ServerConfig:
     namespace = parser.parse_args(argv)
     return ServerConfig(
         model=cast(str | None, namespace.model),
-        hf_id=cast(str | None, namespace.hf_id),
         host=cast(str, namespace.host),
         port=cast(int, namespace.port),
-        allow_downloads=cast(bool, namespace.allow_downloads),
         spec=cast("str | None", namespace.spec),
         force=cast(bool, namespace.force),
     )
@@ -748,19 +738,20 @@ def run_server(config: ServerConfig) -> None:
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(f"alloy serve: {exc}")
     kind = model_kind(arch)
-    server_kwargs: dict = {"spec": config.spec}
+    served: object
+    modality: Modality
     if kind == "chat":
-        server_kwargs["chat_model"] = create_native_served_model(config, resolved)
+        served, modality = create_native_served_model(config, resolved), CHAT
     elif kind == "embed":
         from alloy_server.models.nomic_bert import load_ollama_gguf_embedder  # scoped: pulls transformers.NomicBertModel + huggingface_hub side effects; load only when an embed model is actually served
 
-        server_kwargs["embedding_model"] = load_ollama_gguf_embedder(resolved)
+        served, modality = load_ollama_gguf_embedder(resolved), EMBED
     else:  # transcription (whisper)
         from alloy_server.models.whisper import load_whisper_gguf  # scoped: pulls transformers.Whisper + the alloy backend; load only when an STT model is served
 
-        server_kwargs["served"] = load_whisper_gguf(str(resolved.location), name=config.model)
-        server_kwargs["modality"] = TRANSCRIPTION
-    server = create_server(config.host, config.port, **server_kwargs)
+        served = load_whisper_gguf(str(resolved.location), name=config.model)
+        modality = TRANSCRIPTION
+    server = create_server(config.host, config.port, served=served, modality=modality, spec=config.spec)
     logger.info(
         "server_started",
         host=config.host,
@@ -873,14 +864,8 @@ def server_arg_parser() -> argparse.ArgumentParser:
              "path (./model.gguf), a HuggingFace GGUF repo (Org/Repo:Q4_K_M), "
              "or an Ollama name (qwen3.5:4b); required",
     )
-    parser.add_argument("--hf-id", default=None, help="local Hugging Face model id or path")
     parser.add_argument("--host", default="127.0.0.1", help="bind host")
     parser.add_argument("--port", default=11434, type=int, help="bind port (default 11434, matches Ollama)")
-    parser.add_argument(
-        "--allow-downloads",
-        action="store_true",
-        help="allow HF tokenizer to download missing model files",
-    )
     parser.add_argument(
         "--spec",
         default=os.environ.get("ALLOY_SPEC") or None,

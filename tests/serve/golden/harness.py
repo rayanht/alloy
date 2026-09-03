@@ -35,6 +35,7 @@ from alloy_server import (
     ServedModel,
     create_server,
 )
+from alloy_server.modality import CHAT, EMBED, Modality
 from alloy_server.reasoning import THINK_PROTOCOL
 
 GOLDEN_PATH = os.path.join(os.path.dirname(__file__), "wire_golden.json")
@@ -292,8 +293,8 @@ def _kept_headers(headers) -> dict:
 # ----------------------------------------------------------------------------
 
 @contextmanager
-def _serve(model_kwargs: dict) -> Iterator[int]:
-    server: AlloyServer = create_server("127.0.0.1", 0, **model_kwargs)
+def _serve(served: object, modality: Modality) -> Iterator[int]:
+    server: AlloyServer = create_server("127.0.0.1", 0, served=served, modality=modality)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -343,11 +344,11 @@ def capture_all() -> dict:
     with _isolated_discovery(), ExitStack() as stack:
         ports = {
             "chat": stack.enter_context(
-                _serve({"chat_model": _make_chat_stub("alloy-test:tiny", reasoning=False)})),
+                _serve(_make_chat_stub("alloy-test:tiny", reasoning=False), CHAT)),
             "reasoning": stack.enter_context(
-                _serve({"chat_model": _make_chat_stub("alloy-test:tiny", reasoning=True)})),
+                _serve(_make_chat_stub("alloy-test:tiny", reasoning=True), CHAT)),
             "embed": stack.enter_context(
-                _serve({"embedding_model": _make_embed_stub()})),
+                _serve(_make_embed_stub(), EMBED)),
         }
         records: dict[str, dict] = {}
         for case in cases:

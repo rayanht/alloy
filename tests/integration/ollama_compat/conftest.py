@@ -20,6 +20,7 @@ from alloy_server import (
     ServedModel,
     create_server,
 )
+from alloy_server.modality import CHAT
 
 
 def _complete(messages: tuple[ChatMessage, ...], max_tokens: int, tools: tuple[dict, ...] = (), **kwargs) -> str:
@@ -45,7 +46,7 @@ def server() -> Iterator[AlloyServer]:
     """A live HTTP server on a random port, shut down at teardown. The
     background thread is a daemon so leaks don't keep pytest alive.
     """
-    instance = create_server("127.0.0.1", 0, chat_model=make_stub_model())
+    instance = create_server("127.0.0.1", 0, served=make_stub_model(), modality=CHAT)
     thread = Thread(target=instance.serve_forever, daemon=True)
     thread.start()
     try:

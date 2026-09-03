@@ -162,30 +162,30 @@ class MTPDrafter:
         return kv + cfg.hidden_size * 2
 
     def snapshot_head(self, rows: int) -> object | None:
-        # MTP block cache rows for [0, rows) + the token/hidden mirrors, around
-        # foreign side requests that overwrite the cache head.
-        layer = self._pins["mcache"].layers[0] if self._pins else None
-        if layer is None or layer.keys is None:
+        if self._pins is None:
             return None
+        layer = self._pins["mcache"].layers[0]
+        n = self._local_rows
         return (
-            layer.keys[:, :, :rows].clone(),
-            layer.values[:, :, :rows].clone(),
+            layer.keys[:, :, :n].clone(),
+            layer.values[:, :, :n].clone(),
             list(self._tokens),
             dict(self._hiddens),
-            self._absorbed,
+            self._abs_absorbed,
+            n,
         )
 
     def restore_head(self, snap: object) -> None:
         if snap is None or self._pins is None:
             return
-        keys, values, tokens, hiddens, absorbed = snap
+        keys, values, tokens, hiddens, abs_absorbed, local_rows = snap
         layer = self._pins["mcache"].layers[0]
-        rows = keys.shape[2]
-        layer.keys[:, :, :rows].copy_(keys)
-        layer.values[:, :, :rows].copy_(values)
+        layer.keys[:, :, :local_rows].copy_(keys)
+        layer.values[:, :, :local_rows].copy_(values)
         self._tokens = tokens
         self._hiddens = hiddens
-        self._absorbed = absorbed
+        self._abs_absorbed = abs_absorbed
+        self._local_rows = local_rows
 
     # ------------------------------------------------------------- plumbing
 

@@ -388,7 +388,10 @@ class DFlashDrafter:
         return 2 * cfg["num_hidden_layers"] * cfg["num_key_value_heads"] * cfg["head_dim"] * 2
 
     def snapshot_head(self, rows: int) -> object | None:
-        rows = min(rows, self._ctx_len)
+        if self._pins is not None and self._pins["observe"]:
+            width = max(self._pins["observe"])
+            rows = -(-rows // width) * width
+        rows = min(rows + self.block_size, self._ctx_len)
         if rows <= 0:
             return None
         # Per-cache row count: full layers slice [0, rows); ring layers cap at

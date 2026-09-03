@@ -1,8 +1,6 @@
-"""Wire-format dialects and the path -> Dialect routing.
-
-`chat_dialect_for_path` resolves a chat endpoint to its dialect;
-`error_dialect_for_path` resolves any path to the dialect whose error envelope it
-answers with.
+"""Wire-format dialects. `error_dialect_for_path` resolves any path to the
+dialect whose error envelope it answers with; endpoint routing lives in
+`alloy_server.modality`.
 """
 
 from __future__ import annotations
@@ -115,18 +113,6 @@ OPENAI: Dialect = OpenAIDialect()
 OLLAMA_CHAT: Dialect = OllamaChatDialect()
 OLLAMA_GENERATE: Dialect = OllamaGenerateDialect()
 ANTHROPIC: Dialect = AnthropicDialect()
-
-# Chat endpoints -> the dialect that parses + renders them.
-CHAT_DIALECTS: dict[str, Dialect] = {
-    "/v1/chat/completions": OPENAI,
-    "/api/chat": OLLAMA_CHAT,
-    "/api/generate": OLLAMA_GENERATE,
-    "/v1/messages": ANTHROPIC,
-}
-
-
-def chat_dialect_for_path(path: str) -> Dialect | None:
-    return CHAT_DIALECTS.get(path)
 
 
 def error_dialect_for_path(path: str) -> Dialect:

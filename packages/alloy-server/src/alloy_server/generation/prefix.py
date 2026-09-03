@@ -522,11 +522,14 @@ class PrefixCache:
         preserves when the side request is much smaller than the saved
         prefix, so the copy is always the cheap direction.
         """
+        drafter = self.kv.spec.drafter if self.kv.spec is not None else None
         if self.kv.supports_slices():
-            # Multi-slice mode needs no snapshot: the side request opens (or
-            # LCP-matches) its own conversation slice via `match_paged`, and
-            # the main conversation's slice is rebound on its next turn.
-            yield
+            drafter_snap = drafter.snapshot_head(side_total) if drafter is not None else None
+            try:
+                yield
+            finally:
+                if drafter is not None:
+                    drafter.restore_head(drafter_snap)
             return
         state = self.state
         if state is None:
@@ -534,6 +537,7 @@ class PrefixCache:
             return
         cache_len, _, cache = state
         rows = min(side_total, cache_len)
+        drafter_snap = drafter.snapshot_head(rows) if drafter is not None else None
         snapshot: list[dict[str, tuple[int | None, torch.Tensor]]] = []
         for layer in cache.layers:
             entry: dict[str, tuple[int | None, torch.Tensor]] = {}
@@ -560,6 +564,8 @@ class PrefixCache:
                         live[name].copy_(saved)
                     else:
                         live[name].narrow(dim, 0, saved.shape[dim]).copy_(saved)
+            if drafter is not None:
+                drafter.restore_head(drafter_snap)
             self.state = state
 
     def heal_truncated(

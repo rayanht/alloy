@@ -84,95 +84,6 @@ def attention(
 
 @al.tunable(BLOCK_M=[8, 16, 32, 64], BLOCK_N=[8, 16, 32], options=dict(fuse_loops=[0, 1]))
 @al.kernel
-def attention_masked_by_batch(
-    Q,
-    K,
-    V,
-    Mask,
-    O: al.output,  # noqa: E741
-    BH: al.constexpr = 1,
-    HEADS_PER_BATCH: al.constexpr = 1,
-    BLOCK_M: al.constexpr = 16,
-    BLOCK_N: al.constexpr = 32,
-    causal: al.constexpr = 0,
-    KV_GROUP: al.constexpr = 1,
-    CUSTOM_SCALE: al.constexpr = 0,
-):
-    D = Q.shape[1]
-    N = Q.shape[0] // BH
-    N_KV_BLOCKS = (N + BLOCK_N - 1) // BLOCK_N
-    SCALE = CUSTOM_SCALE if (CUSTOM_SCALE is not None and CUSTOM_SCALE > 0) else 1.0 / (D**0.5)
-    q_block = al.program_id(0)
-    bh = al.program_id(1)
-    batch = bh // HEADS_PER_BATCH
-    head_off = bh * N * D
-    if KV_GROUP is not None and KV_GROUP > 1:
-        kv_bh = bh // KV_GROUP
-        kv_head_off = kv_bh * N * D
-    else:
-        kv_head_off = head_off
-    mask_off = batch * N * N
-    Qh = Q + head_off
-    Kh = K + kv_head_off
-    Vh = V + kv_head_off
-    Mh = Mask + mask_off
-    Oh = O + head_off
-    q_start = q_block * BLOCK_M
-    rm = al.arange(0, BLOCK_M)
-    rd = al.arange(0, D)
-    rn = al.arange(0, BLOCK_N)
-    q = al.load(
-        Qh + (q_start + rm)[:, None] * D + rd[None, :],
-        mask=(q_start + rm[:, None]) < N,
-        other=0.0,
-    )
-    m = -1e30
-    l = 0.0  # noqa: E741
-    o = al.zeros((BLOCK_M, D), dtype=al.float32)
-    for _jb in range(0, N_KV_BLOCKS, 1):
-        j = _jb * BLOCK_N
-        k_tile = al.load(
-            Kh + (j + rn)[:, None] * D + rd[None, :],
-            mask=(j + rn[:, None]) < N,
-            other=0.0,
-        )
-        s = al.tile_dot(q, k_tile, transpose_rhs=True)
-        s = s * SCALE
-        al.barrier()
-        mask_tile = al.load(
-            Mh + (q_start + rm)[:, None] * N + (j + rn)[None, :],
-            mask=((q_start + rm)[:, None] < N) & ((j + rn)[None, :] < N),
-            other=-1e30,
-        )
-        s = s + mask_tile
-        if causal:
-            s = al.where((q_start + rm)[:, None] >= (j + rn)[None, :], s, -1e30)
-        bmax = al.max(s, axis=1)
-        mn = al.maximum(m, bmax)
-        alpha = al.exp(m - mn)
-        l = l * alpha  # noqa: E741
-        o = o * alpha
-        p = al.exp(s - mn)
-        l = l + al.sum(p, axis=1)  # noqa: E741
-        al.barrier()
-        v_tile = al.load(
-            Vh + (j + rn)[:, None] * D + rd[None, :],
-            mask=(j + rn[:, None]) < N,
-            other=0.0,
-        )
-        o = o + al.tile_dot(p, v_tile)
-        m = mn
-        al.barrier()
-    o = o * (1.0 / l)
-    al.store(
-        Oh + (q_start + rm)[:, None] * D + rd[None, :],
-        o,
-        mask=((q_start + rm[:, None]) < N) & (bh < BH),
-    )
-
-
-@al.tunable(BLOCK_M=[8, 16, 32, 64], BLOCK_N=[8, 16, 32], options=dict(fuse_loops=[0, 1]))
-@al.kernel
 def attention_strided(
     Q,
     K,
@@ -759,115 +670,6 @@ def attention_combine_splits(
     al.store(O + batch * N * O_STRIDE + head * D + n * O_STRIDE + rd, out, mask=bh < BH)
 
 
-@al.tunable(BLOCK_M=[8, 16, 32, 64], BLOCK_N=[8, 16, 32], options=dict(fuse_loops=[0, 1]))
-@al.kernel
-def attention_strided_masked_by_batch(
-    Q,
-    K,
-    V,
-    Mask,
-    O: al.output,  # noqa: E741
-    BH: al.constexpr = 1,
-    HEADS_PER_BATCH: al.constexpr = 1,
-    SEQ_LEN: al.constexpr = 1,
-    HEAD_DIM: al.constexpr = 1,
-    Q_OFFSET: al.constexpr = 0,
-    Q_BATCH_STRIDE: al.constexpr = 0,
-    Q_HEAD_STRIDE: al.constexpr = 0,
-    Q_SEQ_STRIDE: al.constexpr = 0,
-    K_OFFSET: al.constexpr = 0,
-    K_BATCH_STRIDE: al.constexpr = 0,
-    K_HEAD_STRIDE: al.constexpr = 0,
-    K_SEQ_STRIDE: al.constexpr = 0,
-    V_OFFSET: al.constexpr = 0,
-    V_BATCH_STRIDE: al.constexpr = 0,
-    V_HEAD_STRIDE: al.constexpr = 0,
-    V_SEQ_STRIDE: al.constexpr = 0,
-    BLOCK_M: al.constexpr = 16,
-    BLOCK_N: al.constexpr = 32,
-    causal: al.constexpr = 0,
-    KV_GROUP: al.constexpr = 1,
-    CUSTOM_SCALE: al.constexpr = 0,
-    KV_LEN: al.constexpr = 0,
-    Q_START_POS: al.constexpr = 0,
-):
-    D = HEAD_DIM
-    N = SEQ_LEN
-    N_KV = KV_LEN if KV_LEN > 0 else N  # KV cache: K/V may be longer than Q
-    N_KV_BLOCKS = (N_KV + BLOCK_N - 1) // BLOCK_N
-    SCALE = CUSTOM_SCALE if (CUSTOM_SCALE is not None and CUSTOM_SCALE > 0) else 1.0 / (D**0.5)
-    q_block = al.program_id(0)
-    bh = al.program_id(1)
-    batch = bh // HEADS_PER_BATCH
-    head = bh - batch * HEADS_PER_BATCH
-    q_head_off = Q_OFFSET + batch * Q_BATCH_STRIDE + head * Q_HEAD_STRIDE
-    kv_head = head // KV_GROUP if KV_GROUP > 1 else head
-    k_head_off = K_OFFSET + batch * K_BATCH_STRIDE + kv_head * K_HEAD_STRIDE
-    v_head_off = V_OFFSET + batch * V_BATCH_STRIDE + kv_head * V_HEAD_STRIDE
-    mask_off = batch * N * N_KV  # mask is [B, q_len, kv_len]
-    Qh = Q + q_head_off
-    Kh = K + k_head_off
-    Vh = V + v_head_off
-    Mh = Mask + mask_off
-    O_STRIDE = HEADS_PER_BATCH * D
-    Oh = O + batch * N * O_STRIDE + head * D
-    q_start = q_block * BLOCK_M
-    rm = al.arange(0, BLOCK_M)
-    rd = al.arange(0, D)
-    rn = al.arange(0, BLOCK_N)
-    q = al.load(
-        Qh + (q_start + rm)[:, None] * Q_SEQ_STRIDE + rd[None, :],
-        mask=(q_start + rm[:, None]) < N,
-        other=0.0,
-    )
-    m = -1e30
-    l = 0.0  # noqa: E741
-    o = al.zeros((BLOCK_M, D), dtype=al.float32)
-    for _jb in range(0, N_KV_BLOCKS, 1):
-        j = _jb * BLOCK_N
-        k_tile = al.load(
-            Kh + (j + rn)[:, None] * K_SEQ_STRIDE + rd[None, :],
-            mask=(j + rn[:, None]) < N_KV,
-            other=0.0,
-        )
-        s = al.tile_dot(q, k_tile, transpose_rhs=True)
-        s = s * SCALE
-        al.barrier()
-        mask_tile = al.load(
-            Mh + (q_start + rm)[:, None] * N_KV + (j + rn)[None, :],
-            mask=((q_start + rm)[:, None] < N) & ((j + rn)[None, :] < N_KV),
-            other=0.0,
-        )
-        al.barrier()
-        s = al.maximum(s + mask_tile, -1e30)
-        s = al.where((j + rn)[None, :] < N_KV, s, -1e30)
-        if causal:
-            # See attention_strided for Q_START_POS semantics.
-            s = al.where((Q_START_POS + q_start + rm)[:, None] >= (j + rn)[None, :], s, -1e30)
-        bmax = al.max(s, axis=1)
-        mn = al.maximum(m, bmax)
-        alpha = al.exp(m - mn)
-        l = l * alpha  # noqa: E741
-        o = o * alpha
-        p = al.exp(s - mn)
-        l = l + al.sum(p, axis=1)  # noqa: E741
-        al.barrier()
-        v_tile = al.load(
-            Vh + (j + rn)[:, None] * V_SEQ_STRIDE + rd[None, :],
-            mask=(j + rn[:, None]) < N_KV,
-            other=0.0,
-        )
-        o = o + al.tile_dot(p, v_tile)
-        m = mn
-        al.barrier()
-    o = o * (1.0 / l)
-    al.store(
-        Oh + (q_start + rm)[:, None] * O_STRIDE + rd[None, :],
-        o,
-        mask=((q_start + rm[:, None]) < N) & (bh < BH),
-    )
-
-
 # fuse_loops=1 is excluded: per-kernel max-diff stays within f32 tolerance
 # but the error compounds across decoder layers into NaN at the lm_head.
 @al.tunable(BLOCK_M=[8, 16, 32, 64], BLOCK_N=[8, 16, 32], options=dict(fuse_loops=[0]))
@@ -904,8 +706,9 @@ def attention_strided_masked_by_batch_with_lse(
     Q_START_POS: al.constexpr = 0,
 ):
     """Fwd attention + lse in one pass, saving a re-read of Q/K/mask for the
-    separate logsumexp kernel. Body mirrors `attention_strided_masked_by_batch`;
-    the only addition is the `log_sum_exp` store using the final (m, l)."""
+    separate logsumexp kernel. Body mirrors `attention_strided` with an additive
+    [B, q_len, kv_len] mask; the only addition is the `log_sum_exp` store using
+    the final (m, l)."""
     D = HEAD_DIM
     N = SEQ_LEN
     N_KV = KV_LEN if KV_LEN > 0 else N
@@ -982,7 +785,7 @@ def attention_strided_masked_by_batch_with_lse(
         o,
         mask=((q_start + rm[:, None]) < N) & (bh < BH),
     )
-    # lse = m + log(l) per row. Layout matches attention_strided_logsumexp_masked_by_batch:
+    # lse = m + log(l) per row. Layout matches attention_strided_logsumexp:
     # log_sum_exp[bh * N + q_start + rm]
     lse_tile = al.zeros((BLOCK_M, 1), dtype=al.float32)
     lse_tile = lse_tile + m + al.log(l)
@@ -1052,93 +855,6 @@ def attention_strided_logsumexp(
             other=0.0,
         )
         s = al.tile_dot(q, k_tile, transpose_rhs=True) * SCALE
-        s = al.where(kv_mask[None, :], s, -1e30)
-        s = al.where(row_mask[:, None], s, -1e30)
-        if causal:
-            s = al.where((q_start + rm)[:, None] >= (j + rn)[None, :], s, -1e30)
-        bmax = al.max(s, axis=1)
-        mn = al.maximum(m, bmax)
-        alpha = al.exp(m - mn)
-        l = l * alpha  # noqa: E741
-        p = al.exp(s - mn)
-        l = l + al.sum(p, axis=1)  # noqa: E741
-        m = mn
-    lse_tile = al.zeros((BLOCK_M, 1), dtype=al.float32)
-    lse_tile = lse_tile + m + al.log(l)
-    al.store(
-        log_sum_exp + (rm[:, None] * 1 + (bh * N + q_start)) + rc[None, :],
-        lse_tile,
-        mask=row_mask[:, None] & (bh < BH),
-    )
-
-
-@al.tunable(BLOCK_M=[8, 16, 32, 64], BLOCK_N=[8, 16, 32], options=dict(fuse_loops=[0, 1]))
-@al.kernel
-def attention_strided_logsumexp_masked_by_batch(
-    Q,
-    K,
-    Mask,
-    log_sum_exp: al.output,
-    BH: al.constexpr = 1,
-    HEADS_PER_BATCH: al.constexpr = 1,
-    SEQ_LEN: al.constexpr = 1,
-    HEAD_DIM: al.constexpr = 1,
-    Q_OFFSET: al.constexpr = 0,
-    Q_BATCH_STRIDE: al.constexpr = 0,
-    Q_HEAD_STRIDE: al.constexpr = 0,
-    Q_SEQ_STRIDE: al.constexpr = 0,
-    K_OFFSET: al.constexpr = 0,
-    K_BATCH_STRIDE: al.constexpr = 0,
-    K_HEAD_STRIDE: al.constexpr = 0,
-    K_SEQ_STRIDE: al.constexpr = 0,
-    BLOCK_M: al.constexpr = 16,
-    BLOCK_N: al.constexpr = 32,
-    causal: al.constexpr = 0,
-    KV_GROUP: al.constexpr = 1,
-    CUSTOM_SCALE: al.constexpr = 0,
-    KV_LEN: al.constexpr = 0,
-):
-    D = HEAD_DIM
-    N = SEQ_LEN
-    N_KV = KV_LEN if KV_LEN > 0 else N
-    N_KV_BLOCKS = (N_KV + BLOCK_N - 1) // BLOCK_N
-    SCALE = CUSTOM_SCALE if (CUSTOM_SCALE is not None and CUSTOM_SCALE > 0) else 1.0 / (D**0.5)
-    q_block = al.program_id(0)
-    bh = al.program_id(1)
-    batch = bh // HEADS_PER_BATCH
-    head = bh - batch * HEADS_PER_BATCH
-    kv_head = head // KV_GROUP if KV_GROUP > 1 else head
-    Qh = Q + Q_OFFSET + batch * Q_BATCH_STRIDE + head * Q_HEAD_STRIDE
-    Kh = K + K_OFFSET + batch * K_BATCH_STRIDE + kv_head * K_HEAD_STRIDE
-    Mh = Mask + batch * N * N_KV
-    q_start = q_block * BLOCK_M
-    rm = al.arange(0, BLOCK_M)
-    rc = al.arange(0, 1)
-    rn = al.arange(0, BLOCK_N)
-    rd = al.arange(0, D)
-    row_mask = (q_start + rm) < N
-    q = al.load(
-        Qh + (q_start + rm)[:, None] * Q_SEQ_STRIDE + rd[None, :],
-        mask=row_mask[:, None],
-        other=0.0,
-    )
-    m = -1e30
-    l = 0.0  # noqa: E741
-    for _jb in range(0, N_KV_BLOCKS, 1):
-        j = _jb * BLOCK_N
-        kv_mask = (j + rn) < N_KV
-        k_tile = al.load(
-            Kh + (j + rn)[:, None] * K_SEQ_STRIDE + rd[None, :],
-            mask=kv_mask[:, None],
-            other=0.0,
-        )
-        s = al.tile_dot(q, k_tile, transpose_rhs=True) * SCALE
-        mask_tile = al.load(
-            Mh + (q_start + rm)[:, None] * N_KV + (j + rn)[None, :],
-            mask=row_mask[:, None] & kv_mask[None, :],
-            other=0.0,
-        )
-        s = al.maximum(s + mask_tile, -1e30)
         s = al.where(kv_mask[None, :], s, -1e30)
         s = al.where(row_mask[:, None], s, -1e30)
         if causal:
@@ -1781,8 +1497,9 @@ def attention_kv_update(
 ):
     """Fused KV cache update + attention.
 
-    Identical to attention_strided_masked_by_batch, with an added prologue
-    that writes new_K/new_V into K_cache/V_cache at cache_pos before attending.
+    Identical to attention_strided_masked_by_batch_with_lse minus the lse store,
+    with an added prologue that writes new_K/new_V into K_cache/V_cache at
+    cache_pos before attending.
     For GQA, all Q heads in a group redundantly write identical data.
 
     Grid: (ceil(SEQ_LEN/BLOCK_M), BH).
@@ -1901,7 +1618,7 @@ def attention_kv_update(
             mask=((q_row + rm1[:, None]) < N) & (rd[None, :] < D) & (bh < BH),
         )
     else:
-        # --- Attention (identical to attention_strided_masked_by_batch) ---
+        # --- Attention (same online-softmax body as attention_strided) ---
         q_start = q_block * BLOCK_M
         rm = al.arange(0, BLOCK_M)
         q = al.load(
