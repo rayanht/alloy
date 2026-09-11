@@ -79,6 +79,28 @@ def _is_rsqrt_like(node: torch.fx.Node) -> bool:
     )
 
 
+def _is_norm_gain(candidate: torch.fx.Node | None, normed: torch.fx.Node) -> bool:
+    """True when the multiply after the norm is a learnable gain rather than
+    some other tensor that merely broadcasts.
+
+    The fused kernel indexes the weight as a rank-1 vector over the normalized
+    dim. Anything else — rope's (1, 1, T, D) table multiplying a QK-normed q, for
+    instance — must not be swallowed as the weight, or the kernel reads it as a
+    gain and the result is unrelated to the input.
+    """
+    if candidate is None:
+        return False
+    weight_val = candidate.meta.get("val")
+    normed_val = normed.meta.get("val")
+    if weight_val is None or not hasattr(weight_val, "shape"):
+        return False
+    if len(weight_val.shape) != 1:
+        return False
+    if normed_val is not None and hasattr(normed_val, "shape") and normed_val.shape:
+        return int(weight_val.shape[0]) == int(normed_val.shape[-1])
+    return True
+
+
 def _find_rms_norm_chain(pow_node: torch.fx.Node) -> RmsNormForwardMatch | None:
     if not _is_call_target(pow_node, torch.ops.aten.pow.Tensor_Scalar):
         return None
@@ -131,7 +153,7 @@ def _find_rms_norm_chain(pow_node: torch.fx.Node) -> RmsNormForwardMatch | None:
     weight_mul = find_single_consumer(current)
     if weight_mul is None:
         return None
-    if weight_mul.target in _MUL_TARGETS:
+    if weight_mul.target in _MUL_TARGETS and _is_norm_gain(_other_node(weight_mul, current), current):
         weight_node = _other_node(weight_mul, current)
         if weight_node is None:
             return None

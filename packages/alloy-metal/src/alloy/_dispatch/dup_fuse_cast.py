@@ -115,8 +115,21 @@ def dup_fuse_casts(
         if is_root:
             result.append(op)
 
+        # A consumer reaches the cast output through its own AlloyBuffer object,
+        # which is only `is`-identical when it reads the whole buffer unviewed.
+        # Anything else (a reshaped or offset view) cannot be repointed at a dup,
+        # and dropping the original would leave it reading a buffer nothing writes.
+        all_rewired = True
         for ci in consumers:
             cop = ops[ci]
+            slots = [
+                pi
+                for pi, (pn, pb) in enumerate(cop.buffer_args)
+                if pn not in cop.output_params and pb is orig_out
+            ]
+            if not slots:
+                all_rewired = False
+                continue
             new_out = _alloc_aligned(orig_out.shape, orig_out._dtype)
             new_op = LazyOp(
                 kernel=op.kernel,
@@ -129,12 +142,12 @@ def dup_fuse_casts(
                 output_params=set(op.output_params),
                 input_producers=dict(op.input_producers),
             )
-            for pi, (pn, pb) in enumerate(cop.buffer_args):
-                if pn in cop.output_params:
-                    continue
-                if pb is orig_out:
-                    cop.buffer_args[pi] = (pn, new_out)
-                    cop.input_producers[pn] = new_op
-                    break
+            for pi in slots:
+                pn, _ = cop.buffer_args[pi]
+                cop.buffer_args[pi] = (pn, new_out)
+                cop.input_producers[pn] = new_op
             result.append(new_op)
+
+        if not all_rewired and not is_root:
+            result.append(op)
     return result

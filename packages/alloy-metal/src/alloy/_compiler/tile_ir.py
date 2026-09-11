@@ -928,7 +928,9 @@ def shallow_clone_for_fusion(func: "TileFunction") -> "TileFunction":
 
     return dataclasses.replace(
         func,
-        params=list(func.params),
+        # Params are copied, not shared: prologue fusion retypes the fused input
+        # param, and the source func is the one held in the trace cache.
+        params=[dataclasses.replace(p) for p in func.params],
         ops=_clone_list(func.ops),
         constexpr_values=dict(func.constexpr_values),
         shape_vars=dict(func.shape_vars),

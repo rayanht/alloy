@@ -1171,6 +1171,13 @@ def _build_anchor_context(anchor_op: LazyOp) -> AnchorFusionContext:
     if out_shape is not None and len(out_shape) == 2:
         cv.setdefault("M", out_shape[0])
         cv.setdefault("N", out_shape[1])
+    elif out_shape is not None and len(out_shape) != 2 and "M" not in cv:
+        # Without M/N the epilogue cannot resolve its broadcast direction, and a
+        # batched (rank-3) anchor output silently lost its epilogue rather than
+        # declining to fuse. Fall back to an unfused dispatch instead.
+        raise FusionUnsupported(
+            f"anchor output is rank-{len(out_shape)}; epilogue needs a 2D M/N"
+        )
     func.constexpr_values = cv
     buffer_map = _build_buf_map(anchor_op, func)
     buffer_params = [p.name for p in func.params if not p.is_constexpr]

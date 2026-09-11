@@ -376,6 +376,7 @@ class TestCompiledPlanInputs:
             slots,
             {0x1000: alloy_torch.backend.InputPtrInfo(arg_idx=0, view_offset=0)},
             {0: 0},
+            {},
         )
 
         assert mutation_input_slots == {0: 0}

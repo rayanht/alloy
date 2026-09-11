@@ -49,6 +49,12 @@ def make_tensor_from_ptr(
         elems = 1
         for s in shape:
             elems *= s
+        if total_nbytes and elems * itemsize > total_nbytes:
+            raise RuntimeError(
+                f"alloy: {shape} of {dtype.ir} needs {elems * itemsize} bytes but the "
+                f"buffer holds {total_nbytes} — a view past the end would read "
+                f"unowned memory"
+            )
         return torch.frombuffer(
             (ctypes.c_uint8 * (elems * itemsize)).from_address(base_ptr),
             dtype=torch_dt,

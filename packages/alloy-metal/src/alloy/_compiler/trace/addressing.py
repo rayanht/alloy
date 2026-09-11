@@ -316,6 +316,20 @@ def _match_stride_to_dim(buf_shape, pid_stride):
     return None
 
 
+def _record_axis_dim(spec, axis, ax_info, buf_name, dim_idx, dim_size):
+    """Bind a pid axis to a buffer dim, unless that dim contradicts a known bound.
+
+    A blocked pid's grid stride can coincide with an unrelated dim's stride —
+    BLOCK_N == N makes `B + rk * N + rn` look like an index into B's dim 0 — and
+    the mismatched binding then resizes the grid at dispatch.
+    """
+    if ax_info["bound"] is None:
+        ax_info["bound"] = dim_size
+    elif ax_info["bound"] != dim_size:
+        return
+    spec.pid_dim_map[axis] = (buf_name, dim_idx, dim_size)
+
+
 def _record_pid_dim_from_address(addr):
     """Detect which buffer dimension each pid indexes from address structure.
 
@@ -344,9 +358,16 @@ def _record_pid_dim_from_address(addr):
         return
 
     if pid_axis == "multi":
-        # Multi-axis: resolve each unresolved axis independently.
+        # Multi-axis: resolve each unresolved axis independently. Only the axes
+        # this address actually indexes — a pid absent from it says nothing about
+        # this buffer's dims, and matching it anyway binds the axis to whichever
+        # dim happens to share its block stride (an n-tile pid picking up the
+        # lhs's M, which only looks right while M == N).
         off_tv = offsets._tv
+        axes_here = _find_pid_axes_in_ir(off_tv)
         for axis in list(spec.axes.keys()):
+            if axis not in axes_here:
+                continue
             if spec.axes[axis]["bound"] is not None and axis in spec.pid_dim_map:
                 continue
             ax_info = spec.axes[axis]
@@ -359,10 +380,7 @@ def _record_pid_dim_from_address(addr):
                 grid_stride = ax_info.get("stride") or 1
                 match = _match_stride_to_dim(buf_shape, grid_stride)
                 if match is not None and match[0] >= 0:
-                    dim_idx, dim_size = match
-                    if ax_info["bound"] is None:
-                        ax_info["bound"] = dim_size
-                    spec.pid_dim_map[axis] = (buf_name, dim_idx, dim_size)
+                    _record_axis_dim(spec, axis, ax_info, buf_name, *match)
             else:
                 # Scalar pid (batch-like): walk IR for actual cumulative stride,
                 # then match including total/stride for batch detection.
@@ -375,7 +393,7 @@ def _record_pid_dim_from_address(addr):
                     if ax_info["bound"] is None:
                         ax_info["bound"] = dim_size
                     if dim_idx >= 0:
-                        spec.pid_dim_map[axis] = (buf_name, dim_idx, dim_size)
+                        _record_axis_dim(spec, axis, ax_info, buf_name, dim_idx, dim_size)
         return
 
     if not isinstance(pid_axis, int):
@@ -389,10 +407,10 @@ def _record_pid_dim_from_address(addr):
     match = _match_stride_to_dim(buf_shape, pid_stride)
     if match is not None:
         dim_idx, dim_size = match
-        if spec.axes[pid_axis]["bound"] is None:
-            spec.axes[pid_axis]["bound"] = dim_size
         if dim_idx >= 0:
-            spec.pid_dim_map[pid_axis] = (buf_name, dim_idx, dim_size)
+            _record_axis_dim(spec, pid_axis, spec.axes[pid_axis], buf_name, dim_idx, dim_size)
+        elif spec.axes[pid_axis]["bound"] is None:
+            spec.axes[pid_axis]["bound"] = dim_size
 
 
 def _find_pid_axes_in_ir(tv: TileValue) -> set[int]:

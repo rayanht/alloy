@@ -240,7 +240,7 @@ def trace_kernel(
         if info is None or info["bound"] is None:
             return None
         mapping = sb.pid_dim_map.get(axis)
-        if mapping is not None:
+        if mapping is not None and mapping[2] == info["bound"]:
             buf_name, dim_idx, _ = mapping
             sym_name = f"{buf_name}_dim{dim_idx}"
             if sym_name in sb.bindings:

@@ -31,7 +31,6 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 from enum import Enum
-from typing import cast
 
 from alloy._compiler.tile_ir import (
     BinOp,
@@ -574,7 +573,17 @@ class NamedDType:
 
 
 def _dtype_short(dt) -> str:
-    name = cast(NamedDType, dt).name.lower() if hasattr(dt, "name") else str(dt).lower()
+    """Short IR dtype name for an alloy DType or a torch dtype.
+
+    An alloy DType already carries the short name on `.ir`; only torch dtypes
+    need the table. Reading `.name` finds neither, and the f32 default then
+    silently retypes every non-f32 buffer — a bf16 row buffer read at 4 bytes
+    per element strides off the end of its rows.
+    """
+    ir = getattr(dt, "ir", None)
+    if isinstance(ir, str):
+        return ir
+    name = str(dt).lower().removeprefix("torch.")
     return {
         "float32": "f32", "float16": "f16", "bfloat16": "bf16",
         "int32": "i32", "int64": "i64", "int8": "i8", "uint8": "u8",

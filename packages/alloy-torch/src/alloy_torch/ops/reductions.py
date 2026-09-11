@@ -155,6 +155,24 @@ def _var_correction(
     return biased * (reduced_count / denom)
 
 
+def _linalg_vector_norm(
+    x: AlloyBuffer,
+    ord: float = 2.0,
+    dim: ReductionDim = None,
+    keepdim: bool = False,
+    *,
+    dtype: torch.dtype | None = None,
+) -> AlloyBuffer:
+    """p-norm over `dim`. Only the p=2 and p=1 cases are reachable from torch's
+    decompositions of `Tensor.norm`; anything else needs a general power."""
+    del dtype
+    if float(ord) == 2.0:
+        return _sum_dim(x * x, dim, keepdim).sqrt()
+    if float(ord) == 1.0:
+        return _sum_dim(x.abs(), dim, keepdim)
+    raise NotImplementedError(f"alloy: linalg_vector_norm with ord={ord}")
+
+
 def _sum_dim(
     x: AlloyBuffer,
     dim: ReductionDim,

@@ -76,3 +76,5 @@ app/
 bench_logs/
 scripts/
 *.gputrace
+# internal training speedrun — not part of the package yet
+speedrun/

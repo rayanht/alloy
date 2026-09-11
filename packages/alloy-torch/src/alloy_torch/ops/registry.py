@@ -62,6 +62,7 @@ from alloy_torch.ops.indexing import (
     _scatter_value,
     _select_backward,
     _slice_scatter,
+    _flip,
 )
 from alloy_torch.ops.linalg import (
     MLX_Q4,
@@ -104,6 +105,7 @@ from alloy_torch.ops.reductions import (
     _softmax,
     _sum_dim,
     _var_correction,
+    _linalg_vector_norm,
 )
 from alloy_torch.ops.rope import (
     _fused_rms_norm_rope,
@@ -214,6 +216,7 @@ ATEN_TO_ALLOY = {
     torch.ops.aten.full_like.default: _full_like,
     torch.ops.aten.scatter.value: _scatter_value,
     torch.ops.aten.scatter_add.default: _scatter_add,
+    torch.ops.aten.flip.default: _flip,
     torch.ops.aten.gather.default: _gather,
     torch.ops.aten.lift_fresh_copy.default: lambda x: x,
     torch.ops.aten.mean.dim: _mean_dim,
@@ -243,6 +246,7 @@ ATEN_TO_ALLOY = {
     torch.ops.aten.split_with_sizes.default: _split_with_sizes,
     torch.ops.aten.sum.default: lambda x: _sum_dim(x, None),
     torch.ops.aten.sum.dim_IntList: _sum_dim,
+    torch.ops.aten.linalg_vector_norm.default: _linalg_vector_norm,
     torch.ops.aten.t.default: AlloyBuffer.transpose,
     torch.ops.aten.tanh.default: AlloyBuffer.tanh,
     torch.ops.aten.transpose.int: _transpose_dims,

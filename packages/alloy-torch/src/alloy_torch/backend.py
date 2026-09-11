@@ -1401,7 +1401,7 @@ def _compile_to_plan(
     mutation_input_slots: dict[int, int] = {}
     if mutation_map:
         mutation_input_slots = _apply_mutation_remap(
-            output_mapping, dispatches, slots, input_ptrs, mutation_map
+            output_mapping, dispatches, slots, input_ptrs, mutation_map, buf_map
         )
 
     # Request-bounded shrink pool: classify M-outer slots BEFORE liveness so
@@ -1556,6 +1556,7 @@ def _apply_mutation_remap(
     slots: list[InputSlot | WeightSlot | IntermediateSlot],
     input_ptrs: dict[int, InputPtrInfo],
     mutation_map: dict[int, int],
+    buf_map: dict[int, AlloyBuffer],
 ) -> dict[int, int]:
     """Route mutation-output intermediates through the corresponding InputSlots.
 
@@ -1587,6 +1588,34 @@ def _apply_mutation_remap(
         if not isinstance(slots[old_slot_idx], IntermediateSlot):
             continue
         new_slot_idx = arg_to_slot.get(arg_idx)
+
+        # The retarget points the dispatch that computes this value straight at
+        # the input's storage, so the value must occupy exactly as many bytes as
+        # the tensor it mutates. A bf16 param whose update is computed in f32
+        # does not: routing it would write 2x the buffer. Leaving the output as
+        # an intermediate falls back to AOT's `input.copy_(output)`, which
+        # converts instead of overrunning.
+        inter_nbytes = slots[old_slot_idx].nbytes
+        target_nbytes = None
+        if new_slot_idx is not None:
+            target_nbytes = slots[new_slot_idx].nbytes
+        else:
+            for ptr, info in input_ptrs.items():
+                if info.arg_idx == arg_idx:
+                    bound = buf_map.get(ptr)
+                    if bound is not None:
+                        target_nbytes = bound.metal_nbytes
+                    break
+        if target_nbytes is not None and target_nbytes != inter_nbytes:
+            logger.info(
+                "mutation_remap_skipped_size_mismatch",
+                arg_idx=arg_idx,
+                value_nbytes=inter_nbytes,
+                target_nbytes=target_nbytes,
+                dtype=entry.dtype.ir,
+            )
+            continue
+
         if new_slot_idx is None:
             # No dispatch uses the input arg as a buffer — create one to retarget
             # the write. The mutated-input nbytes matches the intermediate's.
@@ -1604,7 +1633,7 @@ def _apply_mutation_remap(
             slots.append(
                 InputSlot(
                     arg_idx=arg_idx,
-                    nbytes=inter.nbytes,
+                    nbytes=target_nbytes or inter.nbytes,
                     root_ptr=root_ptr,
                     view_offset=input_info.view_offset,
                 )
@@ -2072,7 +2101,7 @@ def _execute_plan(plan: CompiledPlan, args: tuple[torch.Tensor, ...],
                 if entry.byte_offset or (
                     entry.strides_bytes
                     and entry.strides_bytes
-                    != _compute_contiguous_strides(entry.shape, t.element_size())
+                    != _compute_contiguous_strides(entry.shape, entry.dtype.itemsize)
                 ):
                     results.append(
                         make_tensor_from_ptr(

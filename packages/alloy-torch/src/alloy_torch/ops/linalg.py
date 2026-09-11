@@ -13,7 +13,13 @@ from alloy._dispatch.kernel import KernelFunction
 from alloy._runtime.alloy_buffer import AlloyBuffer
 from alloy._runtime.tune_configs import resolve_config
 from alloy.std.elementwise import gelu_tanh_mul, silu_mul
-from alloy.std.gemm import dot, dot_transpose_lhs, dot_transpose_rhs, dot_transpose_rhs_silu
+from alloy.std.gemm import (
+    dot,
+    dot_batched,
+    dot_transpose_lhs,
+    dot_transpose_rhs,
+    dot_transpose_rhs_silu,
+)
 from alloy.std.quant import (
     dot_dequant,
     dot_dequant_silu,
@@ -46,7 +52,6 @@ from alloy.std.quant import (
 from alloy_torch.mode import is_training_mode_enabled
 from alloy_torch.ops.concat import _cat
 from alloy_torch.ops.creation import _full
-from alloy_torch.ops.views import _select_int
 
 _mm_batched_cache: dict[tuple[int, ...], tuple[AlloyBuffer, list[int]]] = {}
 
@@ -100,6 +105,31 @@ def _addmm(
     return out + bias
 
 
+def _transpose_base_3d(value: AlloyBuffer) -> AlloyBuffer | None:
+    """Detect a batch-wise transposed view — `x.transpose(-2, -1)` over a
+    contiguous (BATCH, N, K) — and return the untransposed base."""
+    if len(value._shape) != 3:
+        return None
+    batch, rows, cols = value._shape
+    itemsize = value._dtype.itemsize
+    if value._strides != (rows * cols * itemsize, itemsize, rows * itemsize):
+        return None
+
+    base_buf = AlloyBuffer(
+        value._parent_handle,
+        value._offset,
+        value._shape,
+        value._strides,
+        value._dtype,
+        raw_ptr=value._raw_ptr,
+        total_nbytes=value._total_nbytes,
+    )
+    base_buf.reinterpret(
+        (batch, cols, rows), (rows * cols * itemsize, rows * itemsize, itemsize)
+    )
+    return value._view_of(base_buf)
+
+
 def _bmm(a: AlloyBuffer, b: AlloyBuffer) -> AlloyBuffer:
     if a.ndim != 3 or b.ndim != 3:
         raise NotImplementedError(f"aten.bmm requires rank-3 tensors, got {a.shape} and {b.shape}")
@@ -108,23 +138,16 @@ def _bmm(a: AlloyBuffer, b: AlloyBuffer) -> AlloyBuffer:
     if reduction == 1 and rhs_reduction == 1:
         return a * b
 
-    a = a.contiguous()
-    b = b.contiguous()
-    slices: list[AlloyBuffer] = []
-    for batch_index in range(batch):
-        a_slice = _select_int(a, 0, batch_index)
-        b_slice = _select_int(b, 0, batch_index)
-        out_slice = _mm(a_slice, b_slice)
-        slices.append(out_slice.reshape(1, rows, cols))
-
-    while len(slices) > 1:
-        pairs: list[AlloyBuffer] = []
-        for index in range(0, len(slices) - 1, 2):
-            pairs.append(_cat((slices[index], slices[index + 1]), dim=0))
-        if len(slices) % 2 == 1:
-            pairs.append(slices[-1])
-        slices = pairs
-    return slices[0]
+    a = _ensure_zero_offset(a.contiguous())
+    rhs_t_base = _transpose_base_3d(b)
+    if rhs_t_base is not None:
+        rhs = _ensure_zero_offset(rhs_t_base)
+        trans_rhs = 1
+    else:
+        rhs = _ensure_zero_offset(b.contiguous())
+        trans_rhs = 0
+    out = _alloc_scratch((batch, rows, cols), a.dtype)
+    return dot_batched(a, rhs, out, _TRANS_RHS=trans_rhs)
 
 
 def _read_int_scalar(buf: AlloyBuffer) -> int:

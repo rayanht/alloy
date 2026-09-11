@@ -40,6 +40,8 @@ _NON_FUSABLE_ELEM_KERNELS = frozenset(
         "k_index_2d_nd",  # data-dependent indexing
         "k_index_copy_dim2_4d",  # scatter with loop over positions
         "k_cache_scatter_dim2_4d",  # scatter to cache at indexed positions
+        "k_index_put_add_rows",  # atomic scatter-add; the store covers only indexed rows,
+        # so an epilogue folded into it never reaches the rest of the output
         "k_copy",  # identity copy — no point fusing
         "strided_copy_4d",  # strided source addressing (infrastructure kernel)
         "strided_copy_5d",  # strided source addressing (5D variant)

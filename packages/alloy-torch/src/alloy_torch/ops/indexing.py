@@ -41,6 +41,23 @@ ScalarIndexValue = AlloyBuffer | torch.Tensor | bool | int
 
 
 @alloy.kernel
+def k_flip_last(
+    x,
+    out: output,
+    N: constexpr,
+    DIM: constexpr,
+    BLOCK_SIZE: constexpr = 1024,
+):
+    """Reverse the last dimension: out[..., i] = x[..., DIM-1-i]."""
+    pid = alloy.program_id(0)
+    offs = pid * BLOCK_SIZE + alloy.arange(0, BLOCK_SIZE)
+    mask = offs < N
+    within = offs % DIM
+    row_start = offs - within
+    alloy.store(out + offs, alloy.load(x + row_start + (DIM - 1 - within), mask=mask), mask=mask)
+
+
+@alloy.kernel
 def k_scatter_last_2d(
     base,
     idx,
@@ -958,3 +975,22 @@ def _constant_pad_nd(x: AlloyBuffer, pad: list[int], value: float = 0.0) -> Allo
         if len(parts) > 1:
             out = _cat(parts, dim)
     return out
+
+
+def _flip(x: AlloyBuffer, dims: Sequence[int]) -> AlloyBuffer:
+    """`aten.flip` over the last dimension.
+
+    Reversing an interior dimension would need a strided walk; the rotary
+    pair-swap only ever reverses the last one, so that is what is implemented —
+    an unsupported dim raises rather than silently returning the input.
+    """
+    shape = _shape_of(x)
+    normalized = [_normalize_dim(int(d), len(shape)) for d in dims]
+    if len(normalized) != 1 or normalized[0] != len(shape) - 1:
+        raise NotImplementedError(
+            f"alloy: aten.flip supports the last dimension only, got dims={list(dims)} "
+            f"for shape {tuple(shape)}"
+        )
+    x = x.contiguous()
+    out = k_flip_last(x, N=x.size, DIM=shape[-1])
+    return out.reshape(tuple(shape))

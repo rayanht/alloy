@@ -41,6 +41,63 @@ def dot(
 
 @al.tunable(
     BLOCK_M=[8, 16, 32, 64],
+    BLOCK_N=[32, 64, 128],
+    BLOCK_K=[16, 32, 64],
+    _reg=[1, 2, 4],
+    _TRANS_RHS=[0, 1],
+    options=dict(double_buffer=[0, 1]),
+)
+@al.kernel
+def dot_batched(
+    A,
+    B,
+    C: al.output,
+    BLOCK_M: al.constexpr = 64,
+    BLOCK_N: al.constexpr = 64,
+    BLOCK_K: al.constexpr = 16,
+    _TRANS_RHS: al.constexpr = 0,
+):
+    """Batched matmul C[b] = A[b] @ B[b], one program per (batch, m-tile, n-tile).
+
+    `_TRANS_RHS` takes B as (BATCH, N, K) and contracts along its last axis, so
+    `X @ X.transpose(-2, -1)` needs no materialized transpose.
+
+    Shape-congruent independent matmuls are what the same-LHS batching rewrite
+    cannot merge — it needs a shared activation, and these share only a shape.
+    """
+    BATCH, M, K = A.shape
+    pb = al.program_id(0)
+    pm = al.program_id(1)
+    pn = al.program_id(2)
+    rm = pm * BLOCK_M + al.arange(0, BLOCK_M)
+    rn = pn * BLOCK_N + al.arange(0, BLOCK_N)
+    rk = al.arange(0, BLOCK_K)
+    acc = al.zeros((BLOCK_M, BLOCK_N), dtype=al.float32)
+    a_ptrs = A + pb * (M * K) + rm[:, None] * K + rk[None, :]
+    if _TRANS_RHS:
+        N = B.shape[1]
+        b_ptrs = B + pb * (N * K) + rn[:, None] * K + rk[None, :]
+        for k in range(0, K, BLOCK_K):
+            a = al.load(a_ptrs, mask=(rm[:, None] < M) & (rk[None, :] < K))
+            b = al.load(b_ptrs, mask=(rn[:, None] < N) & (rk[None, :] < K))
+            acc += al.tile_dot(a, b, transpose_rhs=True)
+            a_ptrs += BLOCK_K
+            b_ptrs += BLOCK_K
+    else:
+        N = B.shape[2]
+        b_ptrs = B + pb * (K * N) + rk[:, None] * N + rn[None, :]
+        for k in range(0, K, BLOCK_K):
+            a = al.load(a_ptrs, mask=(rm[:, None] < M) & (rk[None, :] < K))
+            b = al.load(b_ptrs, mask=(rk[:, None] < K) & (rn[None, :] < N))
+            acc += al.tile_dot(a, b)
+            a_ptrs += BLOCK_K
+            b_ptrs += BLOCK_K * N
+    c_ptrs = C + pb * (M * N) + rm[:, None] * N + rn[None, :]
+    al.store(c_ptrs, acc, mask=(rm[:, None] < M) & (rn[None, :] < N))
+
+
+@al.tunable(
+    BLOCK_M=[8, 16, 32, 64],
     BLOCK_N=[8, 32, 64, 128],
     BLOCK_K=[16, 32, 64],
     _reg=[1, 2, 4],
