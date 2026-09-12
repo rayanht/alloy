@@ -707,6 +707,65 @@ def create_native_served_model(
     )
 
 
+def create_deepseek41_served_model(config: ServerConfig, resolved: ResolvedModel) -> ServedModel:
+    """The DeepSeek-V4.1 streaming engine behind the generic served-model seam:
+    chat-template encode, greedy/temperature decode, whole-history prefix reuse."""
+    from alloy_server.models import load_model as registry_load_model  # scoped: arch-specific path; the module-level name is the native loader callback
+    from alloy_server.models.deepseek_v41.engine import GenerationStats  # scoped: arch-specific engine; keeps the server import graph free of it
+    from alloy_server.models.deepseek_v41.handler import LoadedDeepseekV41  # scoped: same
+
+    t0 = time.perf_counter()
+    loaded = registry_load_model(resolved).payload
+    if not isinstance(loaded, LoadedDeepseekV41):
+        raise TypeError(f"expected a DeepSeek-V4.1 payload for {resolved.ref}")
+    engine, tokenizer = loaded.engine, loaded.tokenizer
+    engine.warmup()
+    logger.info("model_ready", model=resolved.ref, load_s=round(time.perf_counter() - t0, 1))
+    encode_messages = tokenizer_chat_encoder(tokenizer)
+    eos = frozenset(loaded.eos_token_ids)
+    last: dict = {}
+    pending: list[SamplingParams | None] = [None]
+
+    def run_ids(input_ids: torch.Tensor, max_new_tokens: int) -> Iterator[int]:
+        params = pending[0]
+        stats = GenerationStats()
+        yield from engine.generate(
+            input_ids[0].numpy(), max_new_tokens, eos_ids=tuple(eos),
+            temperature=float(params.temperature) if params else 0.0,
+            seed=int(params.seed) if params else 0, stats=stats,
+        )
+        decode_ms = stats.decode_s * 1000.0
+        last.clear()
+        last.update({
+            "prefill_ms": stats.prefill_s * 1000.0, "decode_ms": decode_ms,
+            "prompt_tokens": stats.prompt_tokens + stats.reused_tokens, "decode_tokens": stats.decode_tokens,
+            "warm_prefix_len": stats.reused_tokens,
+            "expert_hit_rate": stats.expert_hits / max(stats.expert_hits + stats.expert_misses, 1),
+            "expert_gib_read": stats.expert_bytes / (1 << 30),
+        })
+
+    def generate(input_ids: torch.Tensor, max_new_tokens: int, constraint: Constraint | None = None) -> torch.Tensor:
+        toks = list(run_ids(input_ids, max_new_tokens))
+        new = torch.tensor([toks], dtype=torch.long)
+        return torch.cat([input_ids, new], dim=1)
+
+    def stream_token_ids(input_ids: torch.Tensor, max_new_tokens: int, constraint: Constraint | None = None) -> Iterator[int]:
+        yield from run_ids(input_ids, max_new_tokens)
+
+    def decode(ids: torch.Tensor) -> str:
+        return cast(str, tokenizer.decode(ids.tolist(), skip_special_tokens=True))
+
+    def apply_sampling(params: SamplingParams) -> None:
+        pending[0] = params
+
+    return create_generation_served_model(
+        config.model, encode_messages, decode, generate, stream_token_ids,
+        tokenizer_text_counter(tokenizer), tokenizer=tokenizer,
+        reset_prefix_state=engine.reset, eos_token_ids=eos, apply_sampling=apply_sampling,
+        last_timings=lambda: dict(last), reasoning=resolve_reasoning_protocol(tokenizer, ()),
+    )
+
+
 def parse_server_config(argv: tuple[str, ...] | None = None) -> ServerConfig:
     parser = server_arg_parser()
     namespace = parser.parse_args(argv)
@@ -740,7 +799,9 @@ def run_server(config: ServerConfig) -> None:
     kind = model_kind(arch)
     served: object
     modality: Modality
-    if kind == "chat":
+    if arch == "deepseek41":
+        served, modality = create_deepseek41_served_model(config, resolved), CHAT
+    elif kind == "chat":
         served, modality = create_native_served_model(config, resolved), CHAT
     elif kind == "embed":
         from alloy_server.models.nomic_bert import load_ollama_gguf_embedder  # scoped: pulls transformers.NomicBertModel + huggingface_hub side effects; load only when an embed model is actually served

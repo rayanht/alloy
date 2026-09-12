@@ -296,6 +296,7 @@ def moe_gate_up_grouped(
     BLOCK_M: al.constexpr = 8,    # == sort PAD_M; not tuned
     BLOCK_N: al.constexpr = 32,
     BLOCK_K: al.constexpr = 64,
+    SWIGLU_LIMIT: al.constexpr = 0.0,   # > 0: gate <= L, up in [-L, L]
 ):
     """Grouped native-Q4_K gate+up GEMM with SiLU and the ROUTING WEIGHT folded in
     (prefill, one tile of one expert).
@@ -357,6 +358,9 @@ def moe_gate_up_grouped(
         acc_up += al.tile_dot(a, up, transpose_rhs=True)
         a_ptrs += BLOCK_K
 
+    if SWIGLU_LIMIT > 0:
+        acc_gate = al.minimum(acc_gate, SWIGLU_LIMIT)
+        acc_up = al.maximum(al.minimum(acc_up, SWIGLU_LIMIT), -SWIGLU_LIMIT)
     silu = acc_gate * (1.0 / (1.0 + al.exp(-acc_gate))) * acc_up * w_row[:, None]
     al.store(H_OUT + rm[:, None] * I + rn[None, :], silu, mask=valid[:, None] & (rn[None, :] < I))
 
@@ -520,6 +524,71 @@ def moe_down_grouped_partial(
             DOWN_Q6 + down_row[:, None] * ROW_BYTES + elem_k[None, :],
             mask=elem_k[None, :] < I,
             _dequant_format="q6_k",
+        )
+        acc += al.tile_dot(a, b, transpose_rhs=True)
+        a_ptrs += BLOCK_K
+
+    al.store(
+        PARTIAL + rm[:, None] * HID + rn[None, :],
+        acc,
+        mask=(rm[:, None] < MAX_ROWS) & (rn[None, :] < HID),
+    )
+
+
+# BLOCK_M fixed (= sort PAD_M); only BLOCK_N/BLOCK_K swept (see moe_gate_up_grouped).
+@al.tunable(
+    BLOCK_N=[32, 64, 128],
+    BLOCK_K=[64, 128, 256],
+)
+@al.kernel
+def moe_down_grouped_partial_q4k(
+    H_IN,               # (MAX_ROWS, I) tile-major w·gate_up_silu output
+    DOWN_Q4,            # (E*H, (I/256)*144) uint8 native Q4_K down weights, expert-stacked rows
+    PERM,               # (MAX_ROWS,) int32 padded-row -> source (token,slot) flat idx
+    TILE_EXPERT,        # (MAX_TILES,) int32 tile -> expert id
+    TOTAL_ROWS,         # (1,) int32 active-tile row boundary
+    PARTIAL: al.output,  # (MAX_ROWS, H) per-sorted-row down output (overwrite, no atomics)
+    HID: al.constexpr,
+    MOE_INTER: al.constexpr,
+    MAX_ROWS: al.constexpr,
+    BLOCK_M: al.constexpr = 8,    # == sort PAD_M; not tuned
+    BLOCK_N: al.constexpr = 64,
+    BLOCK_K: al.constexpr = 64,
+    GROUP_SIZE: al.constexpr = 256,
+):
+    """`moe_down_grouped_partial` for Q4_K down weights (144-byte superblocks)."""
+    I = MOE_INTER
+    BLOCK_BYTES = 144
+    N_GROUPS = I // GROUP_SIZE
+    ROW_BYTES = N_GROUPS * BLOCK_BYTES
+
+    pm = al.program_id(0)
+    pn = al.program_id(1)
+    rm = pm * BLOCK_M + al.arange(0, BLOCK_M)
+    rn = pn * BLOCK_N + al.arange(0, BLOCK_N)
+    rk = al.arange(0, BLOCK_K)
+
+    e = al.cast(al.load(TILE_EXPERT + pm), al.int32)
+    e_safe = al.maximum(e, al.cast(0, al.int32))
+    src = al.cast(al.load(PERM + rm), al.int32)
+    valid = src >= 0
+    total_rows = al.cast(al.load(TOTAL_ROWS + 0), al.int32)
+    k_end = al.where(pm * BLOCK_M < total_rows, al.cast(I, al.int32), al.cast(0, al.int32))
+
+    a_ptrs = H_IN + rm[:, None] * I + rk[None, :]
+    down_row = e_safe * HID + rn
+    acc = al.zeros((BLOCK_M, BLOCK_N), dtype=al.float32)
+
+    for k in range(0, k_end, BLOCK_K):
+        elem_k = k + rk
+        a = al.load(
+            a_ptrs,
+            mask=valid[:, None] & (rm[:, None] < MAX_ROWS) & (elem_k[None, :] < I),
+        )
+        b = al.load(
+            DOWN_Q4 + down_row[:, None] * ROW_BYTES + elem_k[None, :],
+            mask=elem_k[None, :] < I,
+            _dequant_format="q4_k",
         )
         acc += al.tile_dot(a, b, transpose_rhs=True)
         a_ptrs += BLOCK_K

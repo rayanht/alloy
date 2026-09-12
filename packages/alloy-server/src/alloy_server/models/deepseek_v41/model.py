@@ -40,7 +40,22 @@ from alloy.std.deepseek import (
     ds_zero_u8,
 )
 from alloy.std.gemm import dot_transpose_rhs
-from alloy.std.moe import moe_down_combine, moe_down_combine_q4k, moe_gate_up_silu
+from alloy.std.moe import (
+    moe_combine_rows,
+    moe_down_combine,
+    moe_down_combine_q4k,
+    moe_down_grouped_partial,
+    moe_down_grouped_partial_q4k,
+    moe_gate_up_grouped,
+    moe_gate_up_silu,
+    moe_row_tokens,
+    moe_sort_block_count,
+    moe_sort_block_off,
+    moe_sort_count_from_blocks,
+    moe_sort_offsets,
+    moe_sort_perm_scan,
+    moe_tile_expert,
+)
 from alloy.std.norm import rms_norm
 from alloy_torch.ops.linalg import Q4_K, Q6_K, quant_embedding, quant_mm
 from alloy_server.models.deepseek_v41.config import DeepseekV41Config
@@ -448,20 +463,74 @@ class DeepseekV41Model:
         slots = self.experts.acquire(layer, routing.tolist())
         slot_ids = i32_buffer(np.array([slots[int(e)] for e in routing], dtype=np.int32))
         arena = self.experts.arena(layer)
-        h = _alloc_aligned((T * K, I), float32)
-        moe_gate_up_silu[(T * K, I)](
-            x, arena.gate_up, slot_ids, h, K=d, MOE_INTER=I, TOP_K=K, SWIGLU_LIMIT=cfg.swiglu_limit,
-        )
-        y = _alloc_aligned((T, d), float32)
-        if arena.layout.down_qtype.name == "Q6_K":
-            moe_down_combine[(T, d)](h, arena.down, slot_ids, wts, y, HID=d, MOE_INTER=I, TOP_K=K)
+        q6 = arena.layout.down_qtype.name == "Q6_K"
+        if T == 1:
+            h = _alloc_aligned((K, I), float32)
+            moe_gate_up_silu[(K, I)](
+                x, arena.gate_up, slot_ids, h, K=d, MOE_INTER=I, TOP_K=K, SWIGLU_LIMIT=cfg.swiglu_limit,
+            )
+            y = _alloc_aligned((1, d), float32)
+            down = moe_down_combine if q6 else moe_down_combine_q4k
+            down[(1, d)](h, arena.down, slot_ids, wts, y, HID=d, MOE_INTER=I, TOP_K=K)
         else:
-            moe_down_combine_q4k[(T, d)](h, arena.down, slot_ids, wts, y, HID=d, MOE_INTER=I, TOP_K=K)
+            y = self.moe_grouped(x, arena.gate_up, arena.down, q6, arena.slots, slot_ids, wts)
         gate = mm(x, L.shexp_gate)
         up = mm(x, L.shexp_up)
         hs = _alloc_aligned((T, I), float32)
         ds_swiglu_clamp[(cdiv(T * I, 1024),)](gate, up, hs, N=T * I, LIMIT=cfg.swiglu_limit)
         return y + mm(hs, L.shexp_down)
+
+    def moe_grouped(self, x: AlloyBuffer, gate_up: AlloyBuffer, down: AlloyBuffer, q6: bool, slots: int,
+                    slot_ids: AlloyBuffer, wts: AlloyBuffer) -> AlloyBuffer:
+        """Prefill routed experts as grouped GEMMs (the `gguf_moe_routed` pipeline) in
+        arena-slot space: the counting sort keys on slot ids, so tiles index the arena
+        directly and no expert -> slot remap is needed."""
+        cfg = self.cfg
+        T = x.shape[0]
+        K, I, d = cfg.n_activated_experts, cfg.moe_inter_dim, cfg.dim
+        S = slots
+        R = T * K
+        pad, sort_b, bn, bk = 8, 128, 64, 64
+        max_tiles = S + cdiv(R, pad)
+        max_rows = max_tiles * pad
+        active = i32_buffer(np.array([T], dtype=np.int32))
+        nb = cdiv(R, sort_b)
+        block_count = _alloc_aligned((nb * S,), int32)
+        moe_sort_block_count[(nb * S,)](slot_ids, active, block_count, R_TOTAL=R, SORT_B=sort_b, NUM_EXPERTS=S, TOP_K=K)
+        count = _alloc_aligned((S,), int32)
+        moe_sort_count_from_blocks[(S,)](block_count, active, count, R_TOTAL=R, SORT_B=sort_b, NUM_EXPERTS=S, TOP_K=K)
+        row_off = _alloc_aligned((S,), int32)
+        total = _alloc_aligned((1,), int32)
+        moe_sort_offsets[(1,)](count, row_off, total, NUM_EXPERTS=S, PAD_M=pad)
+        tile_e = _alloc_aligned((max_tiles,), int32)
+        moe_tile_expert[(max_tiles,)](row_off, count, tile_e, NUM_EXPERTS=S, PAD_M=pad)
+        block_off = _alloc_aligned((nb * S,), int32)
+        moe_sort_block_off[(S,)](block_count, row_off, block_off, NB=nb, NUM_EXPERTS=S)
+        perm = _alloc_aligned((max_rows,), int32)
+        inv = _alloc_aligned((R,), int32)
+        row_token = _alloc_aligned((max_rows,), int32)
+        moe_sort_perm_scan[(R,)](slot_ids, block_off, perm, inv, row_token, TOP_K=K, SORT_B=sort_b, NUM_EXPERTS=S)
+        tok_ld = _alloc_aligned((max_rows,), int32)
+        tok_st = _alloc_aligned((max_rows,), int32)
+        w_row = _alloc_aligned((max_rows,), float32)
+        moe_row_tokens[(cdiv(max_rows, 256),)](
+            row_token, perm, wts, tile_e, row_off, count, total, tok_ld, tok_st, w_row,
+            PAD_M=pad, MAX_ROWS=max_rows, R_TOTAL=R, BLOCK=256,
+        )
+        h = _alloc_aligned((max_rows, I), float32)
+        moe_gate_up_grouped[(max_tiles, cdiv(I, bn))](
+            x, gate_up, perm, tok_ld, tile_e, total, w_row, h,
+            K=d, MOE_INTER=I, BLOCK_M=pad, BLOCK_N=bn, BLOCK_K=bk, SWIGLU_LIMIT=cfg.swiglu_limit,
+        )
+        partial = _alloc_aligned((max_rows, d), float32)
+        down_kernel = moe_down_grouped_partial if q6 else moe_down_grouped_partial_q4k
+        down_kernel[(max_tiles, cdiv(d, bn))](
+            h, down, perm, tile_e, total, partial,
+            HID=d, MOE_INTER=I, MAX_ROWS=max_rows, BLOCK_M=pad, BLOCK_N=bn, BLOCK_K=bk,
+        )
+        y = _alloc_aligned((T, d), float32)
+        moe_combine_rows[(T, cdiv(d, 256))](partial, inv, y, HID=d, TOP_K=K, BLOCK=256)
+        return y
 
     # --- forward -----------------------------------------------------------------------
 

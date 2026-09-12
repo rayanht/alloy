@@ -46,3 +46,22 @@ def test_eos_stops(engines):
     big.reset()
     toks = list(big.generate(prompt, 4, eos_ids=(first,)))
     assert toks == [first]
+
+
+def test_multi_turn_prefix_reuse(engines):
+    cfg, big, _ = engines
+    big.reset()
+    rng = np.random.default_rng(2)
+    turn1 = rng.integers(3, cfg.vocab_size, size=9, dtype=np.int64)
+    reply = list(big.generate(turn1, 4))
+    history = np.concatenate([turn1, np.array(reply, dtype=np.int64)])
+    turn2 = np.concatenate([history, rng.integers(3, cfg.vocab_size, size=5, dtype=np.int64)])
+    stats = GenerationStats()
+    warm = list(big.generate(turn2, 3, stats=stats))
+    # the whole history is reused except the last reply token, which was sampled but
+    # never fed through the model
+    assert stats.reused_tokens == len(history) - 1
+    assert stats.prompt_tokens == 6
+    big.reset()
+    cold = list(big.generate(turn2, 3))
+    assert warm == cold

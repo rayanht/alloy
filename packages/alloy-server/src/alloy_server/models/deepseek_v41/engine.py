@@ -57,6 +57,7 @@ def default_arena_bytes(split: SplitGGUF, cfg: DeepseekV41Config, max_seq_len: i
 @dataclass
 class GenerationStats:
     prompt_tokens: int = 0
+    reused_tokens: int = 0
     prefill_s: float = 0.0
     decode_tokens: int = 0
     decode_s: float = 0.0
@@ -94,6 +95,8 @@ class DeepseekV41Engine:
             self.cfg, self.weights, self.experts, self.engram, max_seq_len=self.max_seq_len, rounding=rounding,
         )
         self.state: SequenceState = self.model.new_state()
+        # every token the live state has consumed (prompt + generated), for prefix reuse
+        self.history: list[int] = []
         logger.info(
             "deepseek41_loaded",
             took_s=round(time.perf_counter() - t0, 1),
@@ -109,14 +112,36 @@ class DeepseekV41Engine:
 
     def reset(self) -> None:
         self.state = self.model.new_state()
+        self.history = []
+
+    def resume_point(self, ids: np.ndarray) -> int:
+        """How many leading tokens of `ids` the live state already holds. Only a
+        prompt that extends the whole history resumes (the multi-turn append); any
+        divergence restarts cold — the caches are position-indexed but the window /
+        compressor state has no rewind."""
+        n = self.state.pos
+        if n == 0 or len(ids) <= n:
+            return 0
+        if self.history[:n] == ids[:n].tolist():
+            return n
+        return 0
 
     def prefill(self, ids: np.ndarray) -> np.ndarray:
         """Chunked prefill from the current position; returns the last token's logits."""
         ids = np.asarray(ids, dtype=np.int64).reshape(-1)
         logits = None
         for start in range(0, len(ids), self.chunk_size):
-            logits = self.model.forward(self.state, ids[start : start + self.chunk_size])
+            chunk = ids[start : start + self.chunk_size]
+            logits = self.model.forward(self.state, chunk)
+            self.history.extend(int(t) for t in chunk)
         return logits[0]
+
+    def warmup(self) -> None:
+        """JIT every kernel variant (prefill chunk + decode step) on a scratch state."""
+        ids = np.array([self.cfg.bos_token_id, 3, 4, 5], dtype=np.int64)
+        for _ in self.generate(ids, 2):
+            pass
+        self.reset()
 
     def generate(
         self,
@@ -131,16 +156,21 @@ class DeepseekV41Engine:
         """Prefill the prompt then decode token by token (greedy when temperature is 0)."""
         rng = np.random.default_rng(seed)
         prompt_ids = np.asarray(prompt_ids, dtype=np.int64).reshape(-1)
-        if self.state.pos + len(prompt_ids) + max_new_tokens > self.max_seq_len:
+        resume = self.resume_point(prompt_ids)
+        if resume == 0:
+            self.reset()
+        suffix = prompt_ids[resume:]
+        if self.state.pos + len(suffix) + max_new_tokens > self.max_seq_len:
             raise ValueError(
                 f"prompt {len(prompt_ids)} + {max_new_tokens} new tokens exceeds max_seq_len {self.max_seq_len}"
             )
         misses0, hits0, bytes0 = self.experts.misses, self.experts.hits, self.experts.bytes_read
         t0 = time.perf_counter()
-        logits = self.prefill(prompt_ids)
+        logits = self.prefill(suffix)
         t1 = time.perf_counter()
         if stats is not None:
-            stats.prompt_tokens += len(prompt_ids)
+            stats.prompt_tokens += len(suffix)
+            stats.reused_tokens += resume
             stats.prefill_s += t1 - t0
         for i in range(max_new_tokens):
             token = self.sample(logits, temperature, rng)
@@ -151,6 +181,7 @@ class DeepseekV41Engine:
                 break
             t_step = time.perf_counter()
             logits = self.model.forward(self.state, np.array([token], dtype=np.int64))[0]
+            self.history.append(token)
             if stats is not None:
                 stats.step_times.append(time.perf_counter() - t_step)
         if stats is not None:
