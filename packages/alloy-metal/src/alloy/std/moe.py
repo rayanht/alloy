@@ -88,6 +88,7 @@ def moe_gate_up_silu(
     K: al.constexpr,
     MOE_INTER: al.constexpr,     # I
     TOP_K: al.constexpr,
+    SWIGLU_LIMIT: al.constexpr = 0.0,   # > 0: gate <= L, up in [-L, L] (DeepSeek clamped SwiGLU)
 ):
     """Gathered native-Q4_K gate+up matvec with SiLU fusion (decode, one row/slot).
 
@@ -132,7 +133,61 @@ def moe_gate_up_silu(
 
     g = al.simd_reduce(g0)
     u = al.simd_reduce(u0)
+    if SWIGLU_LIMIT > 0:
+        g = al.minimum(g, SWIGLU_LIMIT)
+        u = al.clamp(u, -SWIGLU_LIMIT, SWIGLU_LIMIT)
     al.store(H_OUT + ts * I + col0, _q4k_silu(g) * u, mask=(tid < 1))
+
+
+@al.kernel
+def moe_down_combine_q4k(
+    H_IN,               # (T*TOP_K, I) per-slot gate_up_silu outputs (fp32)
+    DOWN_Q4,            # (E, H, (I/256)*144) uint8 native Q4_K down weights
+    ROUTING,            # (T*TOP_K,) int32 expert index per (token,slot)
+    WEIGHTS,            # (T*TOP_K,) f32 routing weight per (token,slot)
+    Y_OUT: al.output,   # (T, H) combined routed-expert output
+    HID: al.constexpr,
+    MOE_INTER: al.constexpr,
+    TOP_K: al.constexpr,
+):
+    """`moe_down_combine` for Q4_K down weights: the `moe_gate_up_silu` lane layout
+    over the down row `e*H + j`, accumulating `w[slot] * (down[e] @ h[slot])` across the
+    TOP_K slots before one simd reduce."""
+    I = MOE_INTER
+    NB = I // 256
+    NQ = NB // 4
+    R = NB - 4 * NQ
+
+    t = al.program_id(0)
+    j = al.program_id(1)
+    tid = al.arange(0, 32)
+    ix = tid // 8
+    it = tid - ix * 8
+    iq = it // 4
+    ir = it - iq * 4
+    o = 64 * iq + 8 * ir
+
+    acc = 0.0
+    for s in range(TOP_K):
+        ts = t * TOP_K + s
+        e = al.cast(al.load(ROUTING + ts), al.int32)
+        w = al.load(WEIGHTS + ts)
+        row = e * HID + j
+        part = 0.0
+        for jj in range(NQ):
+            ib = ix + 4 * jj
+            yl, yh, sumy = _q4k_load_y(H_IN, ts * I + ib * 256 + o)
+            part = part + _q4k_contrib(DOWN_Q4, (row * NB + ib) * 144, iq, ir, yl, yh, sumy)
+        if R > 0:
+            ib = ix + 4 * NQ
+            valid = ix < R
+            ibc = al.where(valid, ib, 0)
+            yl, yh, sumy = _q4k_load_y(H_IN, ts * I + ibc * 256 + o)
+            part = part + al.where(valid, _q4k_contrib(DOWN_Q4, (row * NB + ibc) * 144, iq, ir, yl, yh, sumy), 0.0)
+        acc = acc + w * part
+
+    y = al.simd_reduce(acc)
+    al.store(Y_OUT + t * HID + j, y, mask=(tid < 1))
 
 
 @al.kernel

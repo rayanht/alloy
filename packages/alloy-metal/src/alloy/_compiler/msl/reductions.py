@@ -230,7 +230,7 @@ class ReductionEmitterMixin:
             input_expr = self._get(inp)
             uid = self._reduce_counter
             self._reduce_counter += 1
-            n_sg = self._threads // 32
+            n_sg = max(1, self._threads // 32)
 
             identity = {"sum": "0.0f", "max": "-INFINITY", "min": "INFINITY"}.get(op.op, "0.0f")
 

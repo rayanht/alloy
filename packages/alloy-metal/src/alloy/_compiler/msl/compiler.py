@@ -736,7 +736,7 @@ class TileCompiler(
             any_decl = True
         # Shared memory for 1D cross-simdgroup reduction
         if self._has_1d_reduce:
-            n_sg = self._threads // 32
+            n_sg = max(1, self._threads // 32)
             self._emit(f"threadgroup float _red[{n_sg}];")
             any_decl = True
         if any_decl:
@@ -1293,7 +1293,7 @@ class TileCompiler(
                 return local_exprs[val.name]
             return self._get(val)
 
-        n_sg = self._threads // 32
+        n_sg = max(1, self._threads // 32)
 
         for phase_ops in phases:
             # Emit ops in the order they appear so scalars that feed 1D
@@ -1514,7 +1514,12 @@ class TileCompiler(
         """
         src_expr = self._get(op.source)
         name = op.result.name
-        ctype = "float" if self._acc_dtype == "half" else self._acc_dtype
+        # Integer carries keep their width: a float copy truncates int32 keys and
+        # int64 counters above 2^24.
+        if op.source.dtype in ("i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"):
+            ctype = from_ir(op.source.dtype).msl
+        else:
+            ctype = "float" if self._acc_dtype == "half" else self._acc_dtype
         self._emit(f"{ctype} {name} = {src_expr};")
         self._exprs[name] = name
 

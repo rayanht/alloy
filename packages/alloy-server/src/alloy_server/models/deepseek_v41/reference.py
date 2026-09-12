@@ -168,10 +168,13 @@ class ReferenceModel:
     """Stateful (KV caches live here) forward over `weights`; `forward(ids, start_pos)`
     returns the last-position logits and the full hc stream for layer-level checks."""
 
-    def __init__(self, config: DeepseekV41Config, weights: Weights, max_seq_len: int) -> None:
+    def __init__(self, config: DeepseekV41Config, weights: Weights, max_seq_len: int, *, rounding: bool = True) -> None:
         self.cfg = config
         self.w = weights
         self.max_seq_len = max_seq_len
+        # the fp8 / fp4 cache rounding; off gives a smooth function for bisecting the
+        # alloy path (rounding flips are chaotic at the indexer's exact-tie scores)
+        self.rounding = rounding
         cfg = config
         self.freqs: dict[int, torch.Tensor] = {}
         for layer in range(cfg.n_layers):
@@ -198,6 +201,7 @@ class ReferenceModel:
         # per-forward shared state (sources write before consumers read)
         self.topk_idxs: torch.Tensor | None = None
         self.candidates: torch.Tensor | None = None
+        self.debug_index: dict = {}
 
     def layer_freqs(self, layer: int) -> torch.Tensor:
         theta, orig = self.cfg.rope_params(layer)
@@ -251,11 +255,13 @@ class ReferenceModel:
             k = rms_norm(latent @ w[f"blk.{layer}.indexer.attn_k.weight"].float().T,
                          w[f"blk.{layer}.indexer.k_norm.weight"], cfg.norm_eps)
             k = torch.cat([k[..., :-rd], apply_rotary(k[..., -rd:], f)], dim=-1)
-            k = fp4_round(k, 32, scale_e4m3=False)
+            if self.rounding:
+                k = fp4_round(k, 32, scale_e4m3=False)
             self.index_k[layer][start_pos // ratio : start_pos // ratio + k.shape[0]] = k
         q = (qr @ w[f"blk.{layer}.indexer.attn_q_b.weight"].float().T).unflatten(-1, (cfg.index_n_heads, cfg.index_head_dim))
         q = torch.cat([q[..., :-rd], apply_rotary(q[..., -rd:], freqs[start_pos:end_pos])], dim=-1)
-        q = fp4_round(q, 32, scale_e4m3=False)
+        if self.rounding:
+            q = fp4_round(q, 32, scale_e4m3=False)
         index_k = self.index_k[src][: end_pos // ratio]
         weights = (x.float() @ w[f"blk.{layer}.indexer.proj.weight"].float().T) * (
             cfg.index_head_dim**-0.5 * cfg.index_n_heads**-0.5
@@ -273,6 +279,7 @@ class ReferenceModel:
             score = score.masked_fill(~self.candidates, -torch.inf)
         topk = min(cfg.index_topk, end_pos // ratio)
         idxs = topk_lowest_index(score, topk).sort(dim=-1).values
+        self.debug_index[layer] = (score, idxs, self.candidates)
         return torch.where(idxs < compress_lens, idxs + offset, -1).int()
 
     def attention(self, layer: int, x: torch.Tensor, start_pos: int) -> torch.Tensor:
@@ -290,7 +297,8 @@ class ReferenceModel:
 
         kv = rms_norm(x.float() @ w[p + "attn_kv.weight"].float().T, w[p + "attn_kv_a_norm.weight"], cfg.norm_eps)
         kv = torch.cat([kv[..., :-rd], apply_rotary(kv[..., -rd:], f)], dim=-1)
-        kv = fp8_round(kv, 32)
+        if self.rounding:
+            kv = fp8_round(kv, 32)
         ring = self.window_kv[layer]
         if start_pos == 0:
             if seqlen <= win:
@@ -321,7 +329,8 @@ class ReferenceModel:
             if latent is not None:
                 fl = freqs[: seqlen - seqlen % ratio : ratio] if start_pos == 0 else freqs[start_pos + 1 - ratio].unsqueeze(0)
                 latent = torch.cat([latent[..., :-rd], apply_rotary(latent[..., -rd:], fl)], dim=-1)
-                latent = fp4_round(latent, 16, scale_e4m3=True)
+                if self.rounding:
+                    latent = fp4_round(latent, 16, scale_e4m3=True)
                 self.compress_kv[layer][start_pos // ratio : start_pos // ratio + latent.shape[0]] = latent
             src = cfg.kv_source_for(layer)
             kv_all = torch.cat([window_kv, self.compress_kv[src][:compress_len]], dim=0)
@@ -423,20 +432,29 @@ class ReferenceModel:
         pre_mix = torch.zeros(ids.shape[0], cfg.hc_mult)
         pre_mix[:, 0] = 1.0
         streams = []
+        # per-layer intermediates for component-level checks of the alloy path
+        self.pres: list[torch.Tensor] = []
+        self.attn_outs: list[torch.Tensor] = []
+        self.moe_outs: list[torch.Tensor] = []
+        self.engram_outs: dict[int, torch.Tensor] = {}
         for layer in range(cfg.n_layers):
             if cfg.engram is not None and layer in cfg.engram.layer_ids:
                 x = self.engram(layer, x, hashes[:, cfg.engram.layer_ids.index(layer), :])
+                self.engram_outs[layer] = x
             residual = x
             attn_pre, attn_post, attn_comb = self.hc_mixes(layer, x, "attn")
             a = rms_norm(self.hc_pre(x, pre_mix), w[f"blk.{layer}.attn_norm.weight"], cfg.norm_eps)
             a = self.attention(layer, a, start_pos)
+            self.attn_outs.append(a)
             x = self.hc_post(a, residual, attn_post, attn_comb)
             residual = x
             ffn_pre, ffn_post, ffn_comb = self.hc_mixes(layer, x, "ffn")
             f = rms_norm(self.hc_pre(x, attn_pre), w[f"blk.{layer}.ffn_norm.weight"], cfg.norm_eps)
             f = self.moe(layer, f)
+            self.moe_outs.append(f)
             x = self.hc_post(f, residual, ffn_post, ffn_comb)
             pre_mix = ffn_pre
+            self.pres.append(ffn_pre)
             streams.append(x)
         h = rms_norm(self.hc_pre(x, pre_mix), w["output_norm.weight"], cfg.norm_eps)
         if not all_logits:
