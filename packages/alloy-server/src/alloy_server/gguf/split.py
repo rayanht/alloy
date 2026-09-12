@@ -30,17 +30,18 @@ class TensorLocation:
     n_elements: int
 
 
-def shard_paths(first: Path) -> list[Path]:
-    """Every shard of the split `first` belongs to (or just `[first]`)."""
+def shard_paths(first: Path, *, allow_missing: bool = False) -> list[Path]:
+    """Every shard of the split `first` belongs to (or just `[first]`). With
+    `allow_missing` absent shards are skipped (their tensors are simply unknown)."""
     m = SPLIT_RE.match(first.name)
     if m is None:
         return [first]
     count = int(m.group("count"))
     paths = [first.with_name(f"{m.group('prefix')}-{i:05d}-of-{count:05d}.gguf") for i in range(1, count + 1)]
     missing = [p.name for p in paths if not p.exists()]
-    if missing:
+    if missing and not allow_missing:
         raise FileNotFoundError(f"split GGUF is missing shards: {missing}")
-    return paths
+    return [p for p in paths if p.exists()]
 
 
 def field_value(field: gguf.ReaderField):
@@ -51,8 +52,9 @@ def field_value(field: gguf.ReaderField):
 class SplitGGUF:
     """Metadata + tensor index over all shards; readers are kept for memmap views."""
 
-    def __init__(self, first: Path) -> None:
-        self.paths = shard_paths(Path(first))
+    def __init__(self, first: Path, *, allow_missing: bool = False) -> None:
+        self.paths = shard_paths(Path(first), allow_missing=allow_missing)
+        self.partial = allow_missing
         self.readers: list[gguf.GGUFReader] = []
         self.tensors: dict[str, TensorLocation] = {}
         self.kv: dict = {}
@@ -74,7 +76,7 @@ class SplitGGUF:
                     n_elements=int(t.n_elements),
                 )
         expected = self.kv.get("split.tensors.count")
-        if expected is not None and int(expected) != len(self.tensors):
+        if expected is not None and int(expected) != len(self.tensors) and not self.partial:
             raise ValueError(f"split declares {expected} tensors, shards carry {len(self.tensors)}")
 
     @property

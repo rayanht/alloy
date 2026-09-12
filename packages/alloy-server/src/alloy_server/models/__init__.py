@@ -26,6 +26,7 @@ from alloy_server.models.registry import (
 
 # Import every arch module for its `@register` side effect.
 from alloy_server.models import gemma4  # noqa: F401
+from alloy_server.models.deepseek_v41 import handler as deepseek_v41_handler  # noqa: F401
 from alloy_server.models import llama  # noqa: F401
 from alloy_server.models import nomic_bert  # noqa: F401
 from alloy_server.models import qwen3_5  # noqa: F401

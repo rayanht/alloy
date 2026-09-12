@@ -23,6 +23,8 @@ _COMMANDS: dict[str, tuple[str, str, str]] = {
              "Resolve a model ref to its GGUF and print its header metadata."),
     "bench": ("alloy_cli.commands.bench", "bench",
               "Benchmark prefill (pp) + decode (tg) tok/s across a cache-depth sweep."),
+    "run": ("alloy_cli.commands.run", "run",
+            "Run one prompt through the DeepSeek-V4.1 streaming engine."),
     "tune": ("alloy_cli.commands.tune", "tune",
              "Tune a model's kernels at the chunked-prefill (M=chunk) and decode (M=1) shapes."),
     "profile": ("alloy_cli.commands.profile", "profile",

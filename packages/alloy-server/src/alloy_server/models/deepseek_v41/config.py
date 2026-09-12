@@ -134,10 +134,11 @@ CANDIDATE_BLOCK_SIZE = 8
 
 
 def config_from_gguf_kv(
-    kv: dict, tensor_shapes: dict[str, tuple[int, ...]], *, arch: str = "deepseek41"
+    kv: dict, tensor_shapes: dict[str, tuple[int, ...]], *, arch: str = "deepseek41", n_layers: int | None = None,
 ) -> DeepseekV41Config:
     """Build the config from a GGUF's key/value table (`kv`, already parsed to
-    python values) and its tensor name -> torch shape map."""
+    python values) and its tensor name -> torch shape map. `n_layers` truncates the
+    model (bring-up on a partial download)."""
     tensor_names = set(tensor_shapes)
 
     def k(key: str, default=None):
@@ -148,7 +149,7 @@ def config_from_gguf_kv(
             raise KeyError(f"GGUF metadata key missing: {full}")
         return default
 
-    n_layers = int(k("block_count"))
+    n_layers = int(k("block_count")) if n_layers is None else n_layers
     compress_ratios = tuple(int(r) for r in k("attention.compress_ratios"))[:n_layers]
     if len(compress_ratios) != n_layers:
         raise ValueError(f"compress_ratios has {len(compress_ratios)} entries for {n_layers} layers")
@@ -168,7 +169,7 @@ def config_from_gguf_kv(
     engram = None
     engram_layers = k("engram.layer_ids", ())
     if engram_layers:
-        layer_ids = tuple(int(i) for i in engram_layers)
+        layer_ids = tuple(int(i) for i in engram_layers if int(i) < n_layers)
         n_heads = int(k("engram.head_count"))
         max_ngram = int(k("engram.max_ngram_size"))
         n_l = len(layer_ids)
