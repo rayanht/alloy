@@ -70,6 +70,16 @@ def idx_bits(n: int) -> int:
     return b + 1
 
 
+# Index-score / candidate buffers are allocated at a bucketed key capacity so their
+# shapes (and the kernels' constexprs) only change every KEY_BUCKET keys — a decode
+# step otherwise recompiles the indexer kernels at every position.
+KEY_BUCKET = 1024
+
+
+def key_capacity(n_keys: int) -> int:
+    return max(KEY_BUCKET, cdiv(n_keys, KEY_BUCKET) * KEY_BUCKET)
+
+
 def i32_buffer(arr: np.ndarray) -> AlloyBuffer:
     arr = np.ascontiguousarray(arr, dtype=np.int32)
     buf = _alloc_aligned(tuple(arr.shape), int32)
@@ -214,6 +224,7 @@ class DeepseekV41Model:
         self.dummy_f16 = _alloc_aligned((1, cfg.head_dim), float16)
         self.dummy_i32 = _alloc_aligned((1,), int32)
         self.dummy_u8 = _alloc_aligned((1,), uint8)
+        self.zero_i32 = i32_buffer(np.zeros(1, dtype=np.int32))
 
     def new_state(self) -> SequenceState:
         return SequenceState(self.cfg, self.max_seq_len)
@@ -280,7 +291,8 @@ class DeepseekV41Model:
         block = 16 if mode == 2 else 32
         if not self.rounding:
             mode = 3
-        ds_block_round[(rows,)](x, cache.slice(0, 0, 1), cache, N=n, MODE=mode, BLOCK=block, OUT_F16=1, OUT_ROW0=row0)
+        row0_buf = i32_buffer(np.array([row0], dtype=np.int32))
+        ds_block_round[(rows,)](x, cache.slice(0, 0, 1), row0_buf, cache, N=n, MODE=mode, BLOCK=block, OUT_F16=1)
 
     # --- attention ----------------------------------------------------------------
 
@@ -322,30 +334,33 @@ class DeepseekV41Model:
         q_r = q
         if self.rounding:
             q_r = _alloc_aligned((T, hi * di), float32)
-            ds_block_round[(T,)](q, self.dummy_f16, q_r, N=hi * di, MODE=1, BLOCK=32)
+            ds_block_round[(T,)](q, self.dummy_f16, self.zero_i32, q_r, N=hi * di, MODE=1, BLOCK=32)
         w = mm(x, L.indexer_proj) * (di**-0.5 * hi**-0.5)
         visible = i32_buffer((positions + 1) // ratio)
-        score = _alloc_aligned((T, n_keys), float32)
+        cap = key_capacity(n_keys)
+        count = i32_buffer(np.array([n_keys], dtype=np.int32))
+        score = _alloc_aligned((T, cap), float32)
         use_mask = cfg.uses_candidates(layer) and state.candidates is not None
-        ds_index_score[(T, cdiv(n_keys, 64))](
-            q_r, state.index_k[src], w, visible, state.candidates if use_mask else self.dummy_u8, score,
-            HEADS=hi, HEAD_DIM=di, N_KEYS=n_keys, HAS_MASK=1 if use_mask else 0,
+        ds_index_score[(T, cdiv(cap, 64))](
+            q_r, state.index_k[src], w, visible, state.candidates if use_mask else self.dummy_u8, count, score,
+            HEADS=hi, HEAD_DIM=di, CAP=cap, HAS_MASK=1 if use_mask else 0,
         )
         if layer == cfg.candidate_source_layer:
             bs = cfg.candidate_block_size
-            nb = cdiv(n_keys, bs)
-            bm = _alloc_aligned((T, nb), float32)
-            ds_block_max[(T, cdiv(nb, 32))](score, visible, bm, N=n_keys, BLOCK_SIZE=bs, NB=nb)
-            nblk = min(cfg.candidate_topk_blocks, nb)
+            nb_cap = cdiv(cap, bs)
+            nb_count = i32_buffer(np.array([cdiv(n_keys, bs)], dtype=np.int32))
+            bm = _alloc_aligned((T, nb_cap), float32)
+            ds_block_max[(T, cdiv(nb_cap, 32))](score, visible, count, bm, CAP=cap, BLOCK_SIZE=bs, NB_CAP=nb_cap)
+            nblk = cfg.candidate_topk_blocks
             sel = _alloc_aligned((T, nblk), int32)
-            ds_topk_select[(T,)](bm, sel, N=nb, K=nblk, IDX_BITS=idx_bits(nb))
-            mask = _alloc_aligned((T, n_keys), uint8)
-            ds_zero_u8[(cdiv(T * n_keys, 1024),)](mask, N=T * n_keys)
-            ds_block_mask_scatter[(T, nblk)](sel, mask.slice(0, 0, 1), mask, N=n_keys, BLOCK_SIZE=bs, B=nblk, NUM_THREADS=bs)
+            ds_topk_select[(T,)](bm, nb_count, sel, CAP=nb_cap, K=nblk, IDX_BITS=idx_bits(nb_cap))
+            mask = _alloc_aligned((T, cap), uint8)
+            ds_zero_u8[(cdiv(T * cap, 1024),)](mask, N=T * cap)
+            ds_block_mask_scatter[(T, nblk)](sel, mask.slice(0, 0, 1), mask, CAP=cap, BLOCK_SIZE=bs, B=nblk, NUM_THREADS=bs)
             state.candidates = mask
-        k = min(cfg.index_topk, n_keys)
+        k = cfg.index_topk
         idx = _alloc_aligned((T, k), int32)
-        ds_topk_select[(T,)](score, idx, N=n_keys, K=k, IDX_BITS=idx_bits(n_keys))
+        ds_topk_select[(T,)](score, count, idx, CAP=cap, K=k, IDX_BITS=idx_bits(cap))
         self.debug_index[layer] = (score, idx, state.candidates)
         return idx
 

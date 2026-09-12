@@ -66,12 +66,12 @@ def _store(ptr, value, f16, mask):
 def ds_block_round(
     X,
     DEP,                      # a view of OUT (or a dummy): orders this write after OUT's previous writer
+    ROW0,                     # (1,) int32 output row offset (writes into a cache slice)
     OUT: al.output,
     N: al.constexpr,          # row width
     MODE: al.constexpr,       # 0: fp8 E4M3 / E8M0 scale, 1: fp4 E2M1 / E8M0, 2: fp4 E2M1 / E4M3, 3: no rounding
     BLOCK: al.constexpr,      # elements per scale (32, 32, 16)
     OUT_F16: al.constexpr = 0,
-    OUT_ROW0: al.constexpr = 0,   # output row offset (writes into a cache slice)
     NUM_THREADS: al.constexpr = 32,
 ):
     """Quantize-dequantize each BLOCK of a row through the reference cache format
@@ -80,7 +80,7 @@ def ds_block_round(
     covering 32 // BLOCK blocks per step."""
     GROUPS = LANES // BLOCK
     row = al.program_id(0)
-    out_row = row + OUT_ROW0
+    out_row = row + al.cast(al.load(ROW0 + 0), al.int32)
     lane = al.arange(0, LANES)
     grp = lane // BLOCK
     _dep = al.load(DEP + 0)
@@ -229,20 +229,23 @@ def ds_index_score(
     K,                        # (n_keys, D) f16 index keys
     W,                        # (ROWS, HEADS) f32 head weights (already scaled)
     VISIBLE,                  # (ROWS,) int32 keys visible to the row (causal)
-    MASK,                     # (ROWS, N_KEYS) uint8 candidate mask (HAS_MASK) else unused
-    SCORE: al.output,         # (ROWS, N_KEYS) f32, -inf where masked
+    MASK,                     # (ROWS, CAP) uint8 candidate mask (HAS_MASK) else unused
+    COUNT,                    # (1,) int32 number of keys
+    SCORE: al.output,         # (ROWS, CAP) f32, -inf where masked; columns >= COUNT untouched
     HEADS: al.constexpr,
     HEAD_DIM: al.constexpr,
-    N_KEYS: al.constexpr,
+    CAP: al.constexpr,        # row stride (allocated key capacity)
     HAS_MASK: al.constexpr = 0,
     BLOCK: al.constexpr = 64,
 ):
     """score[s, t] = sum_h relu(q[s,h] . k[t]) * w[s,h] over the causally visible
-    (and candidate-masked) keys. Grid (ROWS, ceil(N_KEYS/BLOCK)); one lane per key."""
+    (and candidate-masked) keys. Grid (ROWS, ceil(CAP/BLOCK)); one lane per key."""
     D = HEAD_DIM
+    N_KEYS = CAP
     row = al.program_id(0)
     t = al.program_id(1) * BLOCK + al.arange(0, BLOCK)
-    valid = t < N_KEYS
+    n = al.cast(al.load(COUNT + 0), al.int32)
+    valid = t < n
     ts = al.where(valid, t, 0)
     acc = 0.0
     for h in range(HEADS):
@@ -268,21 +271,24 @@ def _ordered_key(score):
 
 @al.kernel
 def ds_topk_select(
-    SCORE,                    # (ROWS, N) f32
-    OUT: al.output,           # (ROWS, K) int32 selected indices ascending; -1 for -inf picks
-    N: al.constexpr,
+    SCORE,                    # (ROWS, CAP) f32
+    COUNT,                    # (1,) int32 number of valid columns N (<= CAP)
+    OUT: al.output,           # (ROWS, K) int32 selected indices ascending; -1 for -inf picks and slots >= min(K, N)
+    CAP: al.constexpr,        # row stride
     K: al.constexpr,
-    IDX_BITS: al.constexpr,   # ceil(log2(N)) + 1
+    IDX_BITS: al.constexpr,   # ceil(log2(CAP)) + 1
     NEG: al.constexpr = NEG_INF,   # scores at or below this are "absent" -> -1
 ):
-    """Exact top-K per row (K <= N) under the total order (score desc, index asc): a
-    32-step bisection on the ordered score bits finds the K-th value, an IDX_BITS-step
+    """Exact top-min(K, N) per row under the total order (score desc, index asc): a
+    33-step bisection on the ordered score bits finds the K-th value, an IDX_BITS-step
     bisection on the index resolves ties at that value, then one ordered pass appends
     the selected indices (simdgroup prefix sums keep them sorted). Deterministic."""
     row = al.program_id(0)
     lane = al.arange(0, LANES)
-    base = SCORE + row * N
-    # threshold key T: the largest key with count(key >= T) >= K (int64 midpoints —
+    base = SCORE + row * CAP
+    N = al.cast(al.load(COUNT + 0), al.int32)
+    k_eff = al.minimum(al.cast(K, al.int32), N)
+    # threshold key T: the largest key with count(key >= T) >= k (int64 midpoints —
     # the int32 span overflows)
     lo = al.cast(-2147483648, al.int64)
     hi = al.cast(2147483647, al.int64)
@@ -293,7 +299,7 @@ def ds_topk_select(
             t = j + lane
             s = al.load(base + t, mask=t < N, other=NEG_INF)
             cnt = cnt + al.where((t < N) & (_ordered_key(s) >= mid), 1.0, 0.0)
-        enough = al.simd_reduce(cnt) >= K
+        enough = al.simd_reduce(cnt) >= al.cast(k_eff, al.float32)
         lo = al.where(enough, al.cast(mid, al.int64), lo)
         hi = al.where(enough, hi, al.cast(mid, al.int64) - 1)
         hi = al.maximum(hi, lo)
@@ -303,10 +309,10 @@ def ds_topk_select(
         t = j + lane
         s = al.load(base + t, mask=t < N, other=NEG_INF)
         gt = gt + al.where((t < N) & (_ordered_key(s) > thresh), 1.0, 0.0)
-    need = K - al.simd_reduce(gt)
+    need = al.cast(k_eff, al.float32) - al.simd_reduce(gt)
     # smallest index I with count(key == thresh and t <= I) >= need
     ilo = al.cast(0, al.int32)
-    ihi = al.cast(N - 1, al.int32)
+    ihi = al.maximum(N - 1, al.cast(0, al.int32))
     for _it in range(IDX_BITS):
         imid = al.cast(ilo + ((ihi - ilo) >> 1), al.int32)
         cnt = 0.0
@@ -327,54 +333,61 @@ def ds_topk_select(
         sel_i = al.where(sel, al.cast(1, al.int32), al.cast(0, al.int32))
         pos = written + al.cast(al.simd_prefix_exclusive_sum(sel_i), al.int32)
         out_val = al.where(s > NEG, t, al.cast(-1, al.int32))
-        al.store(OUT + row * K + pos, out_val, mask=sel & (pos < K))
+        al.store(OUT + row * K + pos, out_val, mask=sel & (pos < k_eff))
         written = written + al.cast(al.simd_reduce(al.cast(sel_i, al.float32)), al.int32)
+    for j in range(0, K, LANES):
+        slot = j + lane
+        al.store(OUT + row * K + slot, al.cast(-1, al.int32), mask=(slot < K) & (slot >= k_eff))
 
 
 @al.kernel
 def ds_block_max(
-    SCORE,                    # (ROWS, N) f32
+    SCORE,                    # (ROWS, CAP) f32
     VISIBLE,                  # (ROWS,) int32
-    OUT: al.output,           # (ROWS, NB) f32 block max, +inf on the row's last visible block
-    N: al.constexpr,
+    COUNT,                    # (1,) int32 number of keys N
+    OUT: al.output,           # (ROWS, NB_CAP) f32 block max, +inf on the row's last visible block
+    CAP: al.constexpr,        # score row stride
     BLOCK_SIZE: al.constexpr,
-    NB: al.constexpr,
+    NB_CAP: al.constexpr,     # output row stride (block capacity)
     NUM_THREADS: al.constexpr = 32,
 ):
     """Per-block max of the index scores (hierarchical indexer level one); the block
-    holding the row's newest position is pinned to +inf so it is always selected."""
+    holding the row's newest position is pinned to +inf so it is always selected.
+    Blocks >= ceil(N / BLOCK_SIZE) are untouched."""
     row = al.program_id(0)
     b = al.program_id(1) * LANES + al.arange(0, LANES)
-    valid = b < NB
+    n = al.cast(al.load(COUNT + 0), al.int32)
+    nb = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
+    valid = b < nb
     mx = NEG_INF
     for i in range(BLOCK_SIZE):
         t = b * BLOCK_SIZE + i
-        v = al.load(SCORE + row * N + t, mask=valid & (t < N), other=NEG_INF)
+        v = al.load(SCORE + row * CAP + t, mask=valid & (t < n), other=NEG_INF)
         mx = al.maximum(mx, v)
     vis = al.cast(al.load(VISIBLE + row), al.int32)
     last = (vis - 1) // BLOCK_SIZE
     mx = al.where(b == last, 1e30, mx)
-    al.store(OUT + row * NB + b, mx, mask=valid)
+    al.store(OUT + row * NB_CAP + b, mx, mask=valid)
 
 
 @al.kernel
 def ds_block_mask_scatter(
     BLOCKS,                   # (ROWS, B) int32 selected block ids, -1 none
     MASK_DEP,                 # a view of MASK: keeps the zero-fill alive and ordered first
-    MASK: al.output,          # (ROWS, N) uint8, pre-zeroed
-    N: al.constexpr,
+    MASK: al.output,          # (ROWS, CAP) uint8, pre-zeroed
+    CAP: al.constexpr,        # mask row stride
     BLOCK_SIZE: al.constexpr,
     B: al.constexpr,
     NUM_THREADS: al.constexpr = 8,    # == BLOCK_SIZE
 ):
-    """Expand selected blocks to a per-key candidate mask. Grid (ROWS, B)."""
+    """Expand selected blocks (-1 = none) to a per-key candidate mask. Grid (ROWS, B)."""
     row = al.program_id(0)
     j = al.program_id(1)
     _dep = al.cast(al.load(MASK_DEP + 0), al.int32)
     blk = al.cast(al.load(BLOCKS + row * B + j), al.int32)
     i = al.arange(0, BLOCK_SIZE)
     t = blk * BLOCK_SIZE + i
-    al.store(MASK + row * N + t, al.cast(1, al.uint8), mask=(blk >= 0) & (t < N))
+    al.store(MASK + row * CAP + t, al.cast(1, al.uint8), mask=(blk >= 0) & (t < CAP))
 
 
 @al.kernel

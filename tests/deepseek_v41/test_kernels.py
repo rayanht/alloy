@@ -58,17 +58,18 @@ def test_block_round_modes():
     rng = np.random.default_rng(0)
     x = (rng.standard_normal((6, 128)) * 3).astype(np.float32)
     xt = torch.from_numpy(x)
+    zero = buf(np.zeros(1, dtype=np.int32), int32)
     for mode, block, expect in (
         (0, 32, reference.fp8_round(xt, 32)),
         (1, 32, reference.fp4_round(xt, 32, scale_e4m3=False)),
         (2, 16, reference.fp4_round(xt, 16, scale_e4m3=True)),
     ):
         o = out((6, 128), float32)
-        ds_block_round[(6,)](buf(x, float32), o.slice(0, 0, 1), o, N=128, MODE=mode, BLOCK=block)
+        ds_block_round[(6,)](buf(x, float32), o.slice(0, 0, 1), zero, o, N=128, MODE=mode, BLOCK=block)
         (got,) = run(o)
         np.testing.assert_array_equal(got, expect.numpy(), err_msg=f"mode {mode}")
         o16 = out((6, 128), float16)
-        ds_block_round[(6,)](buf(x, float32), o16.slice(0, 0, 1), o16, N=128, MODE=mode, BLOCK=block, OUT_F16=1)
+        ds_block_round[(6,)](buf(x, float32), o16.slice(0, 0, 1), zero, o16, N=128, MODE=mode, BLOCK=block, OUT_F16=1)
         (got16,) = run(o16)
         np.testing.assert_array_equal(got16.astype(np.float32), expect.numpy(), err_msg=f"mode {mode} f16")
 
@@ -137,7 +138,8 @@ def test_index_score_and_topk():
     for has_mask, expect in ((0, expect_plain), (1, expect_masked)):
         o = out((rows, n), float32)
         ds_index_score[(rows, (n + 63) // 64)](buf(q, float32), buf(k, float16), buf(w, float32), buf(visible, int32),
-                                              buf(mask, uint8), o, HEADS=heads, HEAD_DIM=d, N_KEYS=n, HAS_MASK=has_mask)
+                                              buf(mask, uint8), buf(np.array([n], dtype=np.int32), int32), o,
+                                              HEADS=heads, HEAD_DIM=d, CAP=n, HAS_MASK=has_mask)
         (got,) = run(o)
         np.testing.assert_allclose(got, expect.numpy(), rtol=1e-4, atol=1e-3)
     # top-k with ties (relu zeros) and -inf rows; lowest index wins ties
@@ -145,7 +147,7 @@ def test_index_score_and_topk():
     sc[2, 3:9] = 0.5  # a tie block
     K = 8
     o = out((rows, K), int32)
-    ds_topk_select[(rows,)](buf(sc, float32), o, N=n, K=K, IDX_BITS=idx_bits(n))
+    ds_topk_select[(rows,)](buf(sc, float32), buf(np.array([n], dtype=np.int32), int32), o, CAP=n, K=K, IDX_BITS=idx_bits(n))
     (got,) = run(o)
     exp_idx = reference.topk_lowest_index(torch.from_numpy(sc), K)
     exp_sorted = torch.where(torch.from_numpy(sc).gather(1, exp_idx) > -1e30, exp_idx, -1)
@@ -169,12 +171,13 @@ def test_candidate_blocks():
     score_ref = torch.from_numpy(score).masked_fill(torch.from_numpy(unreachable), -torch.inf)
     expect = reference.select_candidate_blocks(score_ref, torch.from_numpy(visible)[:, None], top_b, bs)
     bm = out((rows, nb), float32)
-    ds_block_max[(rows, (nb + 31) // 32)](buf(score, float32), buf(visible, int32), bm, N=n, BLOCK_SIZE=bs, NB=nb)
+    count = buf(np.array([n], dtype=np.int32), int32)
+    ds_block_max[(rows, (nb + 31) // 32)](buf(score, float32), buf(visible, int32), count, bm, CAP=n, BLOCK_SIZE=bs, NB_CAP=nb)
     sel = out((rows, top_b), int32)
-    ds_topk_select[(rows,)](bm, sel, N=nb, K=top_b, IDX_BITS=idx_bits(nb))
+    ds_topk_select[(rows,)](bm, buf(np.array([nb], dtype=np.int32), int32), sel, CAP=nb, K=top_b, IDX_BITS=idx_bits(nb))
     mask = out((rows, n), uint8)
     ds_zero_u8[((rows * n + 1023) // 1024,)](mask, N=rows * n)
-    ds_block_mask_scatter[(rows, top_b)](sel, mask.slice(0, 0, 1), mask, N=n, BLOCK_SIZE=bs, B=top_b, NUM_THREADS=bs)
+    ds_block_mask_scatter[(rows, top_b)](sel, mask.slice(0, 0, 1), mask, CAP=n, BLOCK_SIZE=bs, B=top_b, NUM_THREADS=bs)
     (got,) = run(mask)
     np.testing.assert_array_equal(got.astype(bool), expect.numpy())
 
